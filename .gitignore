@@ -36,5 +36,8 @@ htmlcov/
 *.tar.gz
 *.whl
 
+# Publish scripts – may contain PyPI token
+publish.bat
+
 .forge/
 plan.md
