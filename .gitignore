@@ -1,0 +1,40 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.venv/
+*.sqlite3
+*.sqlite
+
+# Environment files – may contain proxy credentials
+.env
+
+# User configuration – the example file is tracked
+config.yaml
+config.yml
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Build artifacts
+*.tar.gz
+*.whl
+
+.forge/
+plan.md

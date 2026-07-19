@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────
+# PageFetch  configuration  (copy to  config.yaml  and edit)
+# ─────────────────────────────────────────────────────────────
+#
+# Values support  ${ENV_VAR}  and  ${ENV_VAR:default}  syntax.
+# Environment variables are resolved from  .env  or the shell.
+# ─────────────────────────────────────────────────────────────
+
+# Fetching mode:  auto  (try HTTP first, fall back to browser),
+#                 http  (HTTP only),  browser  (browser only)
+mode: auto
+
+# Confidence threshold (0.0 – 1.0) for deciding whether HTTP
+# content is usable or a browser fallback is needed.
+confidence_threshold: 0.80
+
+# ── HTTP ────────────────────────────────────────────────────
+http_concurrency: 10
+http_timeout: 20.0          # seconds
+retries_http: 3
+max_redirects: 10
+max_content_size: 26214400  # 25 MiB in bytes
+
+# ── Browser (Camoufox) ──────────────────────────────────────
+browser_concurrency: 4
+browser_timeout: 45.0       # seconds
+retries_browser: 2
+
+# ── Proxy ───────────────────────────────────────────────────
+# Provider:  none  |  decodo  |  dataimpulse
+# Credentials are read from environment variables:
+#   DECODO_PROXY_URL   (or DECODO_HOST / PORT / USERNAME / PASSWORD)
+#   DATAIMPULSE_PROXY_URL
+proxy: none
+
+# ── Cache ───────────────────────────────────────────────────
+cache_enabled: true
+cache_ttl: 24h               # s, m, h, d  suffixes accepted
+cache_path: ~/.cache/pagefetch/cache.sqlite3
+
+# ── Error handling ──────────────────────────────────────────
+raise_on_error: false

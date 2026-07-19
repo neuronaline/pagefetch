@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pagefetch"
+version = "0.1.0"
+description = "Asynchronous HTTP-first web fetching with conservative content extraction and browser fallback"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "PageFetch contributors" }]
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "beautifulsoup4>=4.12,<5",
+  "brotlicffi>=1.0,<2",
+  "camoufox>=0.4,<1",
+  "httpx[http2,socks]>=0.27,<1",
+  "lxml>=5.2,<6",
+  "platformdirs>=4.2,<5",
+  "pypdf>=5.0,<6",
+  "pyyaml>=6.0,<7",
+  "tldextract>=5.1,<6",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0,<9", "pytest-asyncio>=0.23,<1", "ruff>=0.6,<1"]
+
+[project.scripts]
+pagefetch = "pagefetch.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pagefetch*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+ignore = ["E501", "ASYNC109"]
