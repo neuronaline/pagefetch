@@ -39,5 +39,8 @@ htmlcov/
 # Publish scripts – may contain PyPI token
 publish.bat
 
+# Publish guide – sensitive, never commit
+PUBLISH.md
+
 .forge/
 plan.md
