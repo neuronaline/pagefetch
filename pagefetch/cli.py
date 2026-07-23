@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 from pathlib import Path
+from typing import Literal
 
 from .client import PageFetch
 from .config import PageFetchConfig
 from .models import FetchResult
+from .utils.rendering import render_results
+from .utils.urls import read_urls_from_file
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,18 +51,11 @@ def _inputs(value: str) -> list[str]:
             raise ValueError(f"file not found: {value!r}")
         # Otherwise assume it's a URL (downstream validation will catch bad ones).
         return [value]
-    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return read_urls_from_file(value)
 
 
 def _render(results: list[FetchResult], output_format: str, include_html: bool) -> str:
-    if output_format == "json":
-        values = [result.to_dict(include_html=include_html) for result in results]
-        return json.dumps(values, ensure_ascii=False, indent=2)
-    if output_format == "html":
-        documents = [result.html or result.text or "" for result in results]
-    else:
-        documents = [result.markdown or result.json() for result in results]
-    return "\n\n---\n\n".join(documents)
+    return render_results(results, output_format, include_html=include_html)
 
 
 def _build_config(args: argparse.Namespace) -> PageFetchConfig:

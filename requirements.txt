@@ -1,13 +1,13 @@
 # PageFetch runtime dependencies
 # Install: pip install -r requirements.txt
-# Canonical source: pyproject.toml [project.dependencies]
+# Canonical source: pyproject.toml — this file mirrors it for convenience.
 
-aiosqlite>=0.20
-beautifulsoup4>=4.12
-camoufox>=0.4
-httpx[http2,socks]>=0.27
-lxml>=5.2
-platformdirs>=4.2
-pypdf>=5.0
-pyyaml>=6.0
-tldextract>=5.1
+aiosqlite>=0.20,<1
+beautifulsoup4>=4.12,<5
+camoufox>=0.4,<1
+httpx[http2,socks]>=0.27,<1
+lxml>=5.2,<6
+platformdirs>=4.2,<5
+pypdf>=5.0,<6
+pyyaml>=6.0,<7
+tldextract>=5.1,<6

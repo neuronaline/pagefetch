@@ -8,7 +8,7 @@ import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -48,8 +48,8 @@ class PageFetch:
     def __init__(
         self,
         *,
-        mode: str = "auto",
-        proxy: str = "none",
+        mode: Literal["auto", "http", "browser"] = "auto",
+        proxy: Literal["none", "decodo", "dataimpulse"] = "none",
         http_concurrency: int = 10,
         browser_concurrency: int = 4,
         cache_enabled: bool = True,
@@ -86,9 +86,8 @@ class PageFetch:
         self._http_clients: dict[str, httpx.AsyncClient] = {}
         self._http_fetchers: dict[str, HTTPFetcher] = {}
         self._browser_fetchers: dict[str, BrowserFetcher] = {}
-        import threading as _threading
-        self._http_init_lock = _threading.Lock()
-        self._browser_init_lock = _threading.Lock()
+        self._http_init_lock = asyncio.Lock()
+        self._browser_init_lock = asyncio.Lock()
         self._cache = SQLiteCache(self.config.cache_path) if self.config.cache_enabled else None
         self._started = False
         self._closed = False
@@ -153,8 +152,8 @@ class PageFetch:
         self,
         url: str,
         *,
-        mode: str | None = None,
-        proxy: str | None = None,
+        mode: Literal["auto", "http", "browser"] | None = None,
+        proxy: Literal["none", "decodo", "dataimpulse"] | None = None,
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -269,8 +268,8 @@ class PageFetch:
         self,
         urls: Iterable[str],
         *,
-        mode: str | None = None,
-        proxy: str | None = None,
+        mode: Literal["auto", "http", "browser"] | None = None,
+        proxy: Literal["none", "decodo", "dataimpulse"] | None = None,
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -301,16 +300,23 @@ class PageFetch:
         ordered = list(urls)
         unique = list(dict.fromkeys(ordered))
 
-        async def one(item: str) -> FetchResult:
+        async def one(
+            item: str,
+            _mode: str | None = mode,
+            _proxy: str | None = proxy,
+            _use_cache: bool = use_cache,
+            _cache_ttl: str | int | None = cache_ttl,
+            _raise_on_error: bool | None = raise_on_error,
+        ) -> FetchResult:
             item_start = time.perf_counter()
             try:
                 return await self.fetch(
                     item,
-                    mode=mode,
-                    proxy=proxy,
-                    use_cache=use_cache,
-                    cache_ttl=cache_ttl,
-                    raise_on_error=raise_on_error,
+                    mode=_mode,
+                    proxy=_proxy,
+                    use_cache=_use_cache,
+                    cache_ttl=_cache_ttl,
+                    raise_on_error=_raise_on_error,
                 )
             except PageFetchError as exc:
                 return FetchResult(
@@ -326,9 +332,9 @@ class PageFetch:
         by_url = dict(zip(unique, fetched, strict=True))
         return [by_url[item] for item in ordered]
 
-    async def _fetch_http_or_auto(self, url: str, mode: str, proxy: str) -> FetchResult:
+    async def _fetch_http_or_auto(self, url: str, mode: Literal["auto", "http", "browser"], proxy: str) -> FetchResult:
         try:
-            response = await self._http_fetcher(proxy).fetch(url)
+            response = await (await self._http_fetcher(proxy)).fetch(url)
         except TransportFailure as exc:
             if mode == "auto" and exc.error.retryable:
                 logger.info("HTTP transport failed; using browser for %s", url)
@@ -353,6 +359,7 @@ class PageFetch:
         if content_type.startswith("text/plain"):
             return self._result_from_text(url, response, proxy)
         html = self._decode(response)
+        raw_soup = BeautifulSoup(html, "lxml")
         report = analyze_html(html)
         if mode == "auto" and report.score < self.config.confidence_threshold:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
@@ -369,6 +376,7 @@ class PageFetch:
                     proxy=proxy,
                     method="http",
                     response_headers=response.headers,
+                    soup=raw_soup,
                 )
                 available.warnings.extend(
                     [
@@ -388,6 +396,7 @@ class PageFetch:
                     proxy=proxy,
                     method="http",
                     response_headers=response.headers,
+                    soup=raw_soup,
                 )
                 available.warnings.extend(
                     [
@@ -408,13 +417,14 @@ class PageFetch:
             proxy=proxy,
             method="http",
             response_headers=response.headers,
+            soup=raw_soup,
         )
         if mode == "http" and report.score < self.config.confidence_threshold:
             result.warnings.append("HTTP content may be incomplete; browser fallback is disabled.")
         return result
 
     async def _fetch_browser(self, url: str, proxy: str, status_code: int | None) -> FetchResult:
-        response = await self._browser_fetcher(proxy).fetch(url)
+        response = await (await self._browser_fetcher(proxy)).fetch(url)
         raw_soup = BeautifulSoup(response.html, "lxml")
         result = self._result_from_html(
             original_url=url,
@@ -428,7 +438,7 @@ class PageFetch:
             soup=raw_soup,
         )
         result.warnings.extend(response.warnings)
-        report = analyze_html(response.html, soup=raw_soup)
+        report = analyze_html(response.html)
         if response.status_code is not None and response.status_code >= 400:
             result.success = False
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
@@ -444,9 +454,9 @@ class PageFetch:
             result.warnings.append("Rendered content may still be incomplete.")
         return result
 
-    def _http_fetcher(self, provider: str) -> HTTPFetcher:
+    async def _http_fetcher(self, provider: str) -> HTTPFetcher:
         if provider not in self._http_fetchers:
-            with self._http_init_lock:
+            async with self._http_init_lock:
                 if provider in self._http_fetchers:
                     return self._http_fetchers[provider]
                 settings = resolve_proxy(provider)
@@ -471,9 +481,9 @@ class PageFetch:
                 )
         return self._http_fetchers[provider]
 
-    def _browser_fetcher(self, provider: str) -> BrowserFetcher:
+    async def _browser_fetcher(self, provider: str) -> BrowserFetcher:
         if provider not in self._browser_fetchers:
-            with self._browser_init_lock:
+            async with self._browser_init_lock:
                 if provider in self._browser_fetchers:
                     return self._browser_fetchers[provider]
                 self._browser_fetchers[provider] = BrowserFetcher(

@@ -16,10 +16,18 @@ _NOISE_RE = re.compile(
 def clean_html(html: str | BeautifulSoup) -> BeautifulSoup:
     """Remove only strongly identified non-content while preserving page structure."""
     soup = html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml")
-    rendered_copy = BeautifulSoup(str(soup), "lxml")
-    for tag in rendered_copy.find_all("noscript"):
-        tag.decompose()
-    visible_text = " ".join(rendered_copy.stripped_strings)
+    # Build visible-text snapshot without creating a full parsed copy:
+    # we skip noscript subtrees so the visibility check below matches
+    # the same "rendered" view that enabled-JS users see.
+    rendered_strings: list[str] = []
+    for string in soup.stripped_strings:
+        if not any(
+            parent.name == "noscript"
+            for parent in getattr(string, "parents", ())
+            if hasattr(parent, "name")
+        ):
+            rendered_strings.append(string)
+    visible_text = " ".join(rendered_strings)
     for tag in list(soup.find_all("noscript")):
         fallback = tag.get_text(" ", strip=True)
         if fallback and len(fallback) >= 20 and fallback in visible_text:

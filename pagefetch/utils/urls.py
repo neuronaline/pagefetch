@@ -7,7 +7,15 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 import tldextract
 
-_TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
+_TLD_EXTRACT: tldextract.TLDExtract | None = None
+
+
+def _get_tld_extract() -> tldextract.TLDExtract:
+    """Lazily initialise the TLDExtract instance on first use."""
+    global _TLD_EXTRACT
+    if _TLD_EXTRACT is None:
+        _TLD_EXTRACT = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
+    return _TLD_EXTRACT
 
 
 def validate_url(url: str) -> SplitResult:
@@ -55,6 +63,16 @@ def normalize_url(url: str) -> str:
     return urlunsplit(SplitResult(scheme, netloc, parsed.path or "/", parsed.query, ""))
 
 
+def read_urls_from_file(path: str) -> list[str]:
+    """Read newline-delimited URLs from a text file."""
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"file not found: {path!r}")
+    return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 def registrable_host(url: str) -> str:
     """Return the registrable host using the bundled public-suffix snapshot."""
     host = (urlsplit(url).hostname or "").lower().rstrip(".")
@@ -62,7 +80,7 @@ def registrable_host(url: str) -> str:
         return ipaddress.ip_address(host).compressed
     except ValueError:
         pass
-    extracted = _TLD_EXTRACT(host)
+    extracted = _get_tld_extract()(host)
     if extracted.suffix:
         return f"{extracted.domain}.{extracted.suffix}"
     return extracted.domain or host

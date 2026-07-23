@@ -53,10 +53,11 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
 
-    # Capture script payload size before decomposing tags.
-    script_size = sum(len(str(script)) for script in soup.find_all("script"))
-
+    # Single pass: capture script payload size AND decompose noise tags.
+    script_size = 0
     for tag in soup(["script", "style", "template", "noscript"]):
+        if tag.name == "script":
+            script_size += len(str(tag))
         tag.decompose()
     text = " ".join((soup.body or soup).stripped_strings)
     lowered_text = text.lower()
@@ -68,10 +69,31 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
 
     # Smooth length contribution: useful up to roughly 1,500 visible characters.
     score += min(0.38, math.log1p(text_len) / math.log(1501) * 0.38)
-    paragraphs = soup.find_all("p")
-    headings = soup.find_all(re.compile(r"^h[1-6]$"))
-    semantic = soup.find_all(["main", "article", "section"])
-    structured = soup.find_all(["ul", "ol", "table", "pre", "blockquote"])
+    # Single unified traversal for tag-name-based element collections.
+    paragraphs: list = []
+    headings: list = []
+    semantic: list = []
+    structured: list = []
+    nav_texts: list[str] = []
+    main_texts: list[str] = []
+    for tag in soup.find_all(
+        ["p", "h1", "h2", "h3", "h4", "h5", "h6",
+         "main", "article", "section",
+         "ul", "ol", "table", "pre", "blockquote", "nav"]
+    ):
+        name = tag.name
+        if name == "p":
+            paragraphs.append(tag)
+        elif len(name) == 2 and name[0] == "h" and name[1].isdigit():
+            headings.append(tag)
+        elif name in {"main", "article", "section"}:
+            semantic.append(tag)
+            if name in {"main", "article"}:
+                main_texts.append(tag.get_text(" ", strip=True))
+        elif name in {"ul", "ol", "table", "pre", "blockquote"}:
+            structured.append(tag)
+        elif name == "nav":
+            nav_texts.append(tag.get_text(" ", strip=True))
     if paragraphs:
         score += min(0.12, len(paragraphs) * 0.025)
     if headings:
@@ -100,8 +122,8 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     placeholder = any(pattern in lowered_text for pattern in PLACEHOLDER_PATTERNS)
     wall = any(pattern in lowered_text for pattern in WALL_PATTERNS)
     refresh = bool(soup.find("meta", attrs={"http-equiv": re.compile(r"^refresh$", re.I)}))
-    navigation_text = " ".join(tag.get_text(" ", strip=True) for tag in soup.find_all("nav"))
-    main_text = " ".join(tag.get_text(" ", strip=True) for tag in soup.find_all(["main", "article"]))
+    navigation_text = " ".join(nav_texts)
+    main_text = " ".join(main_texts)
 
     if text_len < 80:
         score -= 0.30

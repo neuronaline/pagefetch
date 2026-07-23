@@ -54,8 +54,8 @@ async def test_browser_blocks_media_and_fonts_but_allows_images(monkeypatch):
             return SimpleNamespace(status=200)
 
         async def evaluate(self, _script):
-            # Size pre-check: return a short HTML string well under max_content_size.
-            return "<html><body></body></html>"
+            # Size pre-check: return the UTF-8 byte length (well under max_content_size).
+            return 28  # len(b"<html><body></body></html>")
 
         async def content(self):
             return "<html><body><p>Rendered</p></body></html>"

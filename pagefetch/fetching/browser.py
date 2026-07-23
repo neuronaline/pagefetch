@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -91,7 +92,7 @@ class BrowserFetcher:
                     report = analyze_html(result.html)
                     incomplete = report.score < self.confidence_threshold
                     if (not result.html.strip() or report.challenge or incomplete) and attempt < self.retries:
-                        await asyncio.sleep(0.4 * (2**attempt))
+                        await asyncio.sleep(0.4 * (2**attempt) + random.uniform(0, 0.15))
                         continue
                     return result
                 except TransportFailure as exc:
@@ -100,7 +101,7 @@ class BrowserFetcher:
                         raise
                     if exc.error.code in {"browser_launch_error", "browser_navigation_error"}:
                         await self.close()
-                    await asyncio.sleep(0.4 * (2**attempt))
+                    await asyncio.sleep(0.4 * (2**attempt) + random.uniform(0, 0.15))
             assert last_failure is not None
             raise last_failure
 
@@ -168,9 +169,12 @@ class BrowserFetcher:
             )
             if limit_reached:
                 warnings.append("Maximum controlled-scroll limit was reached.")
-            # Fast size pre-check – avoids serialising the whole DOM for huge pages.
-            outer_html = await page.evaluate("() => document.documentElement.outerHTML")
-            if len(outer_html.encode("utf-8")) > self.max_content_size:
+            # Fast size pre-check — returns only the UTF-8 byte length, avoiding
+            # a second full-DOM IPC transfer.
+            pre_size = await page.evaluate(
+                "() => new TextEncoder().encode(document.documentElement.outerHTML).length"
+            )
+            if pre_size > self.max_content_size:
                 raise TransportFailure(
                     FetchErrorInfo("content_too_large", "rendered content exceeds maximum size", False)
                 )

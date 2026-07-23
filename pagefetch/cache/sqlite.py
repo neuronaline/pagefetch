@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
@@ -17,6 +18,7 @@ class SQLiteCache:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._db: aiosqlite.Connection | None = None
+        self._batch_depth: int = 0
 
     async def start(self) -> None:
         if self._db is not None:
@@ -54,13 +56,15 @@ class SQLiteCache:
             return None
         if row[1] <= time.time():
             await self._db.execute("DELETE FROM fetch_cache WHERE cache_key = ?", (key,))
-            await self._db.commit()
+            if not self._batch_depth:
+                await self._db.commit()
             return None
         try:
             result = FetchResult.from_dict(json.loads(row[0]))
         except (TypeError, ValueError, json.JSONDecodeError):
             await self._db.execute("DELETE FROM fetch_cache WHERE cache_key = ?", (key,))
-            await self._db.commit()
+            if not self._batch_depth:
+                await self._db.commit()
             return None
         result.from_cache = True
         result.fetch_method = "cache"
@@ -94,7 +98,30 @@ class SQLiteCache:
             """,
             (key, payload, now, now + ttl),
         )
-        await self._db.commit()
+        if not self._batch_depth:
+            await self._db.commit()
+
+    @asynccontextmanager
+    async def batch(self):
+        """Context manager that wraps multiple cache operations in a single transaction.
+
+        When inside a batch context, individual ``set`` and ``get`` calls
+        defer commits until the batch completes.  If an exception occurs the
+        transaction is rolled back.
+        """
+        if self._db is None:
+            raise RuntimeError("cache has not been started")
+        self._batch_depth += 1
+        try:
+            yield
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                await self._db.commit()
+        except BaseException:
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                await self._db.rollback()
+            raise
 
     async def close(self) -> None:
         if self._db is not None:

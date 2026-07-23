@@ -1,7 +1,5 @@
 """Package constants."""
 
-LOGGER_NAME = "pagefetch"
-
 # NOTE: The version numbers in the User-Agent below (e.g. Chrome/131.0.0.0)
 # will become stale over time.  Periodically refresh them against a current
 # browser release to reduce the chance of server-side fingerprinting blocks.
@@ -25,7 +23,6 @@ BROWSER_HEADERS = {
 
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 BLOCKED_STATUS_CODES = frozenset({403, 429})
-HTML_TYPES = ("text/html", "application/xhtml+xml")
 XML_TYPES = ("application/xml", "text/xml", "+xml")
 SAFE_RESPONSE_HEADERS = frozenset(
     {"cache-control", "content-language", "content-location", "date", "etag", "last-modified"}

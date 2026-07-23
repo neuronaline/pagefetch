@@ -14,6 +14,7 @@ def extract_links(soup: BeautifulSoup, base_url: str) -> list[LinkInfo]:
     links: list[LinkInfo] = []
     seen: set[tuple[str, str, tuple[str, ...], str | None]] = set()
     base_site = registrable_host(base_url)
+    host_cache: dict[str, str] = {}
     for anchor in soup.find_all("a", href=True):
         absolute = urljoin(base_url, str(anchor["href"]))
         if urlsplit(absolute).scheme not in {"http", "https"}:
@@ -26,11 +27,15 @@ def extract_links(soup: BeautifulSoup, base_url: str) -> list[LinkInfo]:
         if record in seen:
             continue
         seen.add(record)
+        try:
+            rh = host_cache[absolute]
+        except KeyError:
+            rh = host_cache[absolute] = registrable_host(absolute)
         links.append(
             LinkInfo(
                 text=text,
                 url=absolute,
-                internal=registrable_host(absolute) == base_site,
+                internal=rh == base_site,
                 rel=rel,
                 target=target,
                 index=len(links),

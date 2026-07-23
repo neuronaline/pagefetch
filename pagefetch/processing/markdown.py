@@ -141,14 +141,12 @@ class MarkdownConverter:
         items = tag.find_all("li", recursive=False)
         for offset, item in enumerate(items):
             nested = item.find_all(["ul", "ol"], recursive=False)
-            # Temporarily detach nested lists so _children only sees li text
-            detached: list[Tag] = []
-            for child_list in item.find_all(["ul", "ol"], recursive=False):
-                child_list.extract()
-                detached.append(child_list)
-            content = self._children(item).strip()
-            for child_list in detached:
-                item.append(child_list)
+            # Collect content from non-list children only (avoids DOM mutation).
+            content = "".join(
+                self._node(child)
+                for child in item.children
+                if not (isinstance(child, Tag) and child.name in {"ul", "ol"})
+            ).strip()
             marker = f"{start + offset}." if ordered else "-"
             indent = "  " * (self._list_depth - 1)
             lines.append(f"{indent}{marker} {content}")

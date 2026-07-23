@@ -7,7 +7,6 @@ import importlib.util
 import os
 import subprocess
 import sys
-import threading
 from collections.abc import Callable
 
 _RUNTIME_REQUIREMENTS = (
@@ -24,7 +23,6 @@ _RUNTIME_REQUIREMENTS = (
     ("tldextract", "tldextract>=5.1"),
 )
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
-_bootstrap_lock = threading.Lock()
 _bootstrap_complete = False
 
 
@@ -101,13 +99,16 @@ def install_camoufox_browser() -> None:
 
 
 def ensure_runtime_requirements() -> None:
-    """Install all runtime requirements once at process startup."""
+    """Install all runtime requirements once at process startup.
+
+    The caller (PageFetch.start) is responsible for ensuring this is
+    called at most once per client lifecycle via its own asyncio.Lock.
+    """
     global _bootstrap_complete
     if not auto_install_enabled():
         return
-    with _bootstrap_lock:
-        if _bootstrap_complete:
-            return
-        install_python_requirements()
-        install_camoufox_browser()
-        _bootstrap_complete = True
+    if _bootstrap_complete:
+        return
+    install_python_requirements()
+    install_camoufox_browser()
+    _bootstrap_complete = True

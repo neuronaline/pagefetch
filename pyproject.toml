@@ -11,10 +11,31 @@ requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "PageFetch contributors" }]
+keywords = [
+  "web-scraping",
+  "content-extraction",
+  "markdown",
+  "async",
+  "html-to-markdown",
+  "browser-fallback",
+  "http-client",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Text Processing :: Markup :: HTML",
+]
 dependencies = [
   "aiosqlite>=0.20,<1",
   "beautifulsoup4>=4.12,<5",
-  "brotlicffi>=1.0,<2",
   "camoufox>=0.4,<1",
   "httpx[http2,socks]>=0.27,<1",
   "lxml>=5.2,<6",
@@ -23,6 +44,11 @@ dependencies = [
   "pyyaml>=6.0,<7",
   "tldextract>=5.1,<6",
 ]
+
+[project.urls]
+Homepage = "https://github.com/user/pagefetch"
+Repository = "https://github.com/user/pagefetch.git"
+Issues = "https://github.com/user/pagefetch/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0,<9", "pytest-asyncio>=0.23,<1", "ruff>=0.6,<1"]
@@ -44,3 +70,4 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 ignore = ["E501", "ASYNC109"]
+

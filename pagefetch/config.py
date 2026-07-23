@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from platformdirs import user_cache_path
 
@@ -35,8 +35,8 @@ def _interpolate_env(value: Any) -> Any:
 
 @dataclass(slots=True, frozen=True)
 class PageFetchConfig:
-    mode: str = "auto"
-    proxy: str = "none"
+    mode: Literal["auto", "http", "browser"] = "auto"
+    proxy: Literal["none", "decodo", "dataimpulse"] = "none"
     http_concurrency: int = 10
     browser_concurrency: int = 4
     cache_enabled: bool = True
@@ -98,8 +98,8 @@ class PageFetchConfig:
     def build(
         cls,
         *,
-        mode: str = "auto",
-        proxy: str = "none",
+        mode: Literal["auto", "http", "browser"] = "auto",
+        proxy: Literal["none", "decodo", "dataimpulse"] = "none",
         http_concurrency: int = 10,
         browser_concurrency: int = 4,
         cache_enabled: bool = True,
