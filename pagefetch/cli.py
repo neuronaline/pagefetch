@@ -116,10 +116,17 @@ async def _run(args: argparse.Namespace) -> int:
         proxy=config.proxy,
         cache_enabled=config.cache_enabled,
         cache_ttl=config.cache_ttl,
+        cache_path=config.cache_path,
         http_concurrency=config.http_concurrency,
         browser_concurrency=config.browser_concurrency,
         http_timeout=config.http_timeout,
         browser_timeout=config.browser_timeout,
+        retries_http=config.retries_http,
+        retries_browser=config.retries_browser,
+        max_redirects=config.max_redirects,
+        max_content_size=config.max_content_size,
+        confidence_threshold=config.confidence_threshold,
+        raise_on_error=config.raise_on_error,
     ) as client:
         results = await client.fetch_many(urls)
     rendered = _render(results, args.format, args.include_html)

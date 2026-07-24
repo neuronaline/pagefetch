@@ -15,7 +15,7 @@ def parse_duration(value: str | int | float) -> int:
     if isinstance(value, (int, float)):
         if value < 0:
             raise ValueError("duration cannot be negative")
-        return int(value)
+        return round(value)
     if not isinstance(value, str):
         raise TypeError("duration must be a number or string")
     match = _DURATION_RE.fullmatch(value.strip())

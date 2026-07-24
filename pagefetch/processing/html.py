@@ -38,7 +38,7 @@ def process_html(
     """Extract a high-fidelity structured representation from HTML."""
     raw_soup = soup or BeautifulSoup(html, "lxml")
     title, metadata, warnings = extract_metadata(raw_soup, base_url, response_headers)
-    confidence = analyze_html(html, soup=raw_soup)
+    confidence = analyze_html(html)
     cleaned = clean_html(raw_soup)
     links = extract_links(cleaned, base_url)
     images = extract_images(cleaned, base_url)

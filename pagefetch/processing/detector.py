@@ -107,7 +107,9 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     if text_len > 500 and len(paragraphs) >= 3:
         score += 0.05
     title_tokens = {token for token in re.findall(r"\w+", title.lower()) if len(token) > 3}
-    if title_tokens and title_tokens.intersection(set(re.findall(r"\w+", lowered_text))):
+    body_tokens = set(re.findall(r"\w+", lowered_text))
+    title_overlap = bool(title_tokens and title_tokens.intersection(body_tokens))
+    if title_overlap:
         score += 0.03
     if soup.find("meta", attrs={"name": re.compile(r"description", re.I)}):
         score += 0.02
@@ -125,12 +127,37 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     navigation_text = " ".join(nav_texts)
     main_text = " ".join(main_texts)
 
+    # Complete short static pages (e.g. example.com) are fully server-rendered and
+    # should not force an expensive browser fallback just because they are brief.
+    coherent_short = (
+        not shell
+        and not challenge
+        and not placeholder
+        and not wall
+        and not refresh
+        and not mounts
+        and not explicit_js
+        and script_size < 2_000
+        and 80 <= text_len < 400
+        and word_count >= 12
+        and (bool(paragraphs) or bool(headings))
+        and (title_overlap or bool(headings))
+    )
+    if coherent_short:
+        score += 0.28
+        if headings and paragraphs:
+            score += 0.08
+        if title_overlap:
+            score += 0.05
+
     if text_len < 80:
         score -= 0.30
         reasons.append("very little visible text")
-    elif text_len < 250:
+    elif text_len < 250 and not coherent_short:
         score -= 0.14
         reasons.append("short visible text")
+    elif coherent_short and text_len < 250:
+        reasons.append("short but complete static document")
     if challenge:
         score = min(score, 0.08)
         reasons.append("challenge or anti-bot page detected")

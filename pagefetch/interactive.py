@@ -66,6 +66,18 @@ def _render_results(results: list[FetchResult], output_format: str, include_html
     return render_results(results, output_format, include_html=include_html)
 
 
+def _apply_debug(settings: dict) -> None:
+    """Configure the pagefetch logger to match the current debug setting."""
+    logger = logging.getLogger("pagefetch")
+    if settings.get("debug"):
+        if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+            handler = logging.StreamHandler()
+            logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.WARNING)
+
+
 async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
     """Fetch a single URL."""
     result = await client.fetch(
@@ -98,7 +110,7 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
     )
 
 
-def _handle_fetch(client: PageFetch, settings: dict) -> None:
+def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEventLoop) -> None:
     """Interactive fetch flow: URL or file."""
     _clear_screen()
     _banner()
@@ -114,11 +126,12 @@ def _handle_fetch(client: PageFetch, settings: dict) -> None:
     if choice == "3":
         return
 
+    _apply_debug(settings)
     if choice == "2":
         filepath = _prompt("  File path")
         if not filepath:
             return
-        results = asyncio.run(_fetch_file(client, filepath, settings))
+        results = loop.run_until_complete(_fetch_file(client, filepath, settings))
     else:
         url = _prompt("  URL")
         if not url:
@@ -127,7 +140,7 @@ def _handle_fetch(client: PageFetch, settings: dict) -> None:
         if not url.startswith(("http://", "https://")):
             if _confirm(f"  No scheme detected. Use 'https://{url}'?", default=True):
                 url = f"https://{url}"
-        results = asyncio.run(_fetch_url(client, url, settings))
+        results = loop.run_until_complete(_fetch_url(client, url, settings))
 
     if not results:
         return
@@ -244,6 +257,7 @@ def _settings_menu(settings: dict) -> None:
             settings["include_html"] = _confirm("  Include raw HTML in output?", default=settings.get("include_html", False))
         elif choice == "7":
             settings["debug"] = _confirm("  Enable debug logging?", default=settings.get("debug", False))
+            _apply_debug(settings)
         elif choice == "8":
             settings["no_cache"] = _confirm("  Disable cache?", default=settings.get("no_cache", False))
             if settings.get("no_cache"):
@@ -326,56 +340,58 @@ def interactive_main() -> int:
         "config_file": None,
     }
 
-    if settings.get("debug"):
-        handler = logging.StreamHandler()
-        logging.getLogger("pagefetch").addHandler(handler)
-        logging.getLogger("pagefetch").setLevel(logging.DEBUG)
+    _apply_debug(settings)
 
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     client = _init_client(settings)
 
-    while True:
-        _clear_screen()
-        _banner()
+    try:
+        while True:
+            _clear_screen()
+            _banner()
 
-        print("  1. Fetch URL(s)")
-        print("  2. Settings")
-        print("  3. View current config")
-        print("  4. Exit")
-        print()
+            print("  1. Fetch URL(s)")
+            print("  2. Settings")
+            print("  3. View current config")
+            print("  4. Exit")
+            print()
 
-        choice = _prompt("  Choose", "1")
+            choice = _prompt("  Choose", "1")
+
+            try:
+                if choice == "1":
+                    _handle_fetch(client, settings, loop)
+                    # Re-create client in case settings changed
+                    try:
+                        loop.run_until_complete(client.close())
+                    except Exception:
+                        pass
+                    client = _init_client(settings)
+                elif choice == "2":
+                    _settings_menu(settings)
+                    # Re-create client with new settings
+                    try:
+                        loop.run_until_complete(client.close())
+                    except Exception:
+                        pass
+                    client = _init_client(settings)
+                elif choice == "3":
+                    _view_config(settings)
+                elif choice == "4":
+                    print("\n  Goodbye!")
+                    break
+            except KeyboardInterrupt:
+                print("\n\n  Interrupted. Goodbye!")
+                break
+            except Exception as exc:
+                print(f"\n  Unexpected error: {exc}")
+                input("  Press Enter to continue...")
 
         try:
-            if choice == "1":
-                _handle_fetch(client, settings)
-                # Re-create client in case settings changed
-                try:
-                    asyncio.run(client.close())
-                except Exception:
-                    pass
-                client = _init_client(settings)
-            elif choice == "2":
-                _settings_menu(settings)
-                # Re-create client with new settings
-                try:
-                    asyncio.run(client.close())
-                except Exception:
-                    pass
-                client = _init_client(settings)
-            elif choice == "3":
-                _view_config(settings)
-            elif choice == "4":
-                print("\n  Goodbye!")
-                break
-        except KeyboardInterrupt:
-            print("\n\n  Interrupted. Goodbye!")
-            break
-        except Exception as exc:
-            print(f"\n  Unexpected error: {exc}")
-            input("  Press Enter to continue...")
-
-    try:
-        asyncio.run(client.close())
-    except Exception:
-        pass
+            loop.run_until_complete(client.close())
+        except Exception:
+            pass
+    finally:
+        loop.close()
     return 0

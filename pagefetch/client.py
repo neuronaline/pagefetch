@@ -108,7 +108,7 @@ class PageFetch:
                 return self
             if self._closed:
                 raise RuntimeError("PageFetch has already been closed")
-            ensure_runtime_requirements()
+            await asyncio.to_thread(ensure_runtime_requirements)
             if self._cache:
                 try:
                     await self._cache.start()
@@ -210,8 +210,11 @@ class PageFetch:
                 "browser_timeout": self.config.browser_timeout,
                 "confidence_threshold": self.config.confidence_threshold,
                 "headers": BROWSER_HEADERS,
+                "http_timeout": self.config.http_timeout,
                 "max_content_size": self.config.max_content_size,
+                "max_redirects": self.config.max_redirects,
                 "retries_browser": self.config.retries_browser,
+                "retries_http": self.config.retries_http,
             },
         )
         fetch_warnings = list(self._startup_warnings)
@@ -319,8 +322,14 @@ class PageFetch:
                     raise_on_error=_raise_on_error,
                 )
             except PageFetchError as exc:
+                # Use the raw item string — normalize_url would re-raise
+                # ValueError for the same invalid URL that caused the error.
+                try:
+                    result_url = normalize_url(item)
+                except ValueError:
+                    result_url = str(item)
                 return FetchResult(
-                    url=normalize_url(item),
+                    url=result_url,
                     success=False,
                     proxy_provider=proxy or self.config.proxy,
                     error=exc.error,
@@ -330,7 +339,16 @@ class PageFetch:
 
         fetched = await asyncio.gather(*(one(item) for item in unique))
         by_url = dict(zip(unique, fetched, strict=True))
-        return [by_url[item] for item in ordered]
+        # For duplicate URLs, return independent copies so callers
+        # do not accidentally alias mutable fields across entries.
+        from copy import deepcopy
+        results: list[FetchResult] = []
+        for item in ordered:
+            result = by_url[item]
+            if results and results[-1] is result:
+                result = deepcopy(result)
+            results.append(result)
+        return results
 
     async def _fetch_http_or_auto(self, url: str, mode: Literal["auto", "http", "browser"], proxy: str) -> FetchResult:
         try:
@@ -358,6 +376,15 @@ class PageFetch:
             return self._result_from_xml(url, response, proxy)
         if content_type.startswith("text/plain"):
             return self._result_from_text(url, response, proxy)
+        if not self._is_html_like(content_type):
+            raise TransportFailure(
+                FetchErrorInfo(
+                    "unsupported_content_type",
+                    f"Content type {content_type!r} is not HTML; cannot process with HTTP/auto mode",
+                    False,
+                ),
+                status_code=response.status_code,
+            )
         html = self._decode(response)
         raw_soup = BeautifulSoup(html, "lxml")
         report = analyze_html(html)
@@ -616,7 +643,16 @@ class PageFetch:
 
     @staticmethod
     def _is_xml(content_type: str) -> bool:
-        return any(value in content_type for value in XML_TYPES)
+        if content_type in ("application/xml", "text/xml"):
+            return True
+        # Match XML-based subtypes like application/atom+xml, image/svg+xml
+        # but NOT application/xhtml+xml (which is HTML5, not generic XML).
+        return "+xml" in content_type and content_type != "application/xhtml+xml"
+
+    @staticmethod
+    def _is_html_like(content_type: str) -> bool:
+        """Return True when *content_type* should be processed as HTML."""
+        return content_type in ("text/html", "application/xhtml+xml")
 
     @staticmethod
     def _validate_fetch_options(mode: str, proxy: str) -> None:

@@ -123,8 +123,28 @@ class HTTPFetcher:
 
     @staticmethod
     async def _backoff(attempt: int, retry_after: str | None = None) -> None:
-        if retry_after and retry_after.isdigit():
-            delay = min(float(retry_after), 10.0)
+        if retry_after:
+            seconds = HTTPFetcher._parse_retry_after(retry_after)
+            if seconds is not None:
+                delay = min(seconds, 10.0)
+            else:
+                delay = min(0.25 * (2**attempt) + random.uniform(0, 0.15), 3.0)
         else:
             delay = min(0.25 * (2**attempt) + random.uniform(0, 0.15), 3.0)
         await asyncio.sleep(delay)
+
+    @staticmethod
+    def _parse_retry_after(value: str) -> float | None:
+        """Parse a Retry-After header as delta-seconds or HTTP-date."""
+        if value.isdigit():
+            return float(value)
+        # Try HTTP-date (RFC 7231), e.g. "Wed, 21 Oct 2015 07:28:00 GMT"
+        try:
+            from email.utils import parsedate_to_datetime
+            from datetime import UTC, datetime
+            retry_dt = parsedate_to_datetime(value)
+            now = datetime.now(UTC)
+            delta = (retry_dt - now).total_seconds()
+            return max(0.0, delta)
+        except (ValueError, TypeError, OverflowError):
+            return None

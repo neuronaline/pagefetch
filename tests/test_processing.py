@@ -47,6 +47,17 @@ def test_processing_preserves_content_and_converts_markdown():
     assert result.images[0].url == "https://example.com/hero.jpg"
 
 
+EXAMPLE_DOMAIN_HTML = (
+    '<!doctype html><html lang="en"><head><title>Example Domain</title>'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    "<style>body{background:#eee}</style></head><body><div><h1>Example Domain</h1>"
+    "<p>This domain is for use in documentation examples without needing permission. "
+    "Avoid use in operations.</p>"
+    '<p><a href="https://iana.org/domains/example">Learn more</a></p>'
+    "</div></body></html>"
+)
+
+
 def test_detector_distinguishes_rich_content_spa_and_challenge():
     rich = analyze_html(RICH_HTML)
     spa = analyze_html("<html><body><div id='root'></div><script>" + "x" * 12000 + "</script></body></html>")
@@ -54,6 +65,18 @@ def test_detector_distinguishes_rich_content_spa_and_challenge():
     assert rich.score >= 0.80
     assert spa.score < 0.50 and spa.javascript_shell
     assert challenge.score <= 0.08 and challenge.challenge
+
+
+def test_detector_scores_short_static_pages_highly():
+    """Simple complete pages like example.com must clear the HTTP confidence threshold."""
+    report = analyze_html(EXAMPLE_DOMAIN_HTML)
+    assert report.score >= 0.80
+    assert not report.javascript_shell
+    assert not report.challenge
+    assert "short but complete static document" in report.reasons
+
+    thin = analyze_html("<html><body><p>Small but usable notice.</p></body></html>")
+    assert thin.score < 0.50
 
 
 def test_external_link_is_identified():
