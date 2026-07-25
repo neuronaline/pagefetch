@@ -27,7 +27,7 @@ from .constants import (
 from .exceptions import PageFetchError
 from .fetching import BrowserFetcher, HTTPFetcher, HTTPResponse, TransportFailure
 from .models import FetchErrorInfo, FetchResult
-from .processing.detector import analyze_html
+from .processing.detector import ConfidenceReport, analyze_html
 from .processing.html import process_html
 from .processing.non_html import process_pdf, process_text, process_xml
 from .proxy import ProxyConfigurationError, resolve_proxy
@@ -62,6 +62,7 @@ class PageFetch:
         max_redirects: int = 10,
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
+        block_images: bool = True,
         raise_on_error: bool = False,
     ) -> None:
         self.config = PageFetchConfig.build(
@@ -79,6 +80,7 @@ class PageFetch:
             max_redirects=max_redirects,
             max_content_size=max_content_size,
             confidence_threshold=confidence_threshold,
+            block_images=block_images,
             raise_on_error=raise_on_error,
         )
         self._http_semaphore = asyncio.Semaphore(self.config.http_concurrency)
@@ -93,6 +95,8 @@ class PageFetch:
         self._closed = False
         self._lifecycle_lock = asyncio.Lock()
         self._startup_warnings: list[str] = []
+        self._active_fetches = 0
+        self._active_fetches_lock = asyncio.Lock()
 
     async def __aenter__(self) -> PageFetch:
         await self.start()
@@ -108,7 +112,10 @@ class PageFetch:
                 return self
             if self._closed:
                 raise RuntimeError("PageFetch has already been closed")
-            await asyncio.to_thread(ensure_runtime_requirements)
+            await asyncio.to_thread(
+                ensure_runtime_requirements,
+                needs_browser=self.config.mode in ("auto", "browser"),
+            )
             if self._cache:
                 try:
                     await self._cache.start()
@@ -127,6 +134,19 @@ class PageFetch:
         async with self._lifecycle_lock:
             if self._closed:
                 return
+            # Wait for in-flight fetches to drain before tearing down resources
+            for _ in range(50):  # up to ~5 seconds
+                async with self._active_fetches_lock:
+                    if self._active_fetches == 0:
+                        break
+                await asyncio.sleep(0.1)
+            async with self._active_fetches_lock:
+                remaining = self._active_fetches
+            if remaining > 0:
+                logger.warning(
+                    "close timed out waiting for %d in-flight fetch(es); tearing down resources anyway",
+                    remaining,
+                )
             browser_results = await asyncio.gather(
                 *(browser.close() for browser in self._browser_fetchers.values()),
                 return_exceptions=True,
@@ -201,12 +221,32 @@ class PageFetch:
             return result
 
         await self.start()
-        ttl = self.config.cache_ttl if cache_ttl is None else parse_duration(cache_ttl)
+        if self._closed:
+            return self._finish_error(
+                url=normalized_url,
+                proxy=selected_proxy,
+                error=FetchErrorInfo("client_closed", "PageFetch client has been closed", False),
+                started_at=started_at,
+                should_raise=should_raise,
+            )
+        try:
+            ttl = self.config.cache_ttl if cache_ttl is None else parse_duration(cache_ttl)
+        except (TypeError, ValueError) as exc:
+            result = self._finish_error(
+                url=normalized_url,
+                proxy=selected_proxy,
+                error=FetchErrorInfo("invalid_cache_ttl", f"Invalid cache_ttl: {exc}", False, type(exc).__name__),
+                started_at=started_at,
+                should_raise=should_raise,
+            )
+            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            return result
         cache_key = build_cache_key(
             normalized_url,
             mode=selected_mode,
             proxy=selected_proxy,
             settings={
+                "block_images": self.config.block_images,
                 "browser_timeout": self.config.browser_timeout,
                 "confidence_threshold": self.config.confidence_threshold,
                 "headers": BROWSER_HEADERS,
@@ -229,31 +269,37 @@ class PageFetch:
                 fetch_warnings.append("Cache read failed; content was fetched normally.")
                 logger.warning("cache read failed: %s", type(exc).__name__)
 
+        async with self._active_fetches_lock:
+            self._active_fetches += 1
         try:
-            if selected_mode == "browser":
-                result = await self._fetch_browser(normalized_url, selected_proxy, status_code=None)
-            else:
-                result = await self._fetch_http_or_auto(normalized_url, selected_mode, selected_proxy)
-        except (TransportFailure, ProxyConfigurationError) as exc:
-            error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
-                "connection_error", str(exc), False, type(exc).__name__
-            )
-            result = self._finish_error(
-                url=normalized_url,
-                proxy=selected_proxy,
-                error=error,
-                status_code=getattr(exc, "status_code", None),
-                started_at=started_at,
-                should_raise=should_raise,
-            )
-        except Exception as exc:
-            result = self._finish_error(
-                url=normalized_url,
-                proxy=selected_proxy,
-                error=FetchErrorInfo("unknown_error", "An unexpected error occurred while fetching the page.", False, type(exc).__name__),
-                started_at=started_at,
-                should_raise=should_raise,
-            )
+            try:
+                if selected_mode == "browser":
+                    result = await self._fetch_browser(normalized_url, selected_proxy, status_code=None)
+                else:
+                    result = await self._fetch_http_or_auto(normalized_url, selected_mode, selected_proxy)
+            except (TransportFailure, ProxyConfigurationError) as exc:
+                error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
+                    "connection_error", str(exc), False, type(exc).__name__
+                )
+                result = self._finish_error(
+                    url=normalized_url,
+                    proxy=selected_proxy,
+                    error=error,
+                    status_code=getattr(exc, "status_code", None),
+                    started_at=started_at,
+                    should_raise=should_raise,
+                )
+            except Exception as exc:
+                result = self._finish_error(
+                    url=normalized_url,
+                    proxy=selected_proxy,
+                    error=FetchErrorInfo("unknown_error", "An unexpected error occurred while fetching the page.", False, type(exc).__name__),
+                    started_at=started_at,
+                    should_raise=should_raise,
+                )
+        finally:
+            async with self._active_fetches_lock:
+                self._active_fetches -= 1
 
         result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
         result.warnings[:0] = fetch_warnings
@@ -343,24 +389,28 @@ class PageFetch:
         # do not accidentally alias mutable fields across entries.
         from copy import deepcopy
         results: list[FetchResult] = []
+        emitted: set[int] = set()
         for item in ordered:
             result = by_url[item]
-            if results and results[-1] is result:
+            if id(result) in emitted:
                 result = deepcopy(result)
+            emitted.add(id(result))
             results.append(result)
         return results
 
     async def _fetch_http_or_auto(self, url: str, mode: Literal["auto", "http", "browser"], proxy: str) -> FetchResult:
         try:
             response = await (await self._http_fetcher(proxy)).fetch(url)
-        except TransportFailure as exc:
-            if mode == "auto" and exc.error.retryable:
-                logger.info("HTTP transport failed; using browser for %s", url)
-                return await self._fetch_browser(url, proxy, status_code=None)
+        except TransportFailure:
+            # Timeouts, DNS failures, disconnects, and other transport errors are not
+            # fixed by rendering in a browser — surface them immediately instead of
+            # waiting on an expensive Camoufox navigation that will fail the same way.
             raise
         if response.status_code >= 400:
             retryable = response.status_code in RETRYABLE_STATUS_CODES
-            if mode == "auto" and (response.status_code in BLOCKED_STATUS_CODES or retryable):
+            # Only anti-bot / rate-limit responses benefit from a stealth browser.
+            # 4xx like 404 and 5xx server errors should fail fast at the HTTP layer.
+            if mode == "auto" and response.status_code in BLOCKED_STATUS_CODES:
                 logger.info("HTTP %s; using browser for %s", response.status_code, url)
                 return await self._fetch_browser(url, proxy, status_code=response.status_code)
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
@@ -376,7 +426,7 @@ class PageFetch:
             return self._result_from_xml(url, response, proxy)
         if content_type.startswith("text/plain"):
             return self._result_from_text(url, response, proxy)
-        if not self._is_html_like(content_type):
+        if not self._is_html_like(content_type) and not self._looks_like_html(response.content):
             raise TransportFailure(
                 FetchErrorInfo(
                     "unsupported_content_type",
@@ -387,7 +437,7 @@ class PageFetch:
             )
         html = self._decode(response)
         raw_soup = BeautifulSoup(html, "lxml")
-        report = analyze_html(html)
+        report = analyze_html(html, soup=raw_soup)
         if mode == "auto" and report.score < self.config.confidence_threshold:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
             try:
@@ -404,6 +454,7 @@ class PageFetch:
                     method="http",
                     response_headers=response.headers,
                     soup=raw_soup,
+                    confidence=report,
                 )
                 available.warnings.extend(
                     [
@@ -424,6 +475,7 @@ class PageFetch:
                     method="http",
                     response_headers=response.headers,
                     soup=raw_soup,
+                    confidence=report,
                 )
                 available.warnings.extend(
                     [
@@ -445,6 +497,7 @@ class PageFetch:
             method="http",
             response_headers=response.headers,
             soup=raw_soup,
+            confidence=report,
         )
         if mode == "http" and report.score < self.config.confidence_threshold:
             result.warnings.append("HTTP content may be incomplete; browser fallback is disabled.")
@@ -463,9 +516,10 @@ class PageFetch:
             proxy=proxy,
             method="browser",
             soup=raw_soup,
+            confidence=response.confidence,
         )
         result.warnings.extend(response.warnings)
-        report = analyze_html(response.html)
+        report = response.confidence
         if response.status_code is not None and response.status_code >= 400:
             result.success = False
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
@@ -520,6 +574,7 @@ class PageFetch:
                     proxy=resolve_proxy(provider),
                     max_content_size=self.config.max_content_size,
                     confidence_threshold=self.config.confidence_threshold,
+                    block_images=self.config.block_images,
                 )
         return self._browser_fetchers[provider]
 
@@ -536,9 +591,10 @@ class PageFetch:
         method: str,
         response_headers: httpx.Headers | None = None,
         soup: BeautifulSoup | None = None,
+        confidence: ConfidenceReport | None = None,
     ) -> FetchResult:
         try:
-            processed = process_html(html, final_url, response_headers, soup=soup)
+            processed = process_html(html, final_url, response_headers, soup=soup, confidence=confidence)
         except Exception as exc:
             raise TransportFailure(
                 FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
@@ -653,6 +709,17 @@ class PageFetch:
     def _is_html_like(content_type: str) -> bool:
         """Return True when *content_type* should be processed as HTML."""
         return content_type in ("text/html", "application/xhtml+xml")
+
+    @staticmethod
+    def _looks_like_html(content: bytes) -> bool:
+        """Heuristic HTML sniff for responses with ambiguous content types."""
+        stripped = content.lstrip()
+        if not stripped:
+            return False
+        return stripped.startswith(b"<") and any(
+            marker in stripped[:512].lower()
+            for marker in (b"<!doctype html", b"<html", b"<head", b"<body", b"<title", b"<meta", b"<div", b"<p", b"<a ")
+        )
 
     @staticmethod
     def _validate_fetch_options(mode: str, proxy: str) -> None:

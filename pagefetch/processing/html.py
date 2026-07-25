@@ -34,11 +34,17 @@ def process_html(
     base_url: str,
     response_headers: Mapping[str, str] | None = None,
     soup: BeautifulSoup | None = None,
+    confidence: ConfidenceReport | None = None,
 ) -> ProcessedHTML:
-    """Extract a high-fidelity structured representation from HTML."""
+    """Extract a high-fidelity structured representation from HTML.
+
+    *soup* and *confidence* avoid redundant parse/analysis when the caller
+    already has a BeautifulSoup tree or ConfidenceReport from an earlier step.
+    """
     raw_soup = soup or BeautifulSoup(html, "lxml")
     title, metadata, warnings = extract_metadata(raw_soup, base_url, response_headers)
-    confidence = analyze_html(html)
+    if confidence is None:
+        confidence = analyze_html(html, soup=raw_soup)
     cleaned = clean_html(raw_soup)
     links = extract_links(cleaned, base_url)
     images = extract_images(cleaned, base_url)

@@ -104,9 +104,10 @@ async with PageFetch(mode="auto") as client:
 4. **Content analysis** — the `confidence` score evaluates HTML completeness using  
    text density, structural markup, heading presence, link counts, and common blocking signals  
    (captcha walls, empty bodies, access-denied patterns).
-5. **Browser fallback** (auto mode only) — if confidence is below the threshold (default 0.80),  
-   Camoufox takes over: renders JavaScript, scrolls for lazy-loaded content, waits for  
-   network stability, and re-extracts.
+5. **Browser fallback** (auto mode only) — Camoufox takes over only when HTTP content  
+   confidence is below the threshold (default 0.80), or when the server returns a blocked  
+   status (403/429). Timeouts, connection failures, 404s, and 5xx responses fail fast at  
+   the HTTP layer instead of waiting on a browser navigation.
 6. **Processing pipeline** — cleaned HTML → extracted links, images, metadata →  
    converted to Markdown via a custom converter that preserves tables, code blocks,  
    and nested lists.
@@ -178,6 +179,7 @@ client = PageFetch(
     max_redirects=10,         # Maximum redirect chain
     max_content_size=25 * 1024 * 1024,  # Max response body bytes (25 MiB)
     confidence_threshold=0.80,    # Min confidence before browser fallback
+    block_images=True,         # Block image loading in browser mode to save bandwidth
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
 )
 ```
@@ -226,7 +228,7 @@ class FetchResult:
     text: str | None            # Plain-text body fallback
     metadata: dict              # OpenGraph, Twitter Cards, meta tags
     links: list[LinkInfo]       # All <a> tags with text, URL, rel
-    images: list[ImageInfo]     # All <img> tags with src, alt, title
+    images: list[ImageInfo]     # All <img> tags with url, alt, title
     fetch_method: str | None    # "http" or "browser"
     proxy_provider: str         # "none", "decodo", or "dataimpulse"
     content_confidence: float | None  # 0–1 completeness score (None for browser mode)
@@ -262,6 +264,9 @@ PageFetch ships with a command-line interface accessible via `pagefetch`:
 # Fetch and print Markdown
 pagefetch https://example.com --format markdown
 
+# Fetch and print raw HTML
+pagefetch https://example.com --format html
+
 # Fetch from a list and output JSON
 pagefetch urls.txt --format json --mode auto
 
@@ -273,10 +278,18 @@ pagefetch https://example.com --format json --include-html
 
 # Multiple URLs from a file (one URL per line)
 pagefetch urls.txt --format json --mode auto
+
+# Load configuration from a YAML file with CLI overrides
+pagefetch --config config.yaml --mode browser https://example.com
+
+# Override cache TTL and disable image loading
+pagefetch https://example.com --cache-ttl 1h --block-images
 ```
 
 CLI arguments map directly to the Python API — `--mode`, `--proxy`, `--timeout`,
-`--http-concurrency`, and `--browser-concurrency` are all supported.
+`--browser-timeout`, `--http-concurrency`, `--browser-concurrency`, `--cache-ttl`,
+`--no-cache`, `--block-images` / `--no-block-images`, `--include-html`,
+`--debug`, and `--config` are all supported.
 
 ---
 
@@ -358,6 +371,7 @@ at the HTTP response level before any processing pipeline runs.
 | `max_redirects` | `int` | `10` | Maximum redirect chain to follow |
 | `max_content_size` | `int` | `25 MiB` | Maximum response body in bytes |
 | `confidence_threshold` | `float` | `0.80` | Threshold for browser fallback in auto mode |
+| `block_images` | `bool` | `True` | Block image loading in browser mode to save bandwidth |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
 
 ---

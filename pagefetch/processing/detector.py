@@ -14,8 +14,11 @@ CHALLENGE_PATTERNS = (
     "attention required",
     "access denied",
     "unusual traffic",
-    "cf-chl-",
     "captcha",
+)
+# DOM-level challenge markers that are safe to scan in raw HTML
+CHALLENGE_DOM_PATTERNS = (
+    "cf-chl-",
 )
 JS_PATTERNS = (
     "enable javascript",
@@ -46,7 +49,11 @@ class ConfidenceReport:
 
 
 def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceReport:
-    """Estimate document completeness from several positive and negative signals."""
+    """Estimate document completeness from several positive and negative signals.
+
+    When *soup* is provided it is used directly instead of re-parsing *html*,
+    saving one full BeautifulSoup parse on paths that already have a tree.
+    """
     if not html or not html.strip():
         return ConfidenceReport(0.0, ("empty document",), javascript_shell=True)
     if soup is None:
@@ -114,7 +121,9 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     if soup.find("meta", attrs={"name": re.compile(r"description", re.I)}):
         score += 0.02
 
-    challenge = any(pattern in lowered_html for pattern in CHALLENGE_PATTERNS)
+    challenge = any(pattern in lowered_text for pattern in CHALLENGE_PATTERNS) or any(
+        pattern in lowered_html for pattern in CHALLENGE_DOM_PATTERNS
+    )
     explicit_js = any(pattern in lowered_text for pattern in JS_PATTERNS)
     framework = any(pattern in lowered_html for pattern in FRAMEWORK_PATTERNS)
     mounts = soup.select("#app:empty, #root:empty, #__next:empty, [data-reactroot]:empty")

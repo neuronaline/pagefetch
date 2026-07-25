@@ -49,6 +49,7 @@ class PageFetchConfig:
     max_redirects: int = 10
     max_content_size: int = 25 * 1024 * 1024
     confidence_threshold: float = 0.80
+    block_images: bool = True
     raise_on_error: bool = False
 
     @classmethod
@@ -73,7 +74,12 @@ class PageFetchConfig:
         flat: dict[str, Any] = {}
         for section in ("proxy", "cache"):
             if section in resolved and isinstance(resolved[section], dict):
-                flat.update(resolved.pop(section))
+                section_data = resolved.pop(section)
+                # A nested proxy section may use "provider" to select the provider;
+                # map it to the top-level "proxy" key so it is not silently dropped.
+                if section == "proxy" and "provider" in section_data:
+                    flat["proxy"] = section_data.pop("provider")
+                flat.update(section_data)
         flat.update(resolved)
 
         return cls.build(
@@ -91,6 +97,7 @@ class PageFetchConfig:
             max_redirects=flat.get("max_redirects", 10),
             max_content_size=flat.get("max_content_size", 25 * 1024 * 1024),
             confidence_threshold=flat.get("confidence_threshold", 0.80),
+            block_images=flat.get("block_images", True),
             raise_on_error=flat.get("raise_on_error", False),
         )
 
@@ -112,6 +119,7 @@ class PageFetchConfig:
         max_redirects: int = 10,
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
+        block_images: bool = True,
         raise_on_error: bool = False,
     ) -> PageFetchConfig:
         if not isinstance(mode, str) or mode not in VALID_MODES:
@@ -146,6 +154,8 @@ class PageFetchConfig:
             raise ValueError("confidence_threshold must be between 0 and 1")
         if not isinstance(cache_enabled, bool) or not isinstance(raise_on_error, bool):
             raise ValueError("cache_enabled and raise_on_error must be booleans")
+        if not isinstance(block_images, bool):
+            raise ValueError("block_images must be a boolean")
         ttl = parse_duration(cache_ttl)
         path = Path(cache_path).expanduser() if cache_path is not None else user_cache_path("pagefetch") / "cache.sqlite3"
         return cls(
@@ -163,5 +173,6 @@ class PageFetchConfig:
             max_redirects=max_redirects,
             max_content_size=max_content_size,
             confidence_threshold=float(confidence_threshold),
+            block_images=block_images,
             raise_on_error=raise_on_error,
         )

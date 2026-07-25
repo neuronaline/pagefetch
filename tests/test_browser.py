@@ -9,6 +9,7 @@ import pagefetch.fetching.browser as browser_module
 import pagefetch.fetching.readiness as readiness_module
 from pagefetch.fetching.browser import BrowserFetcher, BrowserResponse
 from pagefetch.fetching.http import TransportFailure
+from pagefetch.processing.detector import ConfidenceReport
 from pagefetch.proxy.providers import ProxySettings
 
 
@@ -23,7 +24,8 @@ def make_fetcher(*, timeout: float = 1.0, retries: int = 0) -> BrowserFetcher:
 
 
 @pytest.mark.asyncio
-async def test_browser_blocks_media_and_fonts_but_allows_images(monkeypatch):
+async def test_browser_blocks_media_fonts_images_ping_beacon(monkeypatch):
+    """Route handler now blocks images/ping/beacon in addition to font/media."""
     decisions: dict[str, str] = {}
 
     class Route:
@@ -42,20 +44,23 @@ async def test_browser_blocks_media_and_fonts_but_allows_images(monkeypatch):
         url = "https://example.com/"
         frames = [main_frame]
         closed = False
+        evaluate_call_count = 0
 
         def on(self, _event, _handler):
             return None
 
         async def route(self, _pattern, handler):
-            for resource_type in ("font", "media", "image", "script"):
+            for resource_type in ("font", "media", "image", "script", "ping", "beacon"):
                 await handler(Route(resource_type))
 
         async def goto(self, *_args, **_kwargs):
             return SimpleNamespace(status=200)
 
         async def evaluate(self, _script):
-            # Size pre-check: return the UTF-8 byte length (well under max_content_size).
-            return 28  # len(b"<html><body></body></html>")
+            self.evaluate_call_count += 1
+            # stability / in_page_metrics / size pre-check / scrollTo — all
+            # return harmless small values.
+            return 28
 
         async def content(self):
             return "<html><body><p>Rendered</p></body></html>"
@@ -69,6 +74,9 @@ async def test_browser_blocks_media_and_fonts_but_allows_images(monkeypatch):
     async def scroll(*_args, **_kwargs):
         return False
 
+    async def probe(*_args, **_kwargs):
+        return {"text": 1000, "mainText": 500, "challenge": False}
+
     page = Page()
     fetcher = make_fetcher()
     fetcher._browser = SimpleNamespace(new_page=lambda: None)
@@ -79,9 +87,20 @@ async def test_browser_blocks_media_and_fonts_but_allows_images(monkeypatch):
     fetcher._browser.new_page = new_page
     monkeypatch.setattr(browser_module, "wait_for_stability", stable)
     monkeypatch.setattr(browser_module, "controlled_scroll", scroll)
-    result = await fetcher._fetch_page_once("https://example.com/")
+    monkeypatch.setattr(browser_module, "in_page_metrics", probe)
+    result = await fetcher._fetch_page_once(
+        "https://example.com/",
+        page_timeout=10.0,
+    )
     assert result.status_code == 200
-    assert decisions == {"font": "abort", "media": "abort", "image": "continue", "script": "continue"}
+    assert decisions == {
+        "font": "abort",
+        "media": "abort",
+        "image": "abort",
+        "script": "continue",
+        "ping": "abort",
+        "beacon": "abort",
+    }
     assert page.closed is True
 
 
@@ -117,15 +136,44 @@ async def test_same_site_iframe_is_inserted_and_external_frame_is_skipped():
 
 @pytest.mark.asyncio
 async def test_browser_timeout_is_structured(monkeypatch):
+    """A navigation timeout produces a structured TransportFailure."""
     fetcher = make_fetcher(timeout=0.01)
 
-    async def slow(_url: str) -> BrowserResponse:
-        await asyncio.sleep(1)
-        raise AssertionError("unreachable")
+    async def start():
+        pass
 
-    monkeypatch.setattr(fetcher, "_fetch_page_once", slow)
+    class SlowPage:
+        url = "https://example.com/"
+        closed = False
+
+        def on(self, _event, _handler):
+            return None
+
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def goto(self, *_args, **_kwargs):
+            raise TimeoutError("timeout")
+
+        async def evaluate(self, _script):
+            return 28
+
+        async def content(self):
+            return "<html></html>"
+
+        async def close(self):
+            self.closed = True
+
+    page = SlowPage()
+    fetcher._browser = SimpleNamespace(new_page=lambda: None)
+
+    async def new_page():
+        return page
+
+    fetcher._browser.new_page = new_page
+    monkeypatch.setattr(fetcher, "start", start)
     with pytest.raises(TransportFailure) as caught:
-        await fetcher._fetch_page("https://example.com/")
+        await fetcher.fetch("https://example.com/")
     assert caught.value.error.code == "browser_timeout"
 
 
@@ -137,18 +185,26 @@ async def test_incomplete_browser_render_is_retried(monkeypatch):
     async def start():
         return None
 
-    async def fetch_page(_url: str) -> BrowserResponse:
+    async def fetch_page(url: str, **kwargs) -> BrowserResponse:
         nonlocal calls
         calls += 1
-        return BrowserResponse("https://example.com/", 200, "<html><body>tiny</body></html>", [])
+        return BrowserResponse(
+            "https://example.com/",
+            200,
+            "<html><body>tiny</body></html>",
+            [],
+            ConfidenceReport(1.0, ()),
+        )
 
     async def no_sleep(_delay: float):
         return None
 
     monkeypatch.setattr(fetcher, "start", start)
-    monkeypatch.setattr(fetcher, "_fetch_page", fetch_page)
+    monkeypatch.setattr(fetcher, "_fetch_page_once", fetch_page)
     monkeypatch.setattr(browser_module.asyncio, "sleep", no_sleep)
     result = await fetcher.fetch("https://example.com/")
+    # With only "tiny" visible text, the score will be well below 0.40,
+    # so one retry is triggered.
     assert calls == 2
     assert result.html.endswith("</html>")
 

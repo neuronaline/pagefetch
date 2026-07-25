@@ -167,6 +167,80 @@ async def test_auto_falls_back_for_403(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_auto_does_not_fall_back_for_404():
+    client = PageFetch(mode="auto", cache_enabled=False, retries_http=0)
+    attach_transport(client, lambda request: httpx.Response(404, text="missing", request=request))
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("browser must not be used for HTTP 404")
+
+    client._fetch_browser = forbidden
+    async with client:
+        result = await client.fetch("https://example.com/missing")
+    assert not result.success
+    assert result.status_code == 404
+    assert result.error is not None and result.error.code == "http_error"
+    assert result.fetch_method is None
+
+
+@pytest.mark.asyncio
+async def test_auto_does_not_fall_back_for_503():
+    client = PageFetch(mode="auto", cache_enabled=False, retries_http=0)
+    attach_transport(client, lambda request: httpx.Response(503, text="unavailable", request=request))
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("browser must not be used for HTTP 503")
+
+    client._fetch_browser = forbidden
+    async with client:
+        result = await client.fetch("https://example.com/down")
+    assert not result.success
+    assert result.status_code == 503
+    assert result.error is not None and result.error.code == "http_error"
+    assert result.error.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_auto_does_not_fall_back_on_http_timeout():
+    client = PageFetch(mode="auto", cache_enabled=False, retries_http=0, http_timeout=0.01)
+
+    def handler(request: httpx.Request):
+        raise httpx.ReadTimeout("slow upstream", request=request)
+
+    attach_transport(client, handler)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("browser must not be used after HTTP timeout")
+
+    client._fetch_browser = forbidden
+    async with client:
+        result = await client.fetch("https://example.com/slow")
+    assert not result.success
+    assert result.error is not None and result.error.code == "http_timeout"
+    assert result.fetch_method is None
+
+
+@pytest.mark.asyncio
+async def test_auto_does_not_fall_back_on_connection_error():
+    client = PageFetch(mode="auto", cache_enabled=False, retries_http=0)
+
+    def handler(request: httpx.Request):
+        raise httpx.ConnectError("server disconnected", request=request)
+
+    attach_transport(client, handler)
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("browser must not be used after HTTP connection errors")
+
+    client._fetch_browser = forbidden
+    async with client:
+        result = await client.fetch("https://example.com/drop")
+    assert not result.success
+    assert result.error is not None and result.error.code == "connection_error"
+    assert result.fetch_method is None
+
+
+@pytest.mark.asyncio
 async def test_fetch_many_deduplicates_and_preserves_order():
     counts: dict[str, int] = {}
 
@@ -182,7 +256,8 @@ async def test_fetch_many_deduplicates_and_preserves_order():
         results = await client.fetch_many(urls)
     assert [result.url for result in results] == urls
     assert counts == {"https://a.test/": 1, "https://b.test/": 1}
-    assert results[0] is results[2]
+    assert results[0] == results[2]
+    assert results[0] is not results[2]  # duplicates must be independent copies
 
 
 @pytest.mark.asyncio
@@ -304,3 +379,29 @@ async def test_failed_browser_result_does_not_discard_usable_http_content():
     assert result.success and result.fetch_method == "http"
     assert "Small but usable" in result.text
     assert any("was not usable" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_html_sniffed_from_ambiguous_content_type():
+    """HTML content served as application/octet-stream must be accepted via sniffing."""
+    client = PageFetch(mode="auto", cache_enabled=False, retries_http=0)
+    attach_transport(
+        client,
+        lambda request: httpx.Response(
+            200,
+            text=rich_page("Sniffed Page"),
+            headers={"Content-Type": "application/octet-stream"},
+            request=request,
+        ),
+    )
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("browser must not be used when HTML is sniffed")
+
+    client._fetch_browser = forbidden
+    async with client:
+        result = await client.fetch("https://example.com/data")
+    assert result.success
+    assert result.fetch_method == "http"
+    assert result.title == "Sniffed Page"
+    assert result.content_confidence >= 0.80

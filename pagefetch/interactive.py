@@ -226,7 +226,7 @@ def _settings_menu(settings: dict) -> None:
             print(f"\n  Options: {', '.join(sorted(VALID_MODES))}")
             val = _prompt("  Fetch mode", mode)
             if val in VALID_MODES:
-                settings["mode"] = val if val != "auto" else None
+                settings["mode"] = val
             else:
                 print(f"  Invalid mode: {val}")
                 input("  Press Enter...")
@@ -234,7 +234,7 @@ def _settings_menu(settings: dict) -> None:
             print(f"\n  Options: {', '.join(sorted(VALID_PROXIES))}")
             val = _prompt("  Proxy provider", proxy)
             if val in VALID_PROXIES:
-                settings["proxy"] = val if val != "none" else None
+                settings["proxy"] = val
             else:
                 print(f"  Invalid proxy: {val}")
                 input("  Press Enter...")
@@ -308,8 +308,8 @@ def _init_client(settings: dict) -> PageFetch:
     else:
         config = PageFetchConfig()
 
-    mode = settings.get("mode") or config.mode
-    proxy = settings.get("proxy") or config.proxy
+    mode = settings.get("mode") if settings.get("mode") is not None else config.mode
+    proxy = settings.get("proxy") if settings.get("proxy") is not None else config.proxy
     use_cache = settings.get("use_cache", config.cache_enabled)
     cache_ttl = settings.get("cache_ttl", config.cache_ttl)
 

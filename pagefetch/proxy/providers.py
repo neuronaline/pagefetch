@@ -53,7 +53,7 @@ def resolve_proxy(provider: str) -> ProxySettings:
         return ProxySettings(provider=provider, url=full_url)
     names = ["HOST", "PORT", "USERNAME", "PASSWORD"]
     values = {name: os.getenv(f"{prefix}_{name}") for name in names}
-    missing = [f"{prefix}_{name}" for name, value in values.items() if value is None]
+    missing = [f"{prefix}_{name}" for name, value in values.items() if not value]
     if missing:
         raise ProxyConfigurationError(f"missing proxy settings: {', '.join(missing)}")
     try:

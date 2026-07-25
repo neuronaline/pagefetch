@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--browser-concurrency", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--browser-timeout", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--block-images", action="store_true", default=argparse.SUPPRESS, dest="block_images")
+    parser.add_argument("--no-block-images", action="store_false", default=argparse.SUPPRESS, dest="block_images")
     parser.add_argument("--debug", action="store_true")
     return parser
 
@@ -82,6 +84,8 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         overrides["http_timeout"] = args.timeout
     if hasattr(args, "browser_timeout"):
         overrides["browser_timeout"] = args.browser_timeout
+    if hasattr(args, "block_images"):
+        overrides["block_images"] = args.block_images
 
     if not overrides and not args.no_cache:
         return config
@@ -102,6 +106,7 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         max_redirects=config.max_redirects,
         max_content_size=config.max_content_size,
         confidence_threshold=config.confidence_threshold,
+        block_images=bool(overrides.get("block_images", config.block_images)),
         raise_on_error=config.raise_on_error,
     )
 
@@ -126,6 +131,7 @@ async def _run(args: argparse.Namespace) -> int:
         max_redirects=config.max_redirects,
         max_content_size=config.max_content_size,
         confidence_threshold=config.confidence_threshold,
+        block_images=config.block_images,
         raise_on_error=config.raise_on_error,
     ) as client:
         results = await client.fetch_many(urls)

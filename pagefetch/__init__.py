@@ -46,5 +46,3 @@ __all__ = [
     "VALID_PROXIES",
     "ensure_runtime_requirements",
 ]
-
-__version__ = "0.1.0"
