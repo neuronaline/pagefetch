@@ -20,6 +20,29 @@ from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 
 
+# Resource-type blocking sets per stealth level.
+#   minimal:   only pure overhead (media, beacon) + websocket
+#   balanced:  also strip images and pings
+#   aggressive: block everything non-essential including fonts
+#   'websocket' is always included — never needed for content extraction.
+BLOCK_LEVEL_SETS: dict[str, set[str]] = {
+    "minimal": {"media", "beacon", "websocket"},
+    "balanced": {"media", "beacon", "ping", "image", "websocket"},
+    "aggressive": {"media", "beacon", "ping", "image", "font", "websocket"},
+}
+
+# Common desktop viewport pool — avoids a single fixed fingerprint
+# while staying within realistic bounds for content extraction.
+_VIEWPORT_POOL: list[tuple[int, int]] = [
+    (1280, 720),
+    (1366, 768),
+    (1440, 900),
+    (1536, 864),
+    (1600, 900),
+    (1920, 1080),
+]
+
+
 @dataclass(slots=True)
 class BrowserResponse:
     url: str
@@ -42,6 +65,10 @@ class BrowserFetcher:
         max_content_size: int,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
+        block_level: str = "aggressive",
+        humanize: bool = False,
+        geo_locale: str | None = None,
+        geo_timezone: str | None = None,
     ) -> None:
         self.semaphore = semaphore
         self.timeout = timeout
@@ -50,6 +77,10 @@ class BrowserFetcher:
         self.max_content_size = max_content_size
         self.confidence_threshold = confidence_threshold
         self.block_images = block_images
+        self.block_level = block_level
+        self.humanize = humanize
+        self.geo_locale = geo_locale
+        self.geo_timezone = geo_timezone
         self._manager: Any = None
         self._browser: Any = None
         self._start_lock = asyncio.Lock()
@@ -85,14 +116,16 @@ class BrowserFetcher:
 
                 options: dict[str, Any] = {
                     "headless": True,
-                    "humanize": False,
+                    "humanize": self.humanize,
                     "enable_cache": True,
                     "block_webrtc": True,
-                    "locale": "en-US",
-                    "window": (1280, 720),
+                    "locale": self.geo_locale or "en-US",
+                    "window": random.choice(_VIEWPORT_POOL),
                 }
                 if self.block_images:
                     options["block_images"] = True
+                if self.geo_timezone:
+                    options["timezone_id"] = self.geo_timezone
                 host_os = self._detect_os()
                 if host_os is not None:
                     options["os"] = host_os
@@ -127,13 +160,28 @@ class BrowserFetcher:
                 ) from exc
             self._needs_reset = False
 
-    async def fetch(self, url: str) -> BrowserResponse:
+    async def fetch(self, url: str, *, proxy: ProxySettings | None = None) -> BrowserResponse:
         """Fetch a URL through the browser with adaptive retries.
 
         The semaphore is acquired only during browser I/O, not during HTML
         analysis or inter-retry backoff, so other tasks can use the browser
         during those windows.
+
+        When *proxy* is provided it overrides ``self.proxy`` for this
+        request.  If the browser is already running with a different proxy
+        configuration it will be torn down and restarted transparently.
         """
+        if proxy is not None and proxy != self.proxy:
+            self.proxy = proxy
+            self._needs_reset = True
+            self._browser = None
+            if self._manager is not None:
+                try:
+                    await self._manager.__aexit__(None, None, None)
+                except Exception:
+                    pass
+                self._manager = None
+
         last_failure: TransportFailure | None = None
         total_deadline = time.monotonic() + self.timeout
         # Start with a balanced scroll profile; escalate on retry.
@@ -172,7 +220,7 @@ class BrowserFetcher:
                         max_scrolls = min(12, max_scrolls + 3)
                         scroll_sleep_early = min(0.20, scroll_sleep_early + 0.03)
                         scroll_sleep_late = min(0.28, scroll_sleep_late + 0.05)
-                        await asyncio.sleep(0.4 * (2**attempt) + random.uniform(0, 0.15))
+                        await asyncio.sleep(0.5 * (2**attempt) + random.uniform(0, 0.50))
                         continue
 
                     return result
@@ -183,7 +231,7 @@ class BrowserFetcher:
                     if exc.error.code in {"browser_launch_error", "browser_navigation_error"}:
                         self._browser = None
                         self._needs_reset = True
-                    await asyncio.sleep(0.4 * (2**attempt) + random.uniform(0, 0.15))
+                    await asyncio.sleep(0.5 * (2**attempt) + random.uniform(0, 0.50))
             assert last_failure is not None
             raise last_failure
         finally:
@@ -212,12 +260,18 @@ class BrowserFetcher:
         Uses an adaptive early-exit probe: if the page is already complete
         after the first stability wait, scrolling and the second wait are
         skipped entirely.
+
+        Each call creates a new browser *context* (isolated cookie jar,
+        localStorage, cache) and tears it down at the end so consecutive
+        fetches are not linkable through shared storage.
         """
         page: Any = None
+        context: Any = None
         warnings: list[str] = []
         try:
             async with asyncio.timeout(page_timeout):
-                page = await self._browser.new_page()
+                context = await self._browser.new_context()
+                page = await context.new_page()
                 network = {"active": 0, "last_activity": time.monotonic()}
 
                 def request_started(_request: Any) -> None:
@@ -243,12 +297,24 @@ class BrowserFetcher:
                         request_url = request.url
                         if request_url.startswith(("http://", "https://")):
                             external_frame = registrable_host(request_url) != _main_site
-                    # Block non-essential resource types.  Image blocking via
-                    # the route handler is defense-in-depth when Camoufox
-                    # `block_images=True` is set; `ping`/`beacon` are always
-                    # pure overhead for content extraction.
-                    blocked = {"font", "media", "image", "ping", "beacon"}
-                    if request.resource_type in blocked or external_frame:
+                    # Block non-essential resource types according to the
+                    # configured block_level.  Image blocking via the route
+                    # handler is defense-in-depth when Camoufox `block_images`
+                    # is set; `ping`/`beacon` are pure overhead for content
+                    # extraction.
+                    blocked = BLOCK_LEVEL_SETS.get(self.block_level, BLOCK_LEVEL_SETS["aggressive"])
+                    # Also block cross-site scripts, XHR, and fetch requests.
+                    # Third-party analytics/tracking scripts add no value for
+                    # content extraction and make the browser fingerprint
+                    # detectable through network-side correlation.
+                    external_script = False
+                    _main_frame = getattr(page, "main_frame", None)
+                    if request.resource_type in {"script", "xhr", "fetch"} and _main_frame is not None:
+                        if getattr(request, "frame", None) != _main_frame:
+                            request_url = request.url
+                            if request_url.startswith(("http://", "https://")):
+                                external_script = registrable_host(request_url) != _main_site
+                    if request.resource_type in blocked or external_frame or external_script:
                         await route.abort()
                     else:
                         await route.continue_()
@@ -342,6 +408,11 @@ class BrowserFetcher:
             if page is not None:
                 try:
                     await page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    await context.close()
                 except Exception:
                     pass
 

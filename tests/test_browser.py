@@ -79,12 +79,16 @@ async def test_browser_blocks_media_fonts_images_ping_beacon(monkeypatch):
 
     page = Page()
     fetcher = make_fetcher()
-    fetcher._browser = SimpleNamespace(new_page=lambda: None)
-
+    # Browser context isolation: _fetch_page_once now creates a new
+    # context per call, then a page from that context.
     async def new_page():
         return page
+    mock_context = SimpleNamespace(new_page=new_page)
 
-    fetcher._browser.new_page = new_page
+    async def new_context():
+        return mock_context
+
+    fetcher._browser = SimpleNamespace(new_context=new_context)
     monkeypatch.setattr(browser_module, "wait_for_stability", stable)
     monkeypatch.setattr(browser_module, "controlled_scroll", scroll)
     monkeypatch.setattr(browser_module, "in_page_metrics", probe)
@@ -165,12 +169,14 @@ async def test_browser_timeout_is_structured(monkeypatch):
             self.closed = True
 
     page = SlowPage()
-    fetcher._browser = SimpleNamespace(new_page=lambda: None)
-
     async def new_page():
         return page
+    mock_context = SimpleNamespace(new_page=new_page)
 
-    fetcher._browser.new_page = new_page
+    async def new_context():
+        return mock_context
+
+    fetcher._browser = SimpleNamespace(new_context=new_context)
     monkeypatch.setattr(fetcher, "start", start)
     with pytest.raises(TransportFailure) as caught:
         await fetcher.fetch("https://example.com/")

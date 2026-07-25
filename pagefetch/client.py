@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from hashlib import md5
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -20,9 +23,11 @@ from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
 from .constants import (
     BLOCKED_STATUS_CODES,
     BROWSER_HEADERS,
+    GEO_MAP,
     RETRYABLE_STATUS_CODES,
     SAFE_RESPONSE_HEADERS,
     XML_TYPES,
+    _UA_POOL,
 )
 from .exceptions import PageFetchError
 from .fetching import BrowserFetcher, HTTPFetcher, HTTPResponse, TransportFailure
@@ -30,9 +35,14 @@ from .models import FetchErrorInfo, FetchResult
 from .processing.detector import ConfidenceReport, analyze_html
 from .processing.html import process_html
 from .processing.non_html import process_pdf, process_text, process_xml
-from .proxy import ProxyConfigurationError, resolve_proxy
+from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
+from .proxy.providers import (
+    _inject_session_id,
+    make_domain_session,
+    make_random_session,
+)
 from .utils.durations import parse_duration
-from .utils.urls import normalize_url, validate_url
+from .utils.urls import normalize_url, registrable_host, validate_url
 
 logger = logging.getLogger("pagefetch")
 
@@ -63,6 +73,13 @@ class PageFetch:
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
+        block_level: Literal["minimal", "balanced", "aggressive"] = "aggressive",
+        accept_language: str = "en-US,en;q=0.5",
+        humanize: bool = False,
+        session_rotation: Literal["sticky", "rotate"] = "sticky",
+        request_pacing: float = 0.0,
+        stealth_level: Literal["off", "balanced", "max"] = "off",
+        proxy_geo: str | None = None,
         raise_on_error: bool = False,
     ) -> None:
         self.config = PageFetchConfig.build(
@@ -81,6 +98,13 @@ class PageFetch:
             max_content_size=max_content_size,
             confidence_threshold=confidence_threshold,
             block_images=block_images,
+            block_level=block_level,
+            accept_language=accept_language,
+            humanize=humanize,
+            session_rotation=session_rotation,
+            request_pacing=request_pacing,
+            stealth_level=stealth_level,
+            proxy_geo=proxy_geo,
             raise_on_error=raise_on_error,
         )
         self._http_semaphore = asyncio.Semaphore(self.config.http_concurrency)
@@ -124,7 +148,25 @@ class PageFetch:
                     self._startup_warnings.append("Cache initialization failed; caching is disabled.")
                     logger.warning("cache initialization failed: %s", type(exc).__name__)
             self._started = True
+            self._log_fingerprint_summary()
         return self
+
+    def _log_fingerprint_summary(self) -> None:
+        """Emit a one-line diagnostic summarising the anti-detection posture."""
+        cfg = self.config
+        parts: list[str] = []
+        parts.append(f"stealth={cfg.stealth_level}")
+        parts.append(f"humanize={'on' if cfg.humanize else 'off'}")
+        parts.append(f"block={cfg.block_level}")
+        if cfg.request_pacing > 0:
+            parts.append(f"pacing={cfg.request_pacing:.1f}s")
+        parts.append(f"session={cfg.session_rotation}")
+        parts.append(f"lang={cfg.accept_language}")
+        if cfg.proxy_geo:
+            parts.append(f"geo={cfg.proxy_geo}")
+        if cfg.mode == "auto":
+            parts.append("mode=auto (HTTP→browser)")
+        logger.info("fingerprint profile: %s", ", ".join(parts))
 
     async def close(self) -> None:
         """Release all HTTP clients, browser processes, and the cache database.
@@ -246,6 +288,7 @@ class PageFetch:
             mode=selected_mode,
             proxy=selected_proxy,
             settings={
+                "accept_language": self.config.accept_language,
                 "block_images": self.config.block_images,
                 "browser_timeout": self.config.browser_timeout,
                 "confidence_threshold": self.config.confidence_threshold,
@@ -383,7 +426,17 @@ class PageFetch:
                     fetched_at=datetime.now(UTC),
                 )
 
-        fetched = await asyncio.gather(*(one(item) for item in unique))
+        if self.config.request_pacing > 0 and len(unique) > 1:
+            # Stagger task creation to avoid a synchronized burst of
+            # requests arriving at the same instant — a strong bot signal.
+            tasks: list[asyncio.Task[FetchResult]] = []
+            for i, item in enumerate(unique):
+                if i > 0:
+                    await asyncio.sleep(random.uniform(0, self.config.request_pacing))
+                tasks.append(asyncio.create_task(one(item)))
+            fetched = await asyncio.gather(*tasks)
+        else:
+            fetched = await asyncio.gather(*(one(item) for item in unique))
         by_url = dict(zip(unique, fetched, strict=True))
         # For duplicate URLs, return independent copies so callers
         # do not accidentally alias mutable fields across entries.
@@ -400,7 +453,28 @@ class PageFetch:
 
     async def _fetch_http_or_auto(self, url: str, mode: Literal["auto", "http", "browser"], proxy: str) -> FetchResult:
         try:
-            response = await (await self._http_fetcher(proxy)).fetch(url)
+            fetcher = await self._http_fetcher(proxy, url)
+            # In rotate mode the shared fetcher uses the base proxy URL;
+            # inject a random session into the proxy URL per-request here.
+            _rotate_proxy_url: str | None = None
+            _per_request_headers: dict[str, str] | None = None
+            if self.config.session_rotation == "rotate" and proxy != "none":
+                _settings = resolve_proxy(proxy)
+                if _settings.url:
+                    _rotate_proxy_url = _inject_session_id(_settings.url, make_random_session())
+                # Per-request UA and Accept-Language so each request in rotate
+                # mode gets its own fingerprint — the shared client only has
+                # the first URL's values.
+                _per_request_headers = dict(BROWSER_HEADERS)
+                domain = urlsplit(url).hostname or url
+                pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(_UA_POOL)
+                _per_request_headers["User-Agent"] = _UA_POOL[pool_idx]
+                if self.config.proxy_geo:
+                    geo = GEO_MAP[self.config.proxy_geo]
+                    _per_request_headers["Accept-Language"] = geo["accept_language"]
+                else:
+                    _per_request_headers["Accept-Language"] = self.config.accept_language
+            response = await fetcher.fetch(url, proxy_url=_rotate_proxy_url, headers=_per_request_headers)
         except TransportFailure:
             # Timeouts, DNS failures, disconnects, and other transport errors are not
             # fixed by rendering in a browser — surface them immediately instead of
@@ -412,6 +486,11 @@ class PageFetch:
             # 4xx like 404 and 5xx server errors should fail fast at the HTTP layer.
             if mode == "auto" and response.status_code in BLOCKED_STATUS_CODES:
                 logger.info("HTTP %s; using browser for %s", response.status_code, url)
+                # ── auto-mode double-hit softening ──
+                # Insert a short random delay before the browser fallback so
+                # the same proxy/source IP does not emit two different TLS
+                # stacks (httpx → Camoufox) back-to-back — a strong bot signal.
+                await asyncio.sleep(random.uniform(0.5, 3.0))
                 return await self._fetch_browser(url, proxy, status_code=response.status_code)
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
             raise TransportFailure(
@@ -440,6 +519,8 @@ class PageFetch:
         report = analyze_html(html, soup=raw_soup)
         if mode == "auto" and report.score < self.config.confidence_threshold:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
+            # ── auto-mode double-hit softening ──
+            await asyncio.sleep(random.uniform(0.5, 3.0))
             try:
                 rendered = await self._fetch_browser(url, proxy, status_code=response.status_code)
             except TransportFailure:
@@ -504,7 +585,16 @@ class PageFetch:
         return result
 
     async def _fetch_browser(self, url: str, proxy: str, status_code: int | None) -> FetchResult:
-        response = await (await self._browser_fetcher(proxy)).fetch(url)
+        fetcher = await self._browser_fetcher(proxy, url)
+        # In rotate mode the shared BrowserFetcher uses the base proxy;
+        # inject a random session into the proxy URL per-request here.
+        _rotate_proxy: ProxySettings | None = None
+        if self.config.session_rotation == "rotate" and proxy != "none":
+            _settings = resolve_proxy(proxy)
+            if _settings.url:
+                _proxy_url = _inject_session_id(_settings.url, make_random_session())
+                _rotate_proxy = ProxySettings(provider=_settings.provider, url=_proxy_url)
+        response = await fetcher.fetch(url, proxy=_rotate_proxy)
         raw_soup = BeautifulSoup(response.html, "lxml")
         result = self._result_from_html(
             original_url=url,
@@ -535,48 +625,96 @@ class PageFetch:
             result.warnings.append("Rendered content may still be incomplete.")
         return result
 
-    async def _http_fetcher(self, provider: str) -> HTTPFetcher:
-        if provider not in self._http_fetchers:
+    async def _http_fetcher(self, provider: str, url: str = "") -> HTTPFetcher:
+        session_id = ""
+        if self.config.session_rotation == "sticky" and provider != "none":
+            domain = registrable_host(url) or url
+            session_id = make_domain_session(domain)
+        # In rotate mode the cache key is provider-only so fetchers are
+        # reused across requests — session injection happens at fetch time.
+        # In sticky mode the key includes the session so each domain gets
+        # its own dedicated client.
+        if self.config.session_rotation == "rotate":
+            cache_key = provider
+        else:
+            cache_key = f"{provider}_{session_id}" if session_id else provider
+        if cache_key not in self._http_fetchers:
             async with self._http_init_lock:
-                if provider in self._http_fetchers:
-                    return self._http_fetchers[provider]
+                if cache_key in self._http_fetchers:
+                    return self._http_fetchers[cache_key]
                 settings = resolve_proxy(provider)
+                if self.config.session_rotation == "sticky" and session_id and settings.url:
+                    proxy_url = _inject_session_id(settings.url, session_id)
+                else:
+                    proxy_url = settings.url
+                # ── per-domain User-Agent rotation ──
+                headers = dict(BROWSER_HEADERS)
+                if url:
+                    domain = urlsplit(url).hostname or url
+                    pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(_UA_POOL)
+                    headers["User-Agent"] = _UA_POOL[pool_idx]
+                # ── proxy geo alignment ──
+                if self.config.proxy_geo:
+                    geo = GEO_MAP[self.config.proxy_geo]
+                    headers["Accept-Language"] = geo["accept_language"]
+                else:
+                    headers["Accept-Language"] = self.config.accept_language
                 client = httpx.AsyncClient(
-                    headers=BROWSER_HEADERS,
+                    headers=headers,
                     timeout=httpx.Timeout(self.config.http_timeout),
                     follow_redirects=True,
                     max_redirects=self.config.max_redirects,
                     http2=True,
-                    proxy=settings.url,
+                    proxy=proxy_url,
                     limits=httpx.Limits(
                         max_connections=self.config.http_concurrency * 2,
                         max_keepalive_connections=self.config.http_concurrency,
                     ),
                 )
-                self._http_clients[provider] = client
-                self._http_fetchers[provider] = HTTPFetcher(
+                self._http_clients[cache_key] = client
+                self._http_fetchers[cache_key] = HTTPFetcher(
                     client,
                     self._http_semaphore,
                     retries=self.config.retries_http,
                     max_content_size=self.config.max_content_size,
                 )
-        return self._http_fetchers[provider]
+        return self._http_fetchers[cache_key]
 
-    async def _browser_fetcher(self, provider: str) -> BrowserFetcher:
-        if provider not in self._browser_fetchers:
+    async def _browser_fetcher(self, provider: str, url: str = "") -> BrowserFetcher:
+        session_id = ""
+        if self.config.session_rotation == "sticky" and provider != "none":
+            domain = registrable_host(url) or url
+            session_id = make_domain_session(domain)
+        # Same cache-key strategy as _http_fetcher: in rotate mode the key is
+        # provider-only so a single BrowserFetcher instance is reused and the
+        # per-request proxy override is passed through fetch().
+        if self.config.session_rotation == "rotate":
+            cache_key = provider
+        else:
+            cache_key = f"{provider}_{session_id}" if session_id else provider
+        if cache_key not in self._browser_fetchers:
             async with self._browser_init_lock:
-                if provider in self._browser_fetchers:
-                    return self._browser_fetchers[provider]
-                self._browser_fetchers[provider] = BrowserFetcher(
+                if cache_key in self._browser_fetchers:
+                    return self._browser_fetchers[cache_key]
+                settings = resolve_proxy(provider)
+                if self.config.session_rotation == "sticky" and session_id and settings.url:
+                    proxy_url = _inject_session_id(settings.url, session_id)
+                else:
+                    proxy_url = settings.url
+                self._browser_fetchers[cache_key] = BrowserFetcher(
                     self._browser_semaphore,
                     timeout=self.config.browser_timeout,
                     retries=self.config.retries_browser,
-                    proxy=resolve_proxy(provider),
+                    proxy=ProxySettings(provider=settings.provider, url=proxy_url),
                     max_content_size=self.config.max_content_size,
                     confidence_threshold=self.config.confidence_threshold,
                     block_images=self.config.block_images,
+                    block_level=self.config.block_level,
+                    humanize=self.config.humanize,
+                    geo_locale=GEO_MAP[self.config.proxy_geo]["locale"] if self.config.proxy_geo else None,
+                    geo_timezone=GEO_MAP[self.config.proxy_geo]["timezone"] if self.config.proxy_geo else None,
                 )
-        return self._browser_fetchers[provider]
+        return self._browser_fetchers[cache_key]
 
     def _result_from_html(
         self,

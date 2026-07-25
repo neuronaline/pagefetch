@@ -45,15 +45,37 @@ class HTTPFetcher:
         self.retries = retries
         self.max_content_size = max_content_size
 
-    async def fetch(self, url: str) -> HTTPResponse:
+    async def fetch(self, url: str, *, proxy_url: str | None = None, headers: dict[str, str] | None = None) -> HTTPResponse:
+        if proxy_url is not None:
+            # Session-rotation mode: use a one-shot client with the
+            # session-injected proxy URL to avoid leaking client objects
+            # into the shared pool.
+            req_headers = headers if headers is not None else self.client.headers
+            client = httpx.AsyncClient(
+                headers=req_headers,
+                timeout=self.client.timeout,
+                follow_redirects=True,
+                max_redirects=self.client.max_redirects,
+                http2=True,
+                proxy=proxy_url,
+                limits=httpx.Limits(
+                    max_connections=self.retries + 1,
+                    max_keepalive_connections=1,
+                ),
+            )
+            try:
+                async with self.semaphore:
+                    return await self._fetch_with_retries(url, client=client)
+            finally:
+                await client.aclose()
         async with self.semaphore:
-            return await self._fetch_with_retries(url)
+            return await self._fetch_with_retries(url, client=None)
 
-    async def _fetch_with_retries(self, url: str) -> HTTPResponse:
+    async def _fetch_with_retries(self, url: str, *, client: httpx.AsyncClient | None = None) -> HTTPResponse:
         last_failure: TransportFailure | None = None
         for attempt in range(self.retries + 1):
             try:
-                response = await self._request(url)
+                response = await self._request(url, client=client)
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.retries:
                     await self._backoff(attempt, response.headers.get("Retry-After"))
                     continue
@@ -66,9 +88,10 @@ class HTTPFetcher:
         assert last_failure is not None
         raise last_failure
 
-    async def _request(self, url: str) -> HTTPResponse:
+    async def _request(self, url: str, *, client: httpx.AsyncClient | None = None) -> HTTPResponse:
+        client = client or self.client
         try:
-            async with self.client.stream("GET", url) as response:
+            async with client.stream("GET", url) as response:
                 declared = response.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > self.max_content_size:
                     raise TransportFailure(
@@ -128,9 +151,9 @@ class HTTPFetcher:
             if seconds is not None:
                 delay = min(seconds, 10.0)
             else:
-                delay = min(0.25 * (2**attempt) + random.uniform(0, 0.15), 3.0)
+                delay = min(0.30 * (2**attempt) + random.uniform(0, 0.40), 5.0)
         else:
-            delay = min(0.25 * (2**attempt) + random.uniform(0, 0.15), 3.0)
+            delay = min(0.30 * (2**attempt) + random.uniform(0, 0.40), 5.0)
         await asyncio.sleep(delay)
 
     @staticmethod

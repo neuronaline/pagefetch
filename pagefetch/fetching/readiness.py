@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from collections.abc import Callable
 from typing import Any, TypedDict
@@ -111,11 +112,12 @@ async def controlled_scroll(
         height = int(metrics.get("height", 0))
         if height > max_height:
             return True
-        # Adaptive sleep: shorter early, shorter late (tightened from original 0.10/0.18/0.28).
+        # Adaptive sleep with jitter — avoid perfectly regular intervals that
+        # make bot detection trivial.  ±25 % around the base value.
         if index < 3:
-            await asyncio.sleep(sleep_early)
+            await asyncio.sleep(sleep_early * random.uniform(0.75, 1.25))
         else:
-            await asyncio.sleep(sleep_late)
+            await asyncio.sleep(sleep_late * random.uniform(0.75, 1.25))
         if height <= previous_height and int(metrics.get("y", 0)) + int(metrics.get("viewport", 0)) >= height:
             unchanged += 1
             if unchanged >= 2:

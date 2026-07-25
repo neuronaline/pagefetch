@@ -13,8 +13,37 @@ from platformdirs import user_cache_path
 
 from .utils.durations import parse_duration
 
+from .constants import GEO_MAP
+
 VALID_MODES = frozenset({"auto", "http", "browser"})
 VALID_PROXIES = frozenset({"none", "decodo", "dataimpulse"})
+VALID_BLOCK_LEVELS = frozenset({"minimal", "balanced", "aggressive"})
+VALID_SESSION_ROTATION = frozenset({"sticky", "rotate"})
+VALID_STEALTH_LEVELS = frozenset({"off", "balanced", "max"})
+
+# Stealth presets override multiple individual options in one shot.
+# Individual fields given to `build()` take precedence over the preset
+# defaults so callers can still fine-tune after choosing a level.
+_STEALTH_PRESETS: dict[str, dict[str, object]] = {
+    "off": {
+        "humanize": False,
+        "block_level": "aggressive",
+        "request_pacing": 0.0,
+        "session_rotation": "sticky",
+    },
+    "balanced": {
+        "humanize": True,
+        "block_level": "balanced",
+        "request_pacing": 0.5,
+        "session_rotation": "rotate",
+    },
+    "max": {
+        "humanize": True,
+        "block_level": "minimal",
+        "request_pacing": 2.0,
+        "session_rotation": "rotate",
+    },
+}
 
 _ENV_VAR_RE = re.compile(r"\$\{(\w+)(?::([^}]*))?\}")
 
@@ -50,6 +79,13 @@ class PageFetchConfig:
     max_content_size: int = 25 * 1024 * 1024
     confidence_threshold: float = 0.80
     block_images: bool = True
+    block_level: Literal["minimal", "balanced", "aggressive"] = "aggressive"
+    accept_language: str = "en-US,en;q=0.5"
+    humanize: bool = False
+    session_rotation: Literal["sticky", "rotate"] = "sticky"
+    request_pacing: float = 0.0
+    stealth_level: Literal["off", "balanced", "max"] = "off"
+    proxy_geo: str | None = None
     raise_on_error: bool = False
 
     @classmethod
@@ -82,6 +118,14 @@ class PageFetchConfig:
                 flat.update(section_data)
         flat.update(resolved)
 
+        # ── stealth preset application ──
+        stealth = flat.get("stealth_level", "off")
+        if stealth != "off":
+            preset = _STEALTH_PRESETS[stealth]
+            for field, value in preset.items():
+                # Preset values are defaults — explicit YAML keys win.
+                flat.setdefault(field, value)
+
         return cls.build(
             mode=flat.get("mode", "auto"),
             proxy=flat.get("proxy", "none"),
@@ -98,6 +142,13 @@ class PageFetchConfig:
             max_content_size=flat.get("max_content_size", 25 * 1024 * 1024),
             confidence_threshold=flat.get("confidence_threshold", 0.80),
             block_images=flat.get("block_images", True),
+            block_level=flat.get("block_level", "aggressive"),
+            accept_language=flat.get("accept_language", "en-US,en;q=0.5"),
+            humanize=flat.get("humanize", False),
+            session_rotation=flat.get("session_rotation", "sticky"),
+            request_pacing=flat.get("request_pacing", 0.0),
+            stealth_level=flat.get("stealth_level", "off"),
+            proxy_geo=flat.get("proxy_geo"),
             raise_on_error=flat.get("raise_on_error", False),
         )
 
@@ -120,6 +171,13 @@ class PageFetchConfig:
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
+        block_level: Literal["minimal", "balanced", "aggressive"] = "aggressive",
+        accept_language: str = "en-US,en;q=0.5",
+        humanize: bool = False,
+        session_rotation: Literal["sticky", "rotate"] = "sticky",
+        request_pacing: float = 0.0,
+        stealth_level: Literal["off", "balanced", "max"] = "off",
+        proxy_geo: str | None = None,
         raise_on_error: bool = False,
     ) -> PageFetchConfig:
         if not isinstance(mode, str) or mode not in VALID_MODES:
@@ -152,10 +210,28 @@ class PageFetchConfig:
             or not 0 <= confidence_threshold <= 1
         ):
             raise ValueError("confidence_threshold must be between 0 and 1")
-        if not isinstance(cache_enabled, bool) or not isinstance(raise_on_error, bool):
-            raise ValueError("cache_enabled and raise_on_error must be booleans")
+        if not isinstance(cache_enabled, bool) or not isinstance(raise_on_error, bool) or not isinstance(humanize, bool):
+            raise ValueError("cache_enabled, humanize, and raise_on_error must be booleans")
         if not isinstance(block_images, bool):
             raise ValueError("block_images must be a boolean")
+        if not isinstance(block_level, str) or block_level not in VALID_BLOCK_LEVELS:
+            raise ValueError(f"block_level must be one of {sorted(VALID_BLOCK_LEVELS)}")
+        if not isinstance(accept_language, str) or not accept_language.strip():
+            raise ValueError("accept_language must be a non-empty string")
+        if not isinstance(session_rotation, str) or session_rotation not in VALID_SESSION_ROTATION:
+            raise ValueError(f"session_rotation must be one of {sorted(VALID_SESSION_ROTATION)}")
+        if (
+            not isinstance(request_pacing, (int, float))
+            or isinstance(request_pacing, bool)
+            or not math.isfinite(request_pacing)
+            or request_pacing < 0
+        ):
+            raise ValueError("request_pacing must be a non-negative finite number")
+        if not isinstance(stealth_level, str) or stealth_level not in VALID_STEALTH_LEVELS:
+            raise ValueError(f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}")
+        if proxy_geo is not None:
+            if not isinstance(proxy_geo, str) or proxy_geo not in GEO_MAP:
+                raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")
         ttl = parse_duration(cache_ttl)
         path = Path(cache_path).expanduser() if cache_path is not None else user_cache_path("pagefetch") / "cache.sqlite3"
         return cls(
@@ -174,5 +250,12 @@ class PageFetchConfig:
             max_content_size=max_content_size,
             confidence_threshold=float(confidence_threshold),
             block_images=block_images,
+            block_level=block_level,
+            accept_language=accept_language.strip(),
+            humanize=humanize,
+            session_rotation=session_rotation,
+            request_pacing=float(request_pacing),
+            stealth_level=stealth_level,
+            proxy_geo=proxy_geo.strip() if proxy_geo else None,
             raise_on_error=raise_on_error,
         )

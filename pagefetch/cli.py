@@ -39,6 +39,46 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-images", action="store_true", default=argparse.SUPPRESS, dest="block_images")
     parser.add_argument("--no-block-images", action="store_false", default=argparse.SUPPRESS, dest="block_images")
     parser.add_argument("--debug", action="store_true")
+    # Stealth / fingerprint configuration
+    parser.add_argument(
+        "--block-level",
+        choices=("minimal", "balanced", "aggressive"),
+        default=argparse.SUPPRESS,
+        help="Resource blocking aggressiveness (default: aggressive)",
+    )
+    parser.add_argument(
+        "--accept-language",
+        metavar="HEADER",
+        default=argparse.SUPPRESS,
+        help="Accept-Language header (default: en-US,en;q=0.5)",
+    )
+    parser.add_argument("--humanize", action="store_true", default=argparse.SUPPRESS, dest="humanize")
+    parser.add_argument("--no-humanize", action="store_false", default=argparse.SUPPRESS, dest="humanize")
+    parser.add_argument(
+        "--session-rotation",
+        choices=("sticky", "rotate"),
+        default=argparse.SUPPRESS,
+        help="Proxy session rotation strategy (default: sticky)",
+    )
+    parser.add_argument(
+        "--request-pacing",
+        type=float,
+        metavar="SECONDS",
+        default=argparse.SUPPRESS,
+        help="Delay between requests (default: 0.0)",
+    )
+    parser.add_argument(
+        "--stealth-level",
+        choices=("off", "balanced", "max"),
+        default=argparse.SUPPRESS,
+        help="Anti-detection profile preset (default: off)",
+    )
+    parser.add_argument(
+        "--proxy-geo",
+        metavar="CC",
+        default=argparse.SUPPRESS,
+        help="Align locale/timezone/lang with proxy exit country (ISO 3166-1 alpha-2, e.g. US, DE, TR)",
+    )
     return parser
 
 
@@ -86,6 +126,20 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         overrides["browser_timeout"] = args.browser_timeout
     if hasattr(args, "block_images"):
         overrides["block_images"] = args.block_images
+    if hasattr(args, "block_level"):
+        overrides["block_level"] = args.block_level
+    if hasattr(args, "accept_language"):
+        overrides["accept_language"] = args.accept_language
+    if hasattr(args, "humanize"):
+        overrides["humanize"] = args.humanize
+    if hasattr(args, "session_rotation"):
+        overrides["session_rotation"] = args.session_rotation
+    if hasattr(args, "request_pacing"):
+        overrides["request_pacing"] = args.request_pacing
+    if hasattr(args, "stealth_level"):
+        overrides["stealth_level"] = args.stealth_level
+    if hasattr(args, "proxy_geo"):
+        overrides["proxy_geo"] = args.proxy_geo
 
     if not overrides and not args.no_cache:
         return config
@@ -107,6 +161,13 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         max_content_size=config.max_content_size,
         confidence_threshold=config.confidence_threshold,
         block_images=bool(overrides.get("block_images", config.block_images)),
+        block_level=overrides.get("block_level", config.block_level),
+        accept_language=overrides.get("accept_language", config.accept_language),
+        humanize=bool(overrides.get("humanize", config.humanize)),
+        session_rotation=overrides.get("session_rotation", config.session_rotation),
+        request_pacing=float(overrides.get("request_pacing", config.request_pacing)),
+        stealth_level=overrides.get("stealth_level", config.stealth_level),
+        proxy_geo=overrides.get("proxy_geo", config.proxy_geo),
         raise_on_error=config.raise_on_error,
     )
 
@@ -132,6 +193,13 @@ async def _run(args: argparse.Namespace) -> int:
         max_content_size=config.max_content_size,
         confidence_threshold=config.confidence_threshold,
         block_images=config.block_images,
+        block_level=config.block_level,
+        accept_language=config.accept_language,
+        humanize=config.humanize,
+        session_rotation=config.session_rotation,
+        request_pacing=config.request_pacing,
+        stealth_level=config.stealth_level,
+        proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
     ) as client:
         results = await client.fetch_many(urls)
