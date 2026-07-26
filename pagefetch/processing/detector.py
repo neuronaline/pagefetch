@@ -8,17 +8,19 @@ from dataclasses import dataclass
 
 from bs4 import BeautifulSoup
 
-CHALLENGE_PATTERNS = (
+STRONG_CHALLENGE_PATTERNS = (
     "checking your browser",
     "verify you are human",
     "attention required",
-    "access denied",
-    "unusual traffic",
-    "captcha",
 )
+WEAK_CHALLENGE_PATTERNS = ("access denied", "unusual traffic", "captcha")
 # DOM-level challenge markers that are safe to scan in raw HTML
 CHALLENGE_DOM_PATTERNS = (
     "cf-chl-",
+    "g-recaptcha",
+    "h-captcha",
+    "cf-turnstile",
+    "challenge-form",
 )
 JS_PATTERNS = (
     "enable javascript",
@@ -60,13 +62,18 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         soup = BeautifulSoup(html, "lxml")
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
 
-    # Single pass: capture script payload size AND decompose noise tags.
-    script_size = 0
-    for tag in soup(["script", "style", "template", "noscript"]):
-        if tag.name == "script":
-            script_size += len(str(tag))
-        tag.decompose()
-    text = " ".join((soup.body or soup).stripped_strings)
+    # Inspect noise tags without mutating the caller's tree. The same soup is
+    # reused by metadata extraction, where JSON-LD script nodes are meaningful.
+    noise_tags = soup(["script", "style", "template", "noscript"])
+    script_size = sum(len(str(tag)) for tag in noise_tags if tag.name == "script")
+    text_root = soup.body or soup
+    text = " ".join(
+        value
+        for node in text_root.find_all(string=True)
+        if node.parent is not None
+        and node.parent.name not in {"script", "style", "template", "noscript"}
+        and (value := str(node).strip())
+    )
     lowered_text = text.lower()
     lowered_html = html.lower()
     text_len = len(text)
@@ -121,9 +128,20 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     if soup.find("meta", attrs={"name": re.compile(r"description", re.I)}):
         score += 0.02
 
-    challenge = any(pattern in lowered_text for pattern in CHALLENGE_PATTERNS) or any(
-        pattern in lowered_html for pattern in CHALLENGE_DOM_PATTERNS
+    strong_challenge = any(pattern in lowered_text for pattern in STRONG_CHALLENGE_PATTERNS)
+    dom_challenge = any(pattern in lowered_html for pattern in CHALLENGE_DOM_PATTERNS)
+    weak_hits = sum(pattern in lowered_text for pattern in WEAK_CHALLENGE_PATTERNS)
+    normalized_title = re.sub(r"\s+", " ", title.strip().lower())
+    weak_title = any(
+        normalized_title == pattern or normalized_title.startswith(f"{pattern} |")
+        for pattern in WEAK_CHALLENGE_PATTERNS
     )
+    weak_challenge = bool(
+        weak_hits
+        and text_len < 300
+        and (weak_title or (not semantic and not paragraphs))
+    )
+    challenge = strong_challenge or dom_challenge or weak_challenge
     explicit_js = any(pattern in lowered_text for pattern in JS_PATTERNS)
     framework = any(pattern in lowered_html for pattern in FRAMEWORK_PATTERNS)
     mounts = soup.select("#app:empty, #root:empty, #__next:empty, [data-reactroot]:empty")
@@ -136,9 +154,10 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     navigation_text = " ".join(nav_texts)
     main_text = " ".join(main_texts)
 
-    # Complete short static pages (e.g. example.com) are fully server-rendered and
-    # should not force an expensive browser fallback just because they are brief.
-    coherent_short = (
+    # Reward coherent server-rendered documents continuously. Limiting this
+    # bonus to <400 characters created a cliff where adding content lowered
+    # confidence and triggered unnecessary browser fallbacks.
+    coherent_static = (
         not shell
         and not challenge
         and not placeholder
@@ -147,12 +166,12 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and not mounts
         and not explicit_js
         and script_size < 2_000
-        and 80 <= text_len < 400
+        and text_len >= 80
         and word_count >= 12
         and (bool(paragraphs) or bool(headings))
         and (title_overlap or bool(headings))
     )
-    if coherent_short:
+    if coherent_static:
         score += 0.28
         if headings and paragraphs:
             score += 0.08
@@ -162,10 +181,10 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     if text_len < 80:
         score -= 0.30
         reasons.append("very little visible text")
-    elif text_len < 250 and not coherent_short:
+    elif text_len < 250 and not coherent_static:
         score -= 0.14
         reasons.append("short visible text")
-    elif coherent_short and text_len < 250:
+    elif coherent_static and text_len < 250:
         reasons.append("short but complete static document")
     if challenge:
         score = min(score, 0.08)

@@ -19,7 +19,6 @@ from ..utils.urls import registrable_host
 from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 
-
 # Resource-type blocking sets per stealth level.
 #   minimal:   only pure overhead (media, beacon) + websocket
 #   balanced:  also strip images and pings
@@ -153,7 +152,8 @@ class BrowserFetcher:
                 raise TransportFailure(
                     FetchErrorInfo(
                         "browser_launch_error",
-                        "Camoufox could not be launched; install its browser with 'python -m camoufox fetch'",
+                        "Camoufox could not be launched; install 'pagefetch[browser]' "
+                        "and run 'python -m camoufox fetch'",
                         True,
                         type(exc).__name__,
                     )
@@ -167,20 +167,18 @@ class BrowserFetcher:
         analysis or inter-retry backoff, so other tasks can use the browser
         during those windows.
 
-        When *proxy* is provided it overrides ``self.proxy`` for this
-        request.  If the browser is already running with a different proxy
-        configuration it will be torn down and restarted transparently.
+        A browser process has one immutable proxy configuration. Callers that
+        need a different proxy must create a separate fetcher; changing it
+        while pages are active would close contexts belonging to other tasks.
         """
         if proxy is not None and proxy != self.proxy:
-            self.proxy = proxy
-            self._needs_reset = True
-            self._browser = None
-            if self._manager is not None:
-                try:
-                    await self._manager.__aexit__(None, None, None)
-                except Exception:
-                    pass
-                self._manager = None
+            raise TransportFailure(
+                FetchErrorInfo(
+                    "browser_proxy_mismatch",
+                    "browser proxy cannot be changed after fetcher creation",
+                    False,
+                )
+            )
 
         last_failure: TransportFailure | None = None
         total_deadline = time.monotonic() + self.timeout
@@ -213,7 +211,8 @@ class BrowserFetcher:
                     # *very* low confidence. Slightly-below-threshold pages
                     # are returned with a warning instead of burning a retry.
                     empty = not result.html.strip()
-                    should_retry = empty or report.challenge or report.score < self.confidence_threshold
+                    very_low_threshold = min(0.40, self.confidence_threshold)
+                    should_retry = empty or report.challenge or report.score < very_low_threshold
 
                     if should_retry and attempt < self.retries:
                         # Escalate: more scrolls and longer waits on next attempt.
@@ -302,11 +301,14 @@ class BrowserFetcher:
                     # handler is defense-in-depth when Camoufox `block_images`
                     # is set; `ping`/`beacon` are pure overhead for content
                     # extraction.
-                    blocked = BLOCK_LEVEL_SETS.get(self.block_level, BLOCK_LEVEL_SETS["aggressive"])
-                    # Also block cross-site scripts, XHR, and fetch requests.
-                    # Third-party analytics/tracking scripts add no value for
-                    # content extraction and make the browser fingerprint
-                    # detectable through network-side correlation.
+                    blocked = BLOCK_LEVEL_SETS.get(
+                        self.block_level, BLOCK_LEVEL_SETS["aggressive"]
+                    )
+                    if not self.block_images:
+                        blocked = blocked - {"image"}
+                    # Also block cross-site scripts, XHR, and fetch requests
+                    # initiated inside child frames. Main-frame dependencies
+                    # are allowed because they may be required to render content.
                     external_script = False
                     _main_frame = getattr(page, "main_frame", None)
                     if request.resource_type in {"script", "xhr", "fetch"} and _main_frame is not None:

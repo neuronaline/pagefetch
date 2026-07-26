@@ -11,9 +11,8 @@ from typing import Any, Literal
 
 from platformdirs import user_cache_path
 
-from .utils.durations import parse_duration
-
 from .constants import GEO_MAP
+from .utils.durations import parse_duration
 
 VALID_MODES = frozenset({"auto", "http", "browser"})
 VALID_PROXIES = frozenset({"none", "decodo", "dataimpulse"})
@@ -117,14 +116,10 @@ class PageFetchConfig:
                     flat["proxy"] = section_data.pop("provider")
                 flat.update(section_data)
         flat.update(resolved)
-
-        # ── stealth preset application ──
-        stealth = flat.get("stealth_level", "off")
-        if stealth != "off":
-            preset = _STEALTH_PRESETS[stealth]
-            for field, value in preset.items():
-                # Preset values are defaults — explicit YAML keys win.
-                flat.setdefault(field, value)
+        # YAML 1.1 parsers treat the plain scalar ``off`` as boolean false.
+        # Preserve the documented stealth-level spelling.
+        if flat.get("stealth_level") is False:
+            flat["stealth_level"] = "off"
 
         return cls.build(
             mode=flat.get("mode", "auto"),
@@ -142,11 +137,11 @@ class PageFetchConfig:
             max_content_size=flat.get("max_content_size", 25 * 1024 * 1024),
             confidence_threshold=flat.get("confidence_threshold", 0.80),
             block_images=flat.get("block_images", True),
-            block_level=flat.get("block_level", "aggressive"),
+            block_level=flat.get("block_level"),
             accept_language=flat.get("accept_language", "en-US,en;q=0.5"),
-            humanize=flat.get("humanize", False),
-            session_rotation=flat.get("session_rotation", "sticky"),
-            request_pacing=flat.get("request_pacing", 0.0),
+            humanize=flat.get("humanize"),
+            session_rotation=flat.get("session_rotation"),
+            request_pacing=flat.get("request_pacing"),
             stealth_level=flat.get("stealth_level", "off"),
             proxy_geo=flat.get("proxy_geo"),
             raise_on_error=flat.get("raise_on_error", False),
@@ -171,15 +166,25 @@ class PageFetchConfig:
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
-        block_level: Literal["minimal", "balanced", "aggressive"] = "aggressive",
+        block_level: Literal["minimal", "balanced", "aggressive"] | None = None,
         accept_language: str = "en-US,en;q=0.5",
-        humanize: bool = False,
-        session_rotation: Literal["sticky", "rotate"] = "sticky",
-        request_pacing: float = 0.0,
+        humanize: bool | None = None,
+        session_rotation: Literal["sticky", "rotate"] | None = None,
+        request_pacing: float | None = None,
         stealth_level: Literal["off", "balanced", "max"] = "off",
         proxy_geo: str | None = None,
         raise_on_error: bool = False,
     ) -> PageFetchConfig:
+        if not isinstance(stealth_level, str) or stealth_level not in VALID_STEALTH_LEVELS:
+            raise ValueError(f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}")
+        preset = _STEALTH_PRESETS[stealth_level]
+        block_level = preset["block_level"] if block_level is None else block_level
+        humanize = preset["humanize"] if humanize is None else humanize
+        session_rotation = (
+            preset["session_rotation"] if session_rotation is None else session_rotation
+        )
+        request_pacing = preset["request_pacing"] if request_pacing is None else request_pacing
+
         if not isinstance(mode, str) or mode not in VALID_MODES:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
         if not isinstance(proxy, str) or proxy not in VALID_PROXIES:
@@ -227,8 +232,6 @@ class PageFetchConfig:
             or request_pacing < 0
         ):
             raise ValueError("request_pacing must be a non-negative finite number")
-        if not isinstance(stealth_level, str) or stealth_level not in VALID_STEALTH_LEVELS:
-            raise ValueError(f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}")
         if proxy_geo is not None:
             if not isinstance(proxy_geo, str) or proxy_geo not in GEO_MAP:
                 raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")

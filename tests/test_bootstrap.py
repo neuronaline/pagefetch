@@ -1,70 +1,50 @@
 from __future__ import annotations
 
-import subprocess
+import tomllib
+from pathlib import Path
 
 import pytest
 
 from pagefetch import bootstrap
 
 
-def test_missing_requirements_are_deduplicated():
-    missing = {"aiosqlite", "httpx", "h2", "socksio"}
-
-    def find_spec(module: str):
-        return None if module in missing else object()
-
-    assert bootstrap._missing_requirements(find_spec) == [
-        "aiosqlite>=0.20",
-        "httpx[http2,socks]>=0.27",
-    ]
-
-
-def test_python_requirements_install_uses_current_interpreter(monkeypatch):
-    checks = iter([["aiosqlite>=0.20"], []])
-    commands: list[list[str]] = []
-    monkeypatch.setattr(bootstrap, "_missing_requirements", lambda: next(checks))
+def test_optional_requirement_check_is_read_only_and_actionable(monkeypatch):
     monkeypatch.setattr(
-        bootstrap.subprocess,
-        "run",
-        lambda command, check: commands.append(command),
+        bootstrap.importlib.util,
+        "find_spec",
+        lambda module: None if module in {"camoufox", "pypdf"} else object(),
     )
-    bootstrap.install_python_requirements()
-    assert commands[0][:4] == [
-        bootstrap.sys.executable,
-        "-m",
-        "pip",
-        "install",
-    ]
-    assert commands[0][-1] == "aiosqlite>=0.20"
+
+    with pytest.raises(bootstrap.RuntimeBootstrapError, match=r"pagefetch\[browser\]"):
+        bootstrap.ensure_runtime_requirements(needs_browser=True)
+    with pytest.raises(bootstrap.RuntimeBootstrapError, match=r"pagefetch\[pdf\]"):
+        bootstrap.ensure_runtime_requirements(needs_browser=False, needs_pdf=True)
 
 
-def test_python_requirement_failure_is_actionable(monkeypatch):
-    monkeypatch.setattr(bootstrap, "_missing_requirements", lambda: ["missing-package"])
-
-    def fail(*args, **kwargs):
-        raise subprocess.CalledProcessError(1, "pip")
-
-    monkeypatch.setattr(bootstrap.subprocess, "run", fail)
-    with pytest.raises(bootstrap.RuntimeBootstrapError, match="pip install"):
-        bootstrap.install_python_requirements()
+def test_core_http_mode_has_no_optional_requirements(monkeypatch):
+    monkeypatch.setattr(bootstrap.importlib.util, "find_spec", lambda _module: None)
+    bootstrap.ensure_runtime_requirements(needs_browser=False, needs_pdf=False)
 
 
-def test_auto_install_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("PAGEFETCH_AUTO_INSTALL", "off")
-    assert bootstrap.auto_install_enabled() is False
-
-
-def test_camoufox_browser_is_downloaded_only_when_missing(monkeypatch):
+def test_camoufox_browser_install_is_only_explicit(monkeypatch):
     import camoufox.pkgman
 
     calls: list[bool] = []
-
-    def path(*, download_if_missing: bool):
-        calls.append(download_if_missing)
-        if not download_if_missing:
-            raise FileNotFoundError
-        return "browser"
-
-    monkeypatch.setattr(camoufox.pkgman, "camoufox_path", path)
+    monkeypatch.setattr(
+        camoufox.pkgman,
+        "camoufox_path",
+        lambda *, download_if_missing: calls.append(download_if_missing) or "browser",
+    )
     bootstrap.install_camoufox_browser()
-    assert calls == [False, True]
+    assert calls == [True]
+
+
+def test_browser_and_pdf_dependencies_are_optional_extras():
+    project = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    dependencies = "\n".join(project["dependencies"])
+    assert "camoufox" not in dependencies
+    assert "pypdf" not in dependencies
+    assert any("camoufox" in item for item in project["optional-dependencies"]["browser"])
+    assert any("pypdf" in item for item in project["optional-dependencies"]["pdf"])

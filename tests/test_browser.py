@@ -13,18 +13,32 @@ from pagefetch.processing.detector import ConfidenceReport
 from pagefetch.proxy.providers import ProxySettings
 
 
-def make_fetcher(*, timeout: float = 1.0, retries: int = 0) -> BrowserFetcher:
+def make_fetcher(
+    *,
+    timeout: float = 1.0,
+    retries: int = 0,
+    block_images: bool = True,
+) -> BrowserFetcher:
     return BrowserFetcher(
         asyncio.Semaphore(4),
         timeout=timeout,
         retries=retries,
         proxy=ProxySettings("none", None),
         max_content_size=100_000,
+        block_images=block_images,
     )
 
 
 @pytest.mark.asyncio
-async def test_browser_blocks_media_fonts_images_ping_beacon(monkeypatch):
+@pytest.mark.parametrize(
+    ("block_images", "image_decision"),
+    [(True, "abort"), (False, "continue")],
+)
+async def test_browser_blocks_media_fonts_images_ping_beacon(
+    monkeypatch,
+    block_images,
+    image_decision,
+):
     """Route handler now blocks images/ping/beacon in addition to font/media."""
     decisions: dict[str, str] = {}
 
@@ -78,7 +92,7 @@ async def test_browser_blocks_media_fonts_images_ping_beacon(monkeypatch):
         return {"text": 1000, "mainText": 500, "challenge": False}
 
     page = Page()
-    fetcher = make_fetcher()
+    fetcher = make_fetcher(block_images=block_images)
     # Browser context isolation: _fetch_page_once now creates a new
     # context per call, then a page from that context.
     async def new_page():
@@ -100,7 +114,7 @@ async def test_browser_blocks_media_fonts_images_ping_beacon(monkeypatch):
     assert decisions == {
         "font": "abort",
         "media": "abort",
-        "image": "abort",
+        "image": image_decision,
         "script": "continue",
         "ping": "abort",
         "beacon": "abort",
@@ -213,6 +227,47 @@ async def test_incomplete_browser_render_is_retried(monkeypatch):
     # so one retry is triggered.
     assert calls == 2
     assert result.html.endswith("</html>")
+
+
+@pytest.mark.asyncio
+async def test_slightly_low_browser_confidence_is_not_retried(monkeypatch):
+    fetcher = make_fetcher(retries=2)
+    calls = 0
+
+    async def start():
+        return None
+
+    async def fetch_page(url: str, **kwargs) -> BrowserResponse:
+        nonlocal calls
+        calls += 1
+        return BrowserResponse(
+            url,
+            200,
+            "<html><body><p>usable</p></body></html>",
+            [],
+            ConfidenceReport(1.0, ()),
+        )
+
+    monkeypatch.setattr(fetcher, "start", start)
+    monkeypatch.setattr(fetcher, "_fetch_page_once", fetch_page)
+    monkeypatch.setattr(
+        browser_module,
+        "analyze_html",
+        lambda _html: ConfidenceReport(0.70, ("usable but below threshold",)),
+    )
+    await fetcher.fetch("https://example.com/")
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_running_fetcher_rejects_process_proxy_change():
+    fetcher = make_fetcher()
+    with pytest.raises(TransportFailure) as caught:
+        await fetcher.fetch(
+            "https://example.com/",
+            proxy=ProxySettings("decodo", "http://user:pass@proxy.test:8080"),
+        )
+    assert caught.value.error.code == "browser_proxy_mismatch"
 
 
 @pytest.mark.asyncio

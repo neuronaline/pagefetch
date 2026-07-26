@@ -91,7 +91,7 @@ async with PageFetch(mode="auto") as client:
 | **Repeated requests waste bandwidth** | SQLite disk cache with configurable TTL, shared across runs |
 | **Proxy rotation complexity** | Native Decodo and DataImpulse integration — configure via env vars |
 | **Content that isn't HTML** | PDFs auto-detected and extracted; XML documents parsed; plain text preserved |
-| **Dependency management friction** | Automatic bootstrap installs missing Python packages and the Camoufox binary at first startup |
+| **Dependency management friction** | Core HTTP support stays lightweight; browser and PDF features use explicit extras |
 
 ---
 
@@ -120,38 +120,27 @@ async with PageFetch(mode="auto") as client:
 ### Prerequisites
 
 - **Python** ≥ 3.11
-- **Camoufox** browser binary — *downloaded automatically* at first startup
 
 ### Install
 
 ```bash
+# Core HTTP/HTML support
 pip install .
-```
 
-Automatic bootstrap is **enabled by default**. At first import, PageFetch will:
-
-1. Install any missing Python dependencies via `pip`.
-2. Download the Camoufox browser binary.
-
-Subsequent starts perform quick availability checks only — the browser is launched
-only when `mode="browser"` is selected or auto mode detects incomplete HTTP content.
-
-### Disable Auto-Install (Managed / Offline Environments)
-
-```bash
-# Windows
-set PAGEFETCH_AUTO_INSTALL=0
-
-# Linux / macOS
-export PAGEFETCH_AUTO_INSTALL=0
-```
-
-With auto-install disabled, provision both components manually:
-
-```bash
-pip install .
+# Add browser fallback
+pip install ".[browser]"
 python -m camoufox fetch
+
+# Add PDF extraction
+pip install ".[pdf]"
+
+# Or install every optional feature
+pip install ".[all]"
 ```
+
+PageFetch never runs `pip` or downloads browser binaries implicitly. HTTP mode
+therefore works without Camoufox, while `auto` and `browser` users can provision
+the browser feature explicitly.
 
 ---
 
@@ -344,7 +333,7 @@ PageFetch handles content types beyond HTML natively:
 
 | Content Type | Detection | Extraction |
 |---|---|---|
-| **PDF** | Magic bytes + `Content-Type` | Text via `pypdf` |
+| **PDF** | Magic bytes + `Content-Type` | Text via optional `pagefetch[pdf]` support |
 | **XML** | `Content-Type` matching `+xml` or `application/xml` | Preserved as `.text` |
 | **Plain text** | Fallback when no structured type matches | Served as `.text` directly |
 

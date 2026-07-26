@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from bs4 import BeautifulSoup
+
 from pagefetch.processing.detector import analyze_html
 from pagefetch.processing.html import process_html
 
@@ -77,6 +79,54 @@ def test_detector_scores_short_static_pages_highly():
 
     thin = analyze_html("<html><body><p>Small but usable notice.</p></body></html>")
     assert thin.score < 0.50
+
+
+def test_analysis_does_not_destroy_json_ld_in_reused_soup():
+    soup = BeautifulSoup(RICH_HTML, "lxml")
+    report = analyze_html(RICH_HTML, soup=soup)
+    result = process_html(
+        RICH_HTML,
+        "https://example.com/article",
+        soup=soup,
+        confidence=report,
+    )
+    assert result.metadata["json_ld"][0]["@type"] == "Article"
+
+
+def test_confidence_has_no_400_character_cliff():
+    def coherent_page(length: int) -> str:
+        phrase = "useful article content "
+        content = (phrase * (length // len(phrase) + 1))[:length]
+        return (
+            "<html><head><title>Useful Article</title></head><body>"
+            f"<main><h1>Useful Article</h1><p>{content}</p></main></body></html>"
+        )
+
+    shorter = analyze_html(coherent_page(396))
+    longer = analyze_html(coherent_page(401))
+    assert longer.score >= shorter.score
+    assert longer.score >= 0.80
+
+
+def test_challenge_terms_in_normal_article_are_not_enough():
+    for term in ("CAPTCHA", "access denied", "unusual traffic"):
+        html = f"""
+        <html><head><title>How {term} Detection Works</title></head><body>
+          <main><article><h1>How {term} Detection Works</h1>
+          <p>{term} systems distinguish automated traffic from people. This article
+          explains their history, accessibility tradeoffs, implementation, and common
+          alternatives for protecting forms without frustrating legitimate visitors.</p>
+          </article></main>
+        </body></html>
+        """
+        report = analyze_html(html)
+        assert not report.challenge
+        assert report.score > 0.08
+
+    blocked = analyze_html(
+        "<html><head><title>Access Denied</title></head><body>Access denied.</body></html>"
+    )
+    assert blocked.challenge
 
 
 def test_external_link_is_identified():

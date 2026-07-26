@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 from pathlib import Path
 
 from .client import PageFetch
@@ -199,7 +198,7 @@ def _settings_menu(settings: dict) -> None:
         mode = settings.get("mode") or "auto"
         proxy = settings.get("proxy") or "none"
         fmt = settings.get("format", "markdown")
-        cache_ttl = settings.get("cache_ttl", "24h")
+        cache_ttl = settings.get("cache_ttl") or "(config/default)"
         output = settings.get("output", "none")
         include_html = "yes" if settings.get("include_html") else "no"
         debug = "yes" if settings.get("debug") else "no"
@@ -215,7 +214,7 @@ def _settings_menu(settings: dict) -> None:
         print(f"  7. Debug logging       : {debug}")
         print(f"  8. Disable cache       : {no_cache}")
         print(f"  9. Config file (YAML)  : {config_file}")
-        print(f"  0. Back to main menu")
+        print("  0. Back to main menu")
         print()
 
         choice = _prompt("  Choose", "0")
@@ -247,7 +246,8 @@ def _settings_menu(settings: dict) -> None:
                 print(f"  Invalid format: {val}")
                 input("  Press Enter...")
         elif choice == "4":
-            val = _prompt("  Cache TTL (e.g. 30s, 15m, 24h, 7d)", cache_ttl)
+            default_ttl = "" if cache_ttl == "(config/default)" else cache_ttl
+            val = _prompt("  Cache TTL (e.g. 30s, 15m, 24h, 7d)", default_ttl)
             if val:
                 settings["cache_ttl"] = val
         elif choice == "5":
@@ -311,17 +311,32 @@ def _init_client(settings: dict) -> PageFetch:
     mode = settings.get("mode") if settings.get("mode") is not None else config.mode
     proxy = settings.get("proxy") if settings.get("proxy") is not None else config.proxy
     use_cache = settings.get("use_cache", config.cache_enabled)
-    cache_ttl = settings.get("cache_ttl", config.cache_ttl)
+    cache_ttl = settings.get("cache_ttl") or config.cache_ttl
 
     return PageFetch(
         mode=mode,
         proxy=proxy,
         cache_enabled=use_cache,
         cache_ttl=cache_ttl,
+        cache_path=config.cache_path,
         http_concurrency=config.http_concurrency,
         browser_concurrency=config.browser_concurrency,
         http_timeout=config.http_timeout,
         browser_timeout=config.browser_timeout,
+        retries_http=config.retries_http,
+        retries_browser=config.retries_browser,
+        max_redirects=config.max_redirects,
+        max_content_size=config.max_content_size,
+        confidence_threshold=config.confidence_threshold,
+        block_images=config.block_images,
+        block_level=config.block_level,
+        accept_language=config.accept_language,
+        humanize=config.humanize,
+        session_rotation=config.session_rotation,
+        request_pacing=config.request_pacing,
+        stealth_level=config.stealth_level,
+        proxy_geo=config.proxy_geo,
+        raise_on_error=config.raise_on_error,
     )
 
 
@@ -331,10 +346,9 @@ def interactive_main() -> int:
         "format": "markdown",
         "include_html": False,
         "debug": False,
-        "cache_ttl": "24h",
+        "cache_ttl": None,
         "output": None,
         "no_cache": False,
-        "use_cache": True,
         "mode": None,
         "proxy": None,
         "config_file": None,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pagefetch"
-version = "0.7.0"
+version = "0.8.0"
 description = "Asynchronous HTTP-first web fetching with conservative content extraction and browser fallback"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,22 +35,29 @@ classifiers = [
 dependencies = [
   "aiosqlite>=0.20,<1",
   "beautifulsoup4>=4.12,<5",
-  "camoufox>=0.4,<1",
   "httpx[http2,socks]>=0.27,<1",
   "lxml>=5.2,<6",
   "platformdirs>=4.2,<5",
-  "pypdf>=5.0,<6",
   "pyyaml>=6.0,<7",
   "tldextract>=5.1,<6",
 ]
 
 [project.urls]
-Homepage = "https://github.com/user/pagefetch"
-Repository = "https://github.com/user/pagefetch.git"
-Issues = "https://github.com/user/pagefetch/issues"
+Homepage = "https://github.com/neuronaline/pagefetch"
+Repository = "https://github.com/neuronaline/pagefetch.git"
+Issues = "https://github.com/neuronaline/pagefetch/issues"
 
 [project.optional-dependencies]
-test = ["pytest>=8.0,<9", "pytest-asyncio>=0.23,<1", "ruff>=0.6,<1"]
+browser = ["camoufox>=0.4,<1"]
+pdf = ["pypdf>=5.0,<6"]
+all = ["camoufox>=0.4,<1", "pypdf>=5.0,<6"]
+test = [
+  "camoufox>=0.4,<1",
+  "pypdf>=5.0,<6",
+  "pytest>=8.0,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.6,<1",
+]
 
 [project.scripts]
 pagefetch = "pagefetch.cli:main"

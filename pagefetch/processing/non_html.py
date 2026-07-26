@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from lxml import etree
-from pypdf import PdfReader
 
 
 @dataclass(slots=True)
@@ -20,8 +19,19 @@ class ProcessedDocument:
     warnings: list[str]
 
 
+class MissingOptionalDependency(RuntimeError):
+    """Raised when processing needs an extra that is not installed."""
+
+
 def process_pdf(content: bytes) -> ProcessedDocument:
     """Extract text and basic metadata from a PDF byte stream."""
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise MissingOptionalDependency(
+            "PDF support requires the optional dependency: pip install 'pagefetch[pdf]'"
+        ) from exc
+
     reader = PdfReader(io.BytesIO(content))
     pages: list[str] = []
     warnings: list[str] = []

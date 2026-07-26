@@ -20,9 +20,8 @@ def build_cache_key(
         "url": normalize_url(url),
         "mode": mode,
         "proxy": proxy,
-        "processing_version": 1,
+        "processing_version": 2,
         "settings": settings or {},
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-

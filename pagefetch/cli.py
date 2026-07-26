@@ -7,7 +7,6 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
-from typing import Literal
 
 from .client import PageFetch
 from .config import PageFetchConfig
@@ -144,6 +143,8 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
     if not overrides and not args.no_cache:
         return config
 
+    preset_override = "stealth_level" in overrides
+
     # Rebuild with overrides applied
     return PageFetchConfig.build(
         mode=str(overrides.get("mode", config.mode)),
@@ -161,11 +162,23 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         max_content_size=config.max_content_size,
         confidence_threshold=config.confidence_threshold,
         block_images=bool(overrides.get("block_images", config.block_images)),
-        block_level=overrides.get("block_level", config.block_level),
+        block_level=overrides.get(
+            "block_level",
+            None if preset_override else config.block_level,
+        ),
         accept_language=overrides.get("accept_language", config.accept_language),
-        humanize=bool(overrides.get("humanize", config.humanize)),
-        session_rotation=overrides.get("session_rotation", config.session_rotation),
-        request_pacing=float(overrides.get("request_pacing", config.request_pacing)),
+        humanize=overrides.get(
+            "humanize",
+            None if preset_override else config.humanize,
+        ),
+        session_rotation=overrides.get(
+            "session_rotation",
+            None if preset_override else config.session_rotation,
+        ),
+        request_pacing=overrides.get(
+            "request_pacing",
+            None if preset_override else config.request_pacing,
+        ),
         stealth_level=overrides.get("stealth_level", config.stealth_level),
         proxy_geo=overrides.get("proxy_geo", config.proxy_geo),
         raise_on_error=config.raise_on_error,

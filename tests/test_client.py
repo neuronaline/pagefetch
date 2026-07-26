@@ -6,7 +6,9 @@ import httpx
 import pytest
 
 from pagefetch import PageFetch, PageFetchError
+from pagefetch.fetching.browser import BrowserResponse
 from pagefetch.fetching.http import HTTPFetcher
+from pagefetch.processing.detector import ConfidenceReport
 
 
 def rich_page(title: str = "Test Page") -> str:
@@ -405,3 +407,197 @@ async def test_html_sniffed_from_ambiguous_content_type():
     assert result.fetch_method == "http"
     assert result.title == "Sniffed Page"
     assert result.content_confidence >= 0.80
+
+
+@pytest.mark.asyncio
+async def test_no_proxy_user_agent_is_selected_per_domain():
+    seen: dict[str, str] = {}
+
+    def handler(request: httpx.Request):
+        seen[request.url.host] = request.headers["User-Agent"]
+        return httpx.Response(
+            200,
+            text=rich_page(),
+            headers={"Content-Type": "text/html"},
+            request=request,
+        )
+
+    client = PageFetch(mode="http", cache_enabled=False)
+    attach_transport(client, handler)
+    candidates = [f"domain-{index}.test" for index in range(20)]
+    first = candidates[0]
+    second = next(
+        domain
+        for domain in candidates[1:]
+        if client._headers_for_url(f"https://{domain}/")["User-Agent"]
+        != client._headers_for_url(f"https://{first}/")["User-Agent"]
+    )
+    async with client:
+        await client.fetch_many([f"https://{first}/", f"https://{second}/"])
+    assert seen[first] != seen[second]
+
+
+@pytest.mark.asyncio
+async def test_cache_varies_by_content_settings_not_timeouts(tmp_path):
+    calls = 0
+    cache_path = tmp_path / "cache.sqlite3"
+
+    def handler(request: httpx.Request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            text=rich_page(),
+            headers={"Content-Type": "text/html"},
+            request=request,
+        )
+
+    first = PageFetch(
+        mode="http",
+        cache_path=cache_path,
+        http_timeout=10,
+        block_level="aggressive",
+    )
+    attach_transport(first, handler)
+    async with first:
+        await first.fetch("https://example.com/")
+
+    same_content_policy = PageFetch(
+        mode="http",
+        cache_path=cache_path,
+        http_timeout=30,
+        retries_http=0,
+        block_level="aggressive",
+    )
+    attach_transport(same_content_policy, handler)
+    async with same_content_policy:
+        cached = await same_content_policy.fetch("https://example.com/")
+
+    different_content_policy = PageFetch(
+        mode="http",
+        cache_path=cache_path,
+        http_timeout=30,
+        block_level="minimal",
+    )
+    attach_transport(different_content_policy, handler)
+    async with different_content_policy:
+        fresh = await different_content_policy.fetch("https://example.com/")
+
+    assert cached.from_cache
+    assert not fresh.from_cache
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_rotate_browser_requests_use_isolated_fetchers(monkeypatch):
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user:password@proxy.example:8080",
+    )
+    client = PageFetch(
+        mode="browser",
+        proxy="decodo",
+        cache_enabled=False,
+        session_rotation="rotate",
+        browser_concurrency=2,
+    )
+    created = []
+    active = 0
+    peak = 0
+
+    class FakeBrowserFetcher:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            self.closed = False
+            created.append(self)
+
+        async def fetch(self, url):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return BrowserResponse(
+                url,
+                200,
+                rich_page(),
+                [],
+                ConfidenceReport(1.0, ("complete",)),
+            )
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        client,
+        "_new_browser_fetcher",
+        lambda proxy: FakeBrowserFetcher(proxy),
+    )
+    await asyncio.gather(
+        client._fetch_browser("https://one.test/", "decodo", None),
+        client._fetch_browser("https://two.test/", "decodo", None),
+    )
+    assert peak == 2
+    assert len(created) == 2
+    assert created[0].proxy.url != created[1].proxy.url
+    assert all(fetcher.closed for fetcher in created)
+
+
+@pytest.mark.asyncio
+async def test_sticky_browser_pool_is_bounded(monkeypatch):
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user:password@proxy.example:8080",
+    )
+    client = PageFetch(
+        mode="browser",
+        proxy="decodo",
+        cache_enabled=False,
+        session_rotation="sticky",
+    )
+    client._browser_pool_limit = 2
+    created = []
+
+    class FakeBrowserFetcher:
+        def __init__(self, proxy):
+            self.proxy = proxy
+            self.closed = False
+            created.append(self)
+
+        async def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        client,
+        "_new_browser_fetcher",
+        lambda proxy: FakeBrowserFetcher(proxy),
+    )
+    for domain in ("example.com", "example.org", "example.net"):
+        cache_key, _fetcher = await client._acquire_browser_fetcher(
+            "decodo",
+            f"https://{domain}/",
+        )
+        await client._release_browser_fetcher(cache_key)
+
+    assert len(client._browser_fetchers) == 2
+    assert created[0].closed
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_sticky_http_transport_is_shared_across_domains(monkeypatch):
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user:password@proxy.example:8080",
+    )
+    client = PageFetch(
+        mode="http",
+        proxy="decodo",
+        cache_enabled=False,
+        session_rotation="sticky",
+    )
+    first = await client._http_fetcher("decodo", "https://example.com/")
+    second = await client._http_fetcher("decodo", "https://example.org/")
+    assert first is second
+    assert list(client._http_fetchers) == ["decodo"]
+    await client.close()

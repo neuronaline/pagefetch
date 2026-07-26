@@ -27,11 +27,8 @@ from .models import FetchErrorInfo, FetchResult, ImageInfo, LinkInfo
 # never see "No handler found" warnings.
 logging.getLogger("pagefetch").addHandler(logging.NullHandler())
 
-# NOTE: ensure_runtime_requirements() is deliberately NOT called at import
-# time — it performs network I/O (pip install, browser download).  It fires
-# lazily inside PageFetch.start() before the first fetch.  If you bypass
-# PageFetch.start(), call pagefetch.ensure_runtime_requirements() explicitly
-# or set PAGEFETCH_AUTO_INSTALL=0 to opt out.
+# Optional dependencies are never installed implicitly. Call
+# ensure_runtime_requirements() when an application wants an up-front check.
 
 __all__ = [
     "FetchErrorInfo",

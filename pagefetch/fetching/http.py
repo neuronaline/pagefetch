@@ -6,6 +6,8 @@ import asyncio
 import random
 import socket
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -45,7 +47,13 @@ class HTTPFetcher:
         self.retries = retries
         self.max_content_size = max_content_size
 
-    async def fetch(self, url: str, *, proxy_url: str | None = None, headers: dict[str, str] | None = None) -> HTTPResponse:
+    async def fetch(
+        self,
+        url: str,
+        *,
+        proxy_url: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> HTTPResponse:
         if proxy_url is not None:
             # Session-rotation mode: use a one-shot client with the
             # session-injected proxy URL to avoid leaking client objects
@@ -69,13 +77,19 @@ class HTTPFetcher:
             finally:
                 await client.aclose()
         async with self.semaphore:
-            return await self._fetch_with_retries(url, client=None)
+            return await self._fetch_with_retries(url, client=None, headers=headers)
 
-    async def _fetch_with_retries(self, url: str, *, client: httpx.AsyncClient | None = None) -> HTTPResponse:
+    async def _fetch_with_retries(
+        self,
+        url: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> HTTPResponse:
         last_failure: TransportFailure | None = None
         for attempt in range(self.retries + 1):
             try:
-                response = await self._request(url, client=client)
+                response = await self._request(url, client=client, headers=headers)
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.retries:
                     await self._backoff(attempt, response.headers.get("Retry-After"))
                     continue
@@ -88,10 +102,16 @@ class HTTPFetcher:
         assert last_failure is not None
         raise last_failure
 
-    async def _request(self, url: str, *, client: httpx.AsyncClient | None = None) -> HTTPResponse:
+    async def _request(
+        self,
+        url: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> HTTPResponse:
         client = client or self.client
         try:
-            async with client.stream("GET", url) as response:
+            async with client.stream("GET", url, headers=headers) as response:
                 declared = response.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > self.max_content_size:
                     raise TransportFailure(
@@ -163,8 +183,6 @@ class HTTPFetcher:
             return float(value)
         # Try HTTP-date (RFC 7231), e.g. "Wed, 21 Oct 2015 07:28:00 GMT"
         try:
-            from email.utils import parsedate_to_datetime
-            from datetime import UTC, datetime
             retry_dt = parsedate_to_datetime(value)
             now = datetime.now(UTC)
             delta = (retry_dt - now).total_seconds()
