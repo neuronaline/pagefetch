@@ -407,6 +407,18 @@ class BrowserFetcher:
         finally:
             if page is not None:
                 try:
+                    # Stop route interception before closing so Playwright can
+                    # cleanly tear down its internal async handler tasks.  This
+                    # prevents "TargetClosedError — Future exception was never
+                    # retrieved" warnings when the page closes while routes are
+                    # still being serviced.
+                    await page.unroute("**/*")
+                except Exception:
+                    pass
+                # Give the event loop a chance to flush any in-flight route
+                # handler callbacks before we close the page.
+                await asyncio.sleep(0)
+                try:
                     await page.close()
                 except Exception:
                     pass
