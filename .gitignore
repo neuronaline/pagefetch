@@ -37,8 +37,8 @@ htmlcov/
 *.whl
 
 # Publish scripts – may contain PyPI token
-publish.bat
-run.bat
+publish.sh
+run.sh
 
 # Publish guide – sensitive, never commit
 PUBLISH.md

@@ -110,6 +110,14 @@ class BrowserFetcher:
                 except Exception:
                     pass
                 self._manager = None
+
+            # Auto-install camoufox + browser binary on first use so the
+            # import and launch below do not fail with a "not installed"
+            # error.  No-op when everything is already in place.
+            from ..bootstrap import auto_bootstrap_browser
+
+            auto_bootstrap_browser()
+
             try:
                 from camoufox.async_api import AsyncCamoufox
 

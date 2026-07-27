@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 
-from .bootstrap import RuntimeBootstrapError, ensure_runtime_requirements
+from .bootstrap import RuntimeBootstrapError, auto_bootstrap_browser, ensure_runtime_requirements
 from .client import PageFetch
 from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
 from .exceptions import PageFetchError
@@ -27,8 +27,10 @@ from .models import FetchErrorInfo, FetchResult, ImageInfo, LinkInfo
 # never see "No handler found" warnings.
 logging.getLogger("pagefetch").addHandler(logging.NullHandler())
 
-# Optional dependencies are never installed implicitly. Call
-# ensure_runtime_requirements() when an application wants an up-front check.
+# Browser dependencies (camoufox + browser binary) are auto-installed on
+# first browser use.  Call ensure_runtime_requirements() for an up-front
+# check without installation; call auto_bootstrap_browser() to force
+# installation at any point.
 
 __all__ = [
     "FetchErrorInfo",
@@ -41,5 +43,6 @@ __all__ = [
     "RuntimeBootstrapError",
     "VALID_MODES",
     "VALID_PROXIES",
+    "auto_bootstrap_browser",
     "ensure_runtime_requirements",
 ]
