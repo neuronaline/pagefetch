@@ -55,12 +55,15 @@ def test_dom_hierarchy_and_selector_generation():
     structure = extract_structure(rich_structure_html(), "https://example.com/")
     assert structure.root is not None
     assert structure.root.tag == "html"
-    # Walk to the <article> tag and confirm the selector encodes id and classes.
+    # Walk to the <article> tag and confirm scraper-oriented selectors are available.
     body = next(child for child in structure.root.children if child.tag == "body")
     main = next(child for child in body.children if child.tag == "main")
     assert main.selector == "main#content"
+    assert main.unique_selector == "main#content"
     article = next(child for child in main.children if child.tag == "article")
     assert article.selector == "article.post.featured"
+    assert article.path.endswith("main#content > article.post.featured")
+    assert article.unique_selector == "article.post.featured"
     assert article.attrs == {
         "class": "post featured",
         "data-id": "42",
@@ -117,6 +120,28 @@ def test_depth_and_node_limits_are_enforced():
     assert structure.max_depth == 4
 
 
+def test_repeated_siblings_get_unique_css_paths():
+    structure = extract_structure(
+        "<html><body><ul><li>One</li><li>Two</li></ul></body></html>"
+    )
+    body = next(child for child in structure.root.children if child.tag == "body")
+    items = next(child for child in body.children if child.tag == "ul").children
+    assert items[0].path.endswith("li:nth-of-type(1)")
+    assert items[1].path.endswith("li:nth-of-type(2)")
+    assert items[0].unique_selector == items[0].path
+    assert items[1].unique_selector == items[1].path
+
+
+def test_selector_escapes_css_identifiers():
+    structure = extract_structure(
+        '<html><body><div id="product:42" class="md:hover">Item</div></body></html>'
+    )
+    body = next(child for child in structure.root.children if child.tag == "body")
+    div = next(child for child in body.children if child.tag == "div")
+    assert div.selector == r"div#product\:42.md\:hover"
+    assert div.unique_selector == r"div#product\:42.md\:hover"
+
+
 def test_selector_omits_classes_when_missing():
     structure = extract_structure(
         "<html><body><section><h1>Title</h1></section></body></html>"
@@ -141,22 +166,56 @@ def test_no_event_handlers_or_inline_styles_appear_in_attrs():
 
 
 @pytest.mark.asyncio
-async def test_http_mode_attaches_structure_when_requested(tmp_path):
-    client = PageFetch(mode="http", cache_path=tmp_path / "cache.sqlite3")
+@pytest.mark.parametrize("mode", ["http", "auto"])
+async def test_extract_structure_requires_browser_mode(tmp_path, mode):
+    client = PageFetch(mode=mode, cache_path=tmp_path / f"{mode}.sqlite3")
+    with pytest.raises(ValueError, match="requires mode='browser'"):
+        await client.fetch("https://example.com", extract_structure=True)
 
-    def handler(request: httpx.Request):
-        return httpx.Response(
-            200,
-            text=rich_structure_html(),
-            headers={"Content-Type": "text/html; charset=utf-8"},
-            request=request,
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["http", "auto"])
+async def test_fetch_many_extract_structure_invalid_arg_returns_per_url_error(tmp_path, mode):
+    """``fetch`` raises ValueError for non-browser modes; ``fetch_many``
+    must convert each URL into a structured failure rather than aborting
+    the entire batch."""
+    client = PageFetch(mode=mode, cache_path=tmp_path / f"{mode}.sqlite3")
+    async with client:
+        results = await client.fetch_many(
+            ["https://a.example/", "https://b.example/"],
+            extract_structure=True,
+        )
+    assert len(results) == 2
+    for result in results:
+        assert not result.success
+        assert result.error is not None
+        assert result.error.code == "invalid_argument"
+        assert "requires mode='browser'" in result.error.message
+
+
+@pytest.mark.asyncio
+async def test_browser_mode_attaches_structure_when_requested(tmp_path, monkeypatch):
+    client = PageFetch(mode="browser", cache_path=tmp_path / "cache.sqlite3")
+
+    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False):
+        return client._result_from_html(
+            original_url=url,
+            final_url=url,
+            status_code=200,
+            html=rich_structure_html(),
+            content_type="text/html",
+            encoding="utf-8",
+            proxy=proxy,
+            method="browser",
+            include_structure=extract_structure,
         )
 
-    attach_transport(client, handler)
+    monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
     async with client:
         structured = await client.fetch("https://example.com", extract_structure=True)
         without = await client.fetch("https://example.com", use_cache=False)
     assert structured.success
+    assert structured.fetch_method == "browser"
     assert structured.structure is not None
     assert structured.structure.root is not None
     assert [sheet.url for sheet in structured.structure.stylesheets] == [
@@ -166,19 +225,25 @@ async def test_http_mode_attaches_structure_when_requested(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_structure_setting_partitions_cache(tmp_path):
+async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
     cache_path = tmp_path / "cache.sqlite3"
 
-    def handler(request: httpx.Request):
-        return httpx.Response(
-            200,
-            text=rich_structure_html(),
-            headers={"Content-Type": "text/html"},
-            request=request,
+    client = PageFetch(mode="browser", cache_path=cache_path)
+
+    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False):
+        return client._result_from_html(
+            original_url=url,
+            final_url=url,
+            status_code=200,
+            html=rich_structure_html(),
+            content_type="text/html",
+            encoding="utf-8",
+            proxy=proxy,
+            method="browser",
+            include_structure=extract_structure,
         )
 
-    client = PageFetch(mode="http", cache_path=cache_path)
-    attach_transport(client, handler)
+    monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
     async with client:
         plain = await client.fetch("https://example.com")
         structured = await client.fetch("https://example.com", extract_structure=True)
@@ -188,8 +253,7 @@ async def test_structure_setting_partitions_cache(tmp_path):
     assert plain.from_cache is False
     assert structured.from_cache is False
 
-    cached_client = PageFetch(mode="http", cache_path=cache_path)
-    attach_transport(cached_client, handler)
+    cached_client = PageFetch(mode="browser", cache_path=cache_path)
     async with cached_client:
         reused = await cached_client.fetch("https://example.com", extract_structure=True)
     assert reused.from_cache is True

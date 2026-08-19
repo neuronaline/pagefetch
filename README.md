@@ -27,6 +27,7 @@ content without fighting bot detection.
 
 - [Quick Start](#quick-start)
 - [Why PageFetch](#why-pagefetch)
+- [Stealth & Anti-Detection](#stealth--anti-detection)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
 - [API Reference](#api-reference)
@@ -92,6 +93,44 @@ async with PageFetch(mode="auto") as client:
 | **Proxy rotation complexity** | Native Decodo and DataImpulse integration — configure via env vars |
 | **Content that isn't HTML** | PDFs auto-detected and extracted; XML documents parsed; plain text preserved |
 | **Dependency management friction** | Core HTTP support stays lightweight; browser and PDF features use explicit extras |
+| **Hard-to-match fingerprints** | `stealth_level` presets + `humanize`, `block_level`, `request_pacing`, `session_rotation`, and `proxy_geo` for locale-aligned Accept-Language |
+
+---
+
+## Stealth & Anti-Detection
+
+When `mode` is `"auto"` or `"browser"`, PageFetch exposes a layered stealth
+posture so the browser fingerprint can stay aligned with the proxy exit
+country:
+
+| Knob | Purpose |
+|---|---|
+| `stealth_level` | One-shot preset: `"off"` (default), `"balanced"`, or `"max"`. Sets `humanize`, `block_level`, `request_pacing`, and `session_rotation` together; explicit values still win. |
+| `humanize` | Add small randomized delays to mimic human interaction. |
+| `block_level` | `"minimal"`, `"balanced"`, or `"aggressive"` resource blocking (third-party trackers, fonts, media). |
+| `session_rotation` | `"sticky"` reuses one proxy session per domain; `"rotate"` forces a fresh session per request. |
+| `request_pacing` | Fixed seconds of delay between browser requests (`0.0` = none). |
+| `accept_language` | Value sent as the `Accept-Language` header. |
+| `proxy_geo` | ISO 3166-1 alpha-2 country code (e.g. `"US"`, `"DE"`, `"TR"`); aligns locale, timezone, and `Accept-Language` with the exit country. |
+
+```python
+# Quiet, fast default for open sites
+async with PageFetch(mode="auto") as client:
+    ...
+
+# Maximum stealth for heavily protected targets
+async with PageFetch(
+    mode="browser",
+    proxy="decodo",
+    stealth_level="max",
+    proxy_geo="DE",
+) as client:
+    result = await client.fetch("https://example.com")
+```
+
+The CLI exposes every knob via `--stealth-level`, `--block-level`,
+`--humanize` / `--no-humanize`, `--session-rotation`, `--request-pacing`,
+`--accept-language`, and `--proxy-geo`.
 
 ---
 
@@ -168,7 +207,14 @@ client = PageFetch(
     max_redirects=10,         # Maximum redirect chain
     max_content_size=25 * 1024 * 1024,  # Max response body bytes (25 MiB)
     confidence_threshold=0.80,    # Min confidence before browser fallback
-    block_images=True,         # Block image loading in browser mode to save bandwidth
+    block_images=True,        # Block image loading in browser mode to save bandwidth
+    block_level="aggressive", # "minimal" | "balanced" | "aggressive" (ignored when stealth_level != "off")
+    accept_language="en-US,en;q=0.5",  # Accept-Language header
+    humanize=False,          # Add small randomized delays to mimic a human
+    session_rotation="sticky",# "sticky" | "rotate" proxy session strategy
+    request_pacing=0.0,       # Seconds of delay between requests
+    stealth_level="off",      # "off" | "balanced" | "max" preset (sets humanize, block_level, pacing, session_rotation)
+    proxy_geo=None,           # ISO 3166-1 alpha-2 (e.g. "US", "DE") to align locale + Accept-Language
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
 )
 ```
@@ -186,9 +232,10 @@ client = PageFetch(
 **`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False) → FetchResult`**
 
 Fetch a single URL. All keyword arguments override the client-level defaults
-for this individual request only. Pass `extract_structure=True` to attach a
-bounded `PageStructure` summary to `FetchResult.structure` (the default is
-`False`, keeping the result shape unchanged).
+for this individual request only. Pass `extract_structure=True` with
+`mode="browser"` to attach a scraper-oriented `PageStructure` to
+`FetchResult.structure`. Structure extraction requires browser mode so it
+always describes the rendered DOM rather than incomplete server markup.
 
 **`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False) → list[FetchResult]`**
 
@@ -254,17 +301,23 @@ When you want to understand a page *before* writing scraping rules, opt in to
 the static structure summary:
 
 ```python
-async with PageFetch() as client:
+async with PageFetch(mode="browser") as client:
     result = await client.fetch("https://example.com", extract_structure=True)
     structure = result.structure
 ```
 
+`extract_structure=True` is valid only in browser mode. `PageFetch.fetch` raises
+`ValueError` for `auto` or `http`, preventing an incomplete server-rendered tree
+from being mistaken for the page structure.
+
 `FetchResult.structure` is `None` unless `extract_structure=True` is passed, so
 the default result shape is unchanged. When present, it carries:
 
-- A nested DOM tree (tag, id/class selector, filtered attributes, short text,
-  children) bounded by `max_depth` and `max_nodes` so the payload stays
-  predictable even on enormous pages.
+- A nested DOM tree with filtered attributes, short direct-text previews, a
+  compact selector, a deterministic CSS path, and a verified
+  `unique_selector` suitable for starting scraper rules. It remains bounded by
+  `max_depth` and `max_nodes` so the payload stays predictable even on enormous
+  pages.
 - External stylesheet URLs (`<link rel="stylesheet">`) with `media`,
   `integrity`, and `crossorigin` hints.
 - Inline `<style>` blocks with a per-block preview and a `truncated` flag.
@@ -274,9 +327,8 @@ the default result shape is unchanged. When present, it carries:
   flag.
 
 The summary never downloads external CSS/JavaScript, never walks Shadow DOM,
-and never captures runtime state — it is a static reflection of the markup.
-In HTTP mode it describes the HTML the server returned; in browser mode it
-describes the DOM after JavaScript rendered.
+and never captures runtime state beyond the rendered DOM snapshot. Browser mode
+performs its normal controlled scroll and readiness waits before capture.
 
 Use the lower-level helper directly when you already have parsed HTML:
 
@@ -324,13 +376,43 @@ pagefetch urls.txt --format json --mode auto
 pagefetch --config config.yaml --mode browser https://example.com
 
 # Override cache TTL and disable image loading
-pagefetch https://example.com --cache-ttl 1h --block-images
+pagefetch https://example.com --cache-ttl 1h --no-block-images
+
+# Use the Decodo proxy with a German exit and locale alignment
+pagefetch https://example.com --proxy decodo --proxy-geo DE
+
+# Apply a balanced stealth preset with a rotated proxy session
+pagefetch https://example.com --mode browser --stealth-level balanced --session-rotation rotate
+
+# Verbose logging for debugging
+pagefetch https://example.com --debug
 ```
 
-CLI arguments map directly to the Python API — `--mode`, `--proxy`, `--timeout`,
-`--browser-timeout`, `--http-concurrency`, `--browser-concurrency`, `--cache-ttl`,
-`--no-cache`, `--block-images` / `--no-block-images`, `--include-html`,
-`--include-structure`, `--debug`, and `--config` are all supported.
+CLI arguments map directly to the Python API:
+
+| Flag | Maps to |
+|---|---|
+| `--mode {auto,http,browser}` | `mode` |
+| `--proxy {none,decodo,dataimpulse}` | `proxy` |
+| `--http-concurrency N` / `--browser-concurrency N` | `http_concurrency` / `browser_concurrency` |
+| `--timeout SECONDS` / `--browser-timeout SECONDS` | `http_timeout` / `browser_timeout` |
+| `--cache-ttl DURATION` / `--no-cache` | `cache_ttl` / `cache_enabled=False` |
+| `--block-images` / `--no-block-images` | `block_images` |
+| `--block-level {minimal,balanced,aggressive}` | `block_level` |
+| `--accept-language HEADER` | `accept_language` |
+| `--humanize` / `--no-humanize` | `humanize` |
+| `--session-rotation {sticky,rotate}` | `session_rotation` |
+| `--request-pacing SECONDS` | `request_pacing` |
+| `--stealth-level {off,balanced,max}` | `stealth_level` |
+| `--proxy-geo CC` | `proxy_geo` |
+| `--include-html` / `--include-structure` | `FetchResult.json(include_html=…, include_structure=…)` |
+| `--format {markdown,json,html,structure}` | output renderer |
+| `-o PATH` / `--output PATH` | write rendered output to a file |
+| `-c PATH` / `--config PATH` | `PageFetchConfig.from_yaml` |
+| `--debug` | enable DEBUG logging on the `pagefetch` logger |
+
+Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error,
+`3` partial failure.
 
 ---
 
@@ -371,11 +453,20 @@ PageFetch natively supports **rotating residential proxy** providers:
 # Use a proxy provider
 async with PageFetch(proxy="decodo") as client:
     result = await client.fetch("https://example.com")
+
+# Align locale + Accept-Language with the proxy exit country
+async with PageFetch(proxy="decodo", proxy_geo="DE") as client:
+    result = await client.fetch("https://example.de")
+
+# Force a fresh proxy session per request
+async with PageFetch(proxy="dataimpulse", session_rotation="rotate") as client:
+    results = await client.fetch_many([...])
 ```
 
 Credentials are **never** included in results, logs, or cache keys. Configure
 either a full proxy URL or the individual components — PageFetch validates
-both forms automatically.
+both forms automatically. `proxy_geo` requires one of the countries defined in
+PageFetch's `GEO_MAP` (case-insensitive ISO 3166-1 alpha-2).
 
 ---
 
@@ -413,6 +504,13 @@ at the HTTP response level before any processing pipeline runs.
 | `max_content_size` | `int` | `25 MiB` | Maximum response body in bytes |
 | `confidence_threshold` | `float` | `0.80` | Threshold for browser fallback in auto mode |
 | `block_images` | `bool` | `True` | Block image loading in browser mode to save bandwidth |
+| `block_level` | `str` | `"aggressive"` | Resource blocking: `"minimal"`, `"balanced"`, or `"aggressive"` (overridden by `stealth_level`) |
+| `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in the `Accept-Language` header |
+| `humanize` | `bool` | `False` | Add small randomized delays to mimic a human (overridden by `stealth_level`) |
+| `session_rotation` | `str` | `"sticky"` | `"sticky"` reuses a proxy session per domain; `"rotate"` forces a new session per request (overridden by `stealth_level`) |
+| `request_pacing` | `float` | `0.0` | Fixed seconds of delay between browser requests (overridden by `stealth_level`) |
+| `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
+| `proxy_geo` | `str \| None` | `None` | ISO 3166-1 alpha-2 (e.g. `"US"`, `"DE"`) to align locale/timezone/Accept-Language with proxy exit country |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
 
 ---

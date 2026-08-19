@@ -202,8 +202,12 @@ async def _run(args: argparse.Namespace) -> int:
         raise ValueError("the input file does not contain any URLs")
     config = _build_config(args)
     extract_structure = args.format == "structure" or getattr(args, "include_structure", False)
+    # Page structure is only meaningful in browser mode (the rendered DOM);
+    # auto-promote when the user asked for it so we don't surface a raw
+    # ``ValueError`` from PageFetch.fetch.
+    effective_mode = "browser" if extract_structure else config.mode
     async with PageFetch(
-        mode=config.mode,
+        mode=effective_mode,
         proxy=config.proxy,
         cache_enabled=config.cache_enabled,
         cache_ttl=config.cache_ttl,

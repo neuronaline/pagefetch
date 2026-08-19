@@ -89,14 +89,17 @@ def _apply_debug(settings: dict) -> None:
 
 async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
     """Fetch a single URL."""
+    include_structure = settings.get("include_structure", False) or settings.get("format") == "structure"
+    # Page structure is only meaningful in browser mode; auto-promote so the
+    # call does not raise ValueError.
+    mode = "browser" if include_structure else settings.get("mode")
     result = await client.fetch(
         url,
-        mode=settings.get("mode"),
+        mode=mode,
         proxy=settings.get("proxy"),
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
-        extract_structure=settings.get("include_structure", False)
-        or settings.get("format") == "structure",
+        extract_structure=include_structure,
     )
     return [result]
 
@@ -111,15 +114,18 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
     if not urls:
         print("\n  Error: the file does not contain any URLs.")
         return []
+    include_structure = settings.get("include_structure", False) or settings.get("format") == "structure"
+    # Page structure is only meaningful in browser mode; auto-promote so the
+    # batch call does not raise ValueError for the first URL.
+    mode = "browser" if include_structure else settings.get("mode")
     print(f"\n  Fetching {len(urls)} URL(s)...\n")
     return await client.fetch_many(
         urls,
-        mode=settings.get("mode"),
+        mode=mode,
         proxy=settings.get("proxy"),
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
-        extract_structure=settings.get("include_structure", False)
-        or settings.get("format") == "structure",
+        extract_structure=include_structure,
     )
 
 

@@ -93,8 +93,9 @@ def _render_structure(result: FetchResult) -> str:
 
 
 def _render_node(node, indent: int = 0) -> list[str]:
-    """Render a DOM node tree as a Markdown bullet list."""
-    bullet = "  " * indent + f"- {node.selector}"
+    """Render a DOM node tree with copyable, unique CSS selectors."""
+    selector = node.unique_selector or node.path or node.selector
+    bullet = "  " * indent + f"- `{selector}`"
     if node.text:
         bullet += f": {node.text}"
     lines = [bullet]

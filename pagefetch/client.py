@@ -244,9 +244,10 @@ class PageFetch:
         raise_on_error : bool | None
             Override the default ``raise_on_error`` flag.
         extract_structure : bool
-            When ``True``, the returned result also carries a bounded
-            :class:`~pagefetch.models.PageStructure` summary on
-            ``FetchResult.structure`` (default ``False``).
+            When ``True``, capture the rendered DOM as a bounded,
+            scraper-oriented :class:`~pagefetch.models.PageStructure` on
+            ``FetchResult.structure``. This requires ``mode='browser'``
+            (default ``False``).
 
         Returns
         -------
@@ -257,6 +258,8 @@ class PageFetch:
         selected_mode = mode or self.config.mode
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
+        if extract_structure and selected_mode != "browser":
+            raise ValueError("extract_structure=True requires mode='browser'")
         try:
             self._validate_fetch_options(selected_mode, selected_proxy)
             validate_url(url)
@@ -402,8 +405,9 @@ class PageFetch:
         raise_on_error : bool | None
             Override the default ``raise_on_error`` flag.
         extract_structure : bool
-            When ``True``, attach a bounded :class:`~pagefetch.models.PageStructure`
-            to each result (default ``False``).
+            When ``True``, attach a scraper-oriented
+            :class:`~pagefetch.models.PageStructure` to each result. This
+            requires ``mode='browser'`` (default ``False``).
 
         Returns
         -------
@@ -446,6 +450,19 @@ class PageFetch:
                     success=False,
                     proxy_provider=proxy or self.config.proxy,
                     error=exc.error,
+                    duration_ms=round((time.perf_counter() - item_start) * 1000, 2),
+                    fetched_at=datetime.now(UTC),
+                )
+            except ValueError as exc:
+                # ``fetch`` raises ValueError for argument-validation failures
+                # such as ``extract_structure=True`` outside browser mode.
+                # Surface them as per-URL failures so one bad URL does not
+                # abort the rest of the batch.
+                return FetchResult(
+                    url=str(item),
+                    success=False,
+                    proxy_provider=proxy or self.config.proxy,
+                    error=FetchErrorInfo("invalid_argument", str(exc), False, type(exc).__name__),
                     duration_ms=round((time.perf_counter() - item_start) * 1000, 2),
                     fetched_at=datetime.now(UTC),
                 )
@@ -810,7 +827,8 @@ class PageFetch:
             raise TransportFailure(
                 FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
             ) from exc
-        structure = extract_structure(soup, final_url) if include_structure else None
+        structure_source = soup if soup is not None else html
+        structure = extract_structure(structure_source, final_url) if include_structure else None
         return FetchResult(
             url=original_url,
             final_url=final_url,

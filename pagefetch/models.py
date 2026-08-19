@@ -36,13 +36,15 @@ class FetchErrorInfo:
 
 @dataclass(slots=True)
 class StructureNode:
-    """A single node in the page DOM tree summary."""
+    """A DOM node described with scraper-oriented selector paths."""
 
     tag: str
     selector: str
     attrs: dict[str, str]
     text: str
     children: list[StructureNode]
+    path: str = ""
+    unique_selector: str = ""
 
 
 @dataclass(slots=True)
@@ -217,6 +219,8 @@ def _structure_to_dict(value: PageStructure) -> dict[str, Any]:
         return {
             "tag": node.tag,
             "selector": node.selector,
+            "path": node.path,
+            "unique_selector": node.unique_selector,
             "attrs": node.attrs,
             "text": node.text,
             "children": [node_to_dict(child) for child in node.children],
@@ -254,6 +258,8 @@ def _structure_from_dict(data: dict[str, Any]) -> PageStructure:
             attrs=dict(item.get("attrs", {})),
             text=item.get("text", ""),
             children=[node_from_dict(child) for child in item.get("children", [])],
+            path=item.get("path", ""),
+            unique_selector=item.get("unique_selector", item.get("path", "")),
         )
 
     def script_from_dict(item: dict[str, Any]) -> ScriptInfo:

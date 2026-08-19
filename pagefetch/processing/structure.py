@@ -126,12 +126,17 @@ def _describe(
     depth: int,
     counters: list[int],
     limits: StructureLimits,
+    parent_path: str = "",
 ) -> tuple[StructureNode, bool]:
     """Recursively describe *tag* within the configured depth/node budget."""
     counters[0] += 1
     truncated = False
     text = _short_text(tag, limits.text_preview)
     attrs = _filtered_attrs(tag)
+    selector = _build_selector(tag, attrs)
+    segment = _path_segment(tag, attrs)
+    path = f"{parent_path} > {segment}" if parent_path else segment
+    unique_selector = _unique_selector(tag, selector, path)
     children: list[StructureNode] = []
     if depth + 1 < limits.max_depth and counters[0] < limits.max_nodes:
         for child in tag.children:
@@ -142,6 +147,7 @@ def _describe(
                 depth=depth + 1,
                 counters=counters,
                 limits=limits,
+                parent_path=path,
             )
             children.append(child_node)
             if child_truncated:
@@ -149,8 +155,15 @@ def _describe(
             if counters[0] >= limits.max_nodes:
                 truncated = True
                 break
-    selector = _build_selector(tag, attrs)
-    node = StructureNode(tag=tag.name, selector=selector, attrs=attrs, text=text, children=children)
+    node = StructureNode(
+        tag=tag.name,
+        selector=selector,
+        attrs=attrs,
+        text=text,
+        children=children,
+        path=path,
+        unique_selector=unique_selector,
+    )
     if depth + 1 >= limits.max_depth:
         truncated = True
     return node, truncated
@@ -208,11 +221,61 @@ def _build_selector(tag: Tag, attrs: dict[str, str]) -> str:
     parts: list[str] = [tag.name]
     ident = attrs.get("id")
     if ident:
-        parts.append(f"#{ident}")
+        parts.append(f"#{_css_escape(ident)}")
     classes = attrs.get("class")
     if classes:
-        parts.extend(f".{token}" for token in classes.split() if token)
+        parts.extend(f".{_css_escape(token)}" for token in classes.split() if token)
     return "".join(parts)
+
+
+def _path_segment(tag: Tag, attrs: dict[str, str]) -> str:
+    """Build a deterministic path segment that identifies *tag* among siblings."""
+    ident = attrs.get("id")
+    if ident:
+        return f"{tag.name}#{_css_escape(ident)}"
+
+    segment = tag.name
+    classes = attrs.get("class")
+    if classes:
+        segment += "".join(f".{_css_escape(token)}" for token in classes.split() if token)
+
+    siblings = [sibling for sibling in tag.parent.children if isinstance(sibling, Tag)] if tag.parent else []
+    matches = [sibling for sibling in siblings if sibling.name == tag.name]
+    if len(matches) > 1:
+        segment += f":nth-of-type({matches.index(tag) + 1})"
+    return segment
+
+
+def _unique_selector(tag: Tag, selector: str, path: str) -> str:
+    """Return the shortest generated selector that uniquely matches *tag*."""
+    soup = tag
+    while soup.parent is not None:
+        soup = soup.parent
+    select = getattr(soup, "select", None)
+    if not callable(select):
+        return path
+    for candidate in (selector, path):
+        try:
+            matches = select(candidate)
+        except Exception:
+            continue
+        if len(matches) == 1 and matches[0] is tag:
+            return candidate
+    return path
+
+
+def _css_escape(value: str) -> str:
+    """Escape an identifier for safe use in a generated CSS selector."""
+    escaped: list[str] = []
+    for index, char in enumerate(value):
+        if char.isalnum() or char in {"-", "_"}:
+            if index == 0 and char.isdigit():
+                escaped.append(f"\\3{char} ")
+            else:
+                escaped.append(char)
+        else:
+            escaped.append(f"\\{char}")
+    return "".join(escaped)
 
 
 def _collect_styles(
