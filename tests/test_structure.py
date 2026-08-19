@@ -197,7 +197,7 @@ async def test_fetch_many_extract_structure_invalid_arg_returns_per_url_error(tm
 async def test_browser_mode_attaches_structure_when_requested(tmp_path, monkeypatch):
     client = PageFetch(mode="browser", cache_path=tmp_path / "cache.sqlite3")
 
-    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False):
+    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False, compact_structure=False):
         return client._result_from_html(
             original_url=url,
             final_url=url,
@@ -208,6 +208,7 @@ async def test_browser_mode_attaches_structure_when_requested(tmp_path, monkeypa
             proxy=proxy,
             method="browser",
             include_structure=extract_structure,
+            compact_structure=compact_structure,
         )
 
     monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
@@ -230,7 +231,7 @@ async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
 
     client = PageFetch(mode="browser", cache_path=cache_path)
 
-    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False):
+    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False, compact_structure=False):
         return client._result_from_html(
             original_url=url,
             final_url=url,
@@ -241,6 +242,7 @@ async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
             proxy=proxy,
             method="browser",
             include_structure=extract_structure,
+            compact_structure=compact_structure,
         )
 
     monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
@@ -258,6 +260,162 @@ async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
         reused = await cached_client.fetch("https://example.com", extract_structure=True)
     assert reused.from_cache is True
     assert reused.structure is not None
+
+
+def test_compact_mode_filters_attributes_and_skips_unique_selector():
+    """Compact mode strips non-essential attributes and skips the unique_selector query."""
+    structure = extract_structure(
+        rich_structure_html(),
+        "https://example.com/",
+        limits=StructureLimits(compact=True),
+    )
+    body = next(child for child in structure.root.children if child.tag == "body")
+    main = next(child for child in body.children if child.tag == "main")
+    article = next(child for child in main.children if child.tag == "article")
+    # ``data-id`` stays (whitelisted), ``data-track`` would not (not in the
+    # whitelist) — but rich_structure_html only has ``data-id``.
+    assert article.attrs == {"class": "post featured", "data-id": "42"}
+    # ``unique_selector`` is intentionally empty in compact mode.
+    assert article.unique_selector == ""
+    # ``selector`` and ``path`` still carry the developer-relevant info.
+    assert article.selector == "article.post.featured"
+    assert article.path.endswith("article.post.featured")
+
+
+def test_compact_payload_keeps_essential_fields_only():
+    """Compact serialization drops empty fields and trims inline script/style content."""
+    structure = extract_structure(
+        rich_structure_html(),
+        "https://example.com/",
+        limits=StructureLimits(compact=True),
+    )
+    from pagefetch.models import FetchResult
+
+    result = FetchResult(
+        url="https://example.com/",
+        final_url="https://example.com/",
+        status_code=200,
+        success=True,
+        structure=structure,
+    )
+    payload = result.to_dict(include_structure=True, compact_structure=True)
+    # Stylesheets/scripts shrink to {"url": ...}.
+    assert payload["structure"]["stylesheets"] == [{"url": "https://example.com/theme.css"}]
+    assert payload["structure"]["scripts"] == [
+        {"url": "https://example.com/boot.js"},
+        {"url": "https://example.com/app.js"},
+    ]
+    # Inline scripts become ``{length, preview, [truncated]}``.
+    inline_script = payload["structure"]["inline_scripts"][0]
+    assert set(inline_script.keys()) <= {"length", "preview", "truncated"}
+    assert "truncated" not in inline_script or inline_script["truncated"] is False
+    # Empty attrs/text are dropped — no ``"attrs": {}`` noise.
+    assert "attrs" not in payload["structure"]["root"]
+    assert "text" not in payload["structure"]["root"]
+
+
+def test_compact_payload_truncates_huge_inline_script():
+    """Inline content beyond the preview bound is replaced by length+truncated flag."""
+    big_script = "<script>" + ("const x = 1;\n" * 1000) + "</script>"
+    html = (
+        "<html><head>"
+        + big_script
+        + "</head><body><p>hi</p></body></html>"
+    )
+    structure = extract_structure(html, limits=StructureLimits(compact=True))
+    from pagefetch.models import FetchResult
+
+    payload = FetchResult(url="x", success=True, structure=structure).to_dict(
+        include_structure=True, compact_structure=True
+    )
+    inline = payload["structure"]["inline_scripts"][0]
+    assert inline["truncated"] is True
+    assert inline["length"] > 160
+    assert len(inline["preview"]) == 160
+
+
+def test_verbose_to_dict_is_unchanged_by_default():
+    """Backwards compatibility: ``to_dict(include_structure=True)`` keeps all fields."""
+    structure = extract_structure(rich_structure_html(), "https://example.com/")
+    from pagefetch.models import FetchResult
+
+    payload = FetchResult(
+        url="https://example.com/", success=True, structure=structure
+    ).to_dict(include_structure=True)
+    # Verbose mode keeps the selector trio on every node.
+    assert "selector" in payload["structure"]["root"]
+    assert "path" in payload["structure"]["root"]
+    assert "unique_selector" in payload["structure"]["root"]
+    # And inline scripts contain the full ``{content, truncated, type}``.
+    assert "content" in payload["structure"]["inline_scripts"][0]
+    # And stylesheets/scripts carry their non-URL fields.
+    assert "type" in payload["structure"]["scripts"][0]
+    assert "async" in payload["structure"]["scripts"][0]
+
+
+@pytest.mark.asyncio
+async def test_compact_mode_partitions_cache(tmp_path, monkeypatch):
+    """``compact_structure`` must produce a different cache key than the verbose run."""
+    cache_path = tmp_path / "cache.sqlite3"
+    client = PageFetch(mode="browser", cache_path=cache_path)
+
+    captured: list[bool] = []
+
+    async def fake_fetch_browser(
+        url, proxy, status_code=None, *, extract_structure=False, compact_structure=False
+    ):
+        captured.append(compact_structure)
+        return client._result_from_html(
+            original_url=url,
+            final_url=url,
+            status_code=200,
+            html=rich_structure_html(),
+            content_type="text/html",
+            encoding="utf-8",
+            proxy=proxy,
+            method="browser",
+            include_structure=extract_structure,
+            compact_structure=compact_structure,
+        )
+
+    monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
+    async with client:
+        verbose = await client.fetch("https://example.com", extract_structure=True)
+        compact = await client.fetch(
+            "https://example.com", extract_structure=True, compact_structure=True
+        )
+        verbose_again = await client.fetch(
+            "https://example.com", extract_structure=True
+        )
+        compact_again = await client.fetch(
+            "https://example.com", extract_structure=True, compact_structure=True
+        )
+    # Verbose and compact must be cached under distinct keys: both first calls
+    # are misses, the cached-key reuses for each variant are hits.
+    assert captured == [False, True]
+    assert verbose.from_cache is False
+    assert compact.from_cache is False
+    assert verbose_again.from_cache is True
+    assert compact_again.from_cache is True
+    assert verbose.structure.root.children
+    assert compact.structure.root.children
+    # Verbose nodes carry unique_selector; compact nodes don't.
+    verbose_article = next(
+        child
+        for child in next(
+            child for child in verbose.structure.root.children if child.tag == "body"
+        ).children[0].children
+        if child.tag == "article"
+    )
+    compact_article = next(
+        child
+        for child in next(
+            child for child in compact.structure.root.children if child.tag == "body"
+        ).children[0].children
+        if child.tag == "article"
+    )
+    assert verbose_article.unique_selector != ""
+    assert compact_article.unique_selector == ""
 
 
 def test_result_serialization_round_trips_structure():

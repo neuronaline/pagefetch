@@ -26,6 +26,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--include-html", action="store_true")
     parser.add_argument("--include-structure", action="store_true", help="Attach a bounded PageStructure summary to every result.")
     parser.add_argument(
+        "--compact-structure",
+        action="store_true",
+        help=(
+            "Emit the LLM-friendly variant of the structure tree when "
+            "--include-structure/--format=structure is active: skip the "
+            "unique_selector query, filter non-essential attributes, and "
+            "trim inline <script>/<style> content to {length, preview}."
+        ),
+    )
+    parser.add_argument(
         "--cache-ttl",
         metavar="DURATION",
         default=argparse.SUPPRESS,
@@ -101,12 +111,14 @@ def _render(
     output_format: str,
     include_html: bool,
     include_structure: bool = False,
+    compact_structure: bool = False,
 ) -> str:
     return render_results(
         results,
         output_format,
         include_html=include_html,
         include_structure=include_structure,
+        compact_structure=compact_structure,
     )
 
 
@@ -202,6 +214,7 @@ async def _run(args: argparse.Namespace) -> int:
         raise ValueError("the input file does not contain any URLs")
     config = _build_config(args)
     extract_structure = args.format == "structure" or getattr(args, "include_structure", False)
+    compact_structure = bool(getattr(args, "compact_structure", False)) and extract_structure
     # Page structure is only meaningful in browser mode (the rendered DOM);
     # auto-promote when the user asked for it so we don't surface a raw
     # ``ValueError`` from PageFetch.fetch.
@@ -231,8 +244,18 @@ async def _run(args: argparse.Namespace) -> int:
         proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
     ) as client:
-        results = await client.fetch_many(urls, extract_structure=extract_structure)
-    rendered = _render(results, args.format, args.include_html, include_structure=extract_structure)
+        results = await client.fetch_many(
+            urls,
+            extract_structure=extract_structure,
+            compact_structure=compact_structure,
+        )
+    rendered = _render(
+        results,
+        args.format,
+        args.include_html,
+        include_structure=extract_structure,
+        compact_structure=compact_structure,
+    )
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")
     else:

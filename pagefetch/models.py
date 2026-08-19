@@ -7,6 +7,10 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from typing import Any
 
+# Compact serialization bounds. Kept conservative so the LLM-facing JSON
+# payload never balloons even for pages with megabyte-sized inline scripts.
+_COMPACT_INLINE_PREVIEW = 160
+
 
 @dataclass(slots=True)
 class LinkInfo:
@@ -157,11 +161,18 @@ class FetchResult:
         *,
         include_html: bool = False,
         include_structure: bool = False,
+        compact_structure: bool = False,
     ) -> dict[str, Any]:
         """Return a JSON-compatible dictionary.
 
         Raw HTML and the page structure summary are excluded by default; opt
-        in with ``include_html=True`` and ``include_structure=True``.
+        in with ``include_html=True`` and ``include_structure=True``. When
+        ``compact_structure=True`` (and ``include_structure=True``) the
+        structure payload is trimmed to the fields most useful for LLM
+        consumers and developer inspection: empty fields are dropped,
+        stylesheet/script entries shrink to ``{"url": ...}``, and inline
+        ``<style>``/``<script>`` previews are returned as ``{length, preview}``
+        instead of the full content.
         """
         output: dict[str, Any] = {}
         for field in fields(self):
@@ -177,7 +188,7 @@ class FetchResult:
             elif field.name == "error" and value is not None:
                 output[field.name] = asdict(value)
             elif field.name == "structure" and value is not None:
-                output[field.name] = _structure_to_dict(value)
+                output[field.name] = _structure_to_dict(value, compact=compact_structure)
             else:
                 output[field.name] = value
         return output
@@ -187,11 +198,20 @@ class FetchResult:
         *,
         include_html: bool = False,
         include_structure: bool = False,
+        compact_structure: bool = False,
         indent: int | None = None,
     ) -> str:
-        """Serialize the result as UTF-8 friendly JSON."""
+        """Serialize the result as UTF-8 friendly JSON.
+
+        ``compact_structure`` mirrors :meth:`to_dict` and only affects the
+        payload when ``include_structure=True``.
+        """
         return json.dumps(
-            self.to_dict(include_html=include_html, include_structure=include_structure),
+            self.to_dict(
+                include_html=include_html,
+                include_structure=include_structure,
+                compact_structure=compact_structure,
+            ),
             ensure_ascii=False,
             indent=indent,
         )
@@ -212,40 +232,85 @@ class FetchResult:
         return cls(**values)
 
 
-def _structure_to_dict(value: PageStructure) -> dict[str, Any]:
-    """Serialize a PageStructure, mapping ``async_`` back to ``async``."""
+def _structure_to_dict(value: PageStructure, *, compact: bool = False) -> dict[str, Any]:
+    """Serialize a PageStructure, mapping ``async_`` back to ``async``.
+
+    When ``compact=True`` the payload is trimmed for LLM/developer use: empty
+    fields are omitted, stylesheets and scripts keep only ``url``, and inline
+    ``<style>``/``<script>`` blocks expose ``{length, preview}`` instead of the
+    full content. The verbose selector triples (``selector``/``path``/
+    ``unique_selector``) are intentionally kept in compact mode because they
+    are the most developer-actionable parts of the tree; callers that want
+    the raw tree can ignore them.
+    """
 
     def node_to_dict(node: StructureNode) -> dict[str, Any]:
-        return {
-            "tag": node.tag,
-            "selector": node.selector,
-            "path": node.path,
-            "unique_selector": node.unique_selector,
-            "attrs": node.attrs,
-            "text": node.text,
-            "children": [node_to_dict(child) for child in node.children],
-        }
+        payload: dict[str, Any] = {"tag": node.tag}
+        if node.selector:
+            payload["selector"] = node.selector
+        if node.path:
+            payload["path"] = node.path
+        # ``unique_selector`` is verbose-mode-only: callers that opted out of
+        # the LLM-friendly variant rely on the field being present even when
+        # it duplicates ``selector``. In compact mode the ``path`` already
+        # uniquely addresses the node.
+        if not compact and node.unique_selector:
+            payload["unique_selector"] = node.unique_selector
+        if node.attrs:
+            payload["attrs"] = node.attrs
+        if node.text:
+            payload["text"] = node.text
+        if node.children:
+            payload["children"] = [node_to_dict(child) for child in node.children]
+        return payload
 
     def script_to_dict(item: ScriptInfo) -> dict[str, Any]:
-        return {
-            "url": item.url,
-            "type": item.type,
-            "async": item.async_,
-            "defer": item.defer,
-            "integrity": item.integrity,
-            "crossorigin": item.crossorigin,
-        }
+        payload: dict[str, Any] = {"url": item.url}
+        if compact:
+            return payload
+        payload["type"] = item.type
+        payload["async"] = item.async_
+        payload["defer"] = item.defer
+        if item.integrity:
+            payload["integrity"] = item.integrity
+        if item.crossorigin:
+            payload["crossorigin"] = item.crossorigin
+        return payload
+
+    if compact:
+        stylesheets = [{"url": item.url} for item in value.stylesheets]
+        inline_styles = [_compact_inline(item) for item in value.inline_styles]
+        inline_scripts = [_compact_inline(item) for item in value.inline_scripts]
+    else:
+        stylesheets = [asdict(item) for item in value.stylesheets]
+        inline_styles = [asdict(item) for item in value.inline_styles]
+        inline_scripts = [asdict(item) for item in value.inline_scripts]
 
     return {
         "root": node_to_dict(value.root) if value.root is not None else None,
-        "stylesheets": [asdict(item) for item in value.stylesheets],
-        "inline_styles": [asdict(item) for item in value.inline_styles],
+        "stylesheets": stylesheets,
+        "inline_styles": inline_styles,
         "scripts": [script_to_dict(item) for item in value.scripts],
-        "inline_scripts": [asdict(item) for item in value.inline_scripts],
+        "inline_scripts": inline_scripts,
         "truncated": value.truncated,
         "node_count": value.node_count,
         "max_depth": value.max_depth,
     }
+
+
+def _compact_inline(item: InlineStylesheet | InlineScript) -> dict[str, Any]:
+    """Return a compact ``{length, preview, truncated?}`` view of inline content.
+
+    ``preview`` is bounded to :data:`_COMPACT_INLINE_PREVIEW` chars so the JSON
+    payload stays predictable even for huge inline ``<script>`` blocks.
+    """
+    content = item.content
+    truncated = bool(getattr(item, "truncated", False)) or len(content) > _COMPACT_INLINE_PREVIEW
+    preview = content[:_COMPACT_INLINE_PREVIEW]
+    payload: dict[str, Any] = {"length": len(content), "preview": preview}
+    if truncated:
+        payload["truncated"] = True
+    return payload
 
 
 def _structure_from_dict(data: dict[str, Any]) -> PageStructure:

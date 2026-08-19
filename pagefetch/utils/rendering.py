@@ -13,11 +13,20 @@ def render_results(
     *,
     include_html: bool = False,
     include_structure: bool = False,
+    compact_structure: bool = False,
 ) -> str:
-    """Render fetch results in the chosen format (markdown, json, html, or structure)."""
+    """Render fetch results in the chosen format (markdown, json, html, or structure).
+
+    ``compact_structure`` only affects JSON output and is forwarded to
+    :meth:`FetchResult.to_dict`.
+    """
     if output_format == "json":
         values = [
-            result.to_dict(include_html=include_html, include_structure=include_structure)
+            result.to_dict(
+                include_html=include_html,
+                include_structure=include_structure,
+                compact_structure=compact_structure,
+            )
             for result in results
         ]
         return json.dumps(values, ensure_ascii=False, indent=2)

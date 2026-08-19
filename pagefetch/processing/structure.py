@@ -35,18 +35,56 @@ _DEFAULT_MAX_NODES = 800
 _DEFAULT_TEXT_PREVIEW = 120
 _DEFAULT_INLINE_SOURCE_LIMIT = 4_096
 
+# Attribute whitelist used in compact mode to keep the tree payload small.
+# We keep the selectors' building blocks (``id``/``class``) plus the fields an
+# LLM or developer would reasonably look at first (``role``,
+# ``data-testid``/``data-test``/``data-id``, ``aria-*``, ``href``,
+# ``name``/``type``/``value``/``placeholder``/``title``/``alt``/``src``/
+# ``for``/``disabled``/``hidden``/``target``/``rel``).
+_COMPACT_ATTR_WHITELIST = frozenset(
+    {
+        "id",
+        "class",
+        "role",
+        "data-testid",
+        "data-test",
+        "data-id",
+        "aria-label",
+        "aria-labelledby",
+        "aria-describedby",
+        "href",
+        "name",
+        "type",
+        "value",
+        "placeholder",
+        "title",
+        "alt",
+        "src",
+        "for",
+        "disabled",
+        "hidden",
+        "target",
+        "rel",
+    }
+)
+
 
 @dataclass(slots=True, frozen=True)
 class StructureLimits:
     """Bounds for the structure extractor.
 
     ``inline_source_limit`` is applied per ``<style>`` / ``<script>`` block.
+    ``compact`` switches on the LLM/developer-friendly output: the selector
+    triples are still emitted for developer ergonomics, but verbose fields
+    (``unique_selector`` duplicates, all inline script content, non-essential
+    attributes) are dropped or trimmed.
     """
 
     max_depth: int = _DEFAULT_MAX_DEPTH
     max_nodes: int = _DEFAULT_MAX_NODES
     text_preview: int = _DEFAULT_TEXT_PREVIEW
     inline_source_limit: int = _DEFAULT_INLINE_SOURCE_LIMIT
+    compact: bool = False
 
 
 def extract_structure(
@@ -59,7 +97,9 @@ def extract_structure(
 
     *base_url* is used to absolutize external asset references; pass ``None``
     when the document was loaded from a local file or the absolute URLs are
-    already present in the markup.
+    already present in the markup. Pass ``StructureLimits(compact=True)`` (or
+    rely on the caller's choice in :meth:`PageFetch.fetch`) to receive the
+    smaller, LLM-friendly variant.
     """
     limits = limits or StructureLimits()
     soup = (
@@ -132,11 +172,17 @@ def _describe(
     counters[0] += 1
     truncated = False
     text = _short_text(tag, limits.text_preview)
-    attrs = _filtered_attrs(tag)
+    attrs = _filtered_attrs(tag, compact=limits.compact)
     selector = _build_selector(tag, attrs)
     segment = _path_segment(tag, attrs)
     path = f"{parent_path} > {segment}" if parent_path else segment
-    unique_selector = _unique_selector(tag, selector, path)
+    # ``unique_selector`` requires running a CSS query to validate uniqueness.
+    # In compact mode we skip it: the ``path`` already uniquely addresses the
+    # node, and removing this saves one ``select`` per node on large pages.
+    if limits.compact:
+        unique_selector = ""
+    else:
+        unique_selector = _unique_selector(tag, selector, path)
     children: list[StructureNode] = []
     if depth + 1 < limits.max_depth and counters[0] < limits.max_nodes:
         for child in tag.children:
@@ -200,11 +246,20 @@ _ATTR_BLACKLIST = frozenset(
 )
 
 
-def _filtered_attrs(tag: Tag) -> dict[str, str]:
-    """Return a JSON-safe attribute map, dropping event handlers and styles."""
+def _filtered_attrs(tag: Tag, *, compact: bool = False) -> dict[str, str]:
+    """Return a JSON-safe attribute map, dropping event handlers and styles.
+
+    In *compact* mode the map is additionally filtered to
+    :data:`_COMPACT_ATTR_WHITELIST` so the tree payload stays focused on the
+    fields an LLM or developer is most likely to ask about (selectors, ARIA,
+    test hooks, form bindings). ``id`` and ``class`` are always kept because
+    they are the building blocks of the generated CSS selectors.
+    """
     attrs: dict[str, str] = {}
     for key, value in tag.attrs.items():
         if key.startswith("on") or key in _ATTR_BLACKLIST:
+            continue
+        if compact and key not in _COMPACT_ATTR_WHITELIST:
             continue
         attrs[str(key)] = _stringify(value)
     return attrs

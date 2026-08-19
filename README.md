@@ -229,19 +229,44 @@ client = PageFetch(
 
 ### Methods
 
-**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False) → FetchResult`**
+**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False, compact_structure=False) → FetchResult`**
 
 Fetch a single URL. All keyword arguments override the client-level defaults
 for this individual request only. Pass `extract_structure=True` with
 `mode="browser"` to attach a scraper-oriented `PageStructure` to
 `FetchResult.structure`. Structure extraction requires browser mode so it
 always describes the rendered DOM rather than incomplete server markup.
+Pass `compact_structure=True` (with `extract_structure=True`) to request the
+LLM-friendly variant — `unique_selector` is dropped, non-essential attributes
+are filtered, and inline `<style>`/`<script>` content is trimmed to
+`{length, preview}`. `compact_structure` only affects subsequent
+`to_dict()` / `json()` calls; the in-memory `FetchResult.structure` still
+carries the full fields.
 
-**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False) → list[FetchResult]`**
+**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False, compact_structure=False) → list[FetchResult]`**
 
 Fetch multiple URLs concurrently. Deduplicates identical inputs internally,
 preserves the original input order, and isolates individual failures — one
-bad URL never affects the others.
+bad URL never affects the others. The `extract_structure` / `compact_structure`
+flags are forwarded to each underlying `fetch()` call.
+
+### Public API Exports
+
+Everything PageFetch ships in its top-level `pagefetch` namespace:
+
+| Symbol | Purpose |
+|---|---|
+| `PageFetch`, `PageFetchConfig` | Client + validated configuration |
+| `FetchResult`, `LinkInfo`, `ImageInfo`, `FetchErrorInfo` | Result dataclasses |
+| `PageStructure`, `StructureNode`, `StylesheetInfo`, `InlineStylesheet`, `ScriptInfo`, `InlineScript` | Page-structure summary types |
+| `StructureLimits`, `extract_structure` | Lower-level structure extraction |
+| `PageFetchError`, `RuntimeBootstrapError` | Exception hierarchy |
+| `ensure_runtime_requirements`, `auto_bootstrap_browser` | Pre-flight / force-install Camoufox |
+| `VALID_MODES`, `VALID_PROXIES` | Allowed-value constants |
+
+Browser dependencies are auto-installed on first browser use. Call
+`ensure_runtime_requirements()` for an up-front check without installing,
+or `auto_bootstrap_browser()` to force installation at any point.
 
 ---
 
@@ -406,6 +431,7 @@ CLI arguments map directly to the Python API:
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
 | `--proxy-geo CC` | `proxy_geo` |
 | `--include-html` / `--include-structure` | `FetchResult.json(include_html=…, include_structure=…)` |
+| `--compact-structure` | `compact_structure=True` for `to_dict()` / `json()` / `render_results()` |
 | `--format {markdown,json,html,structure}` | output renderer |
 | `-o PATH` / `--output PATH` | write rendered output to a file |
 | `-c PATH` / `--config PATH` | `PageFetchConfig.from_yaml` |
@@ -413,6 +439,14 @@ CLI arguments map directly to the Python API:
 
 Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error,
 `3` partial failure.
+
+### Interactive Menu
+
+Running `python -m pagefetch` with **no arguments** opens a guided
+interactive menu (mode, proxy, stealth, format, URL/file input, …) — useful
+when you don't want to memorise the flags. Pass `python -m pagefetch --cli`
+(or invoke the `pagefetch` console script) to use the argparse CLI
+documented above.
 
 ---
 

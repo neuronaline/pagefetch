@@ -65,6 +65,7 @@ def _render_results(
     output_format: str,
     include_html: bool,
     include_structure: bool = False,
+    compact_structure: bool = False,
 ) -> str:
     """Render fetch results in the chosen format."""
     return render_results(
@@ -72,6 +73,7 @@ def _render_results(
         output_format,
         include_html=include_html,
         include_structure=include_structure,
+        compact_structure=compact_structure,
     )
 
 
@@ -90,6 +92,7 @@ def _apply_debug(settings: dict) -> None:
 async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
     """Fetch a single URL."""
     include_structure = settings.get("include_structure", False) or settings.get("format") == "structure"
+    compact_structure = bool(settings.get("compact_structure")) and include_structure
     # Page structure is only meaningful in browser mode; auto-promote so the
     # call does not raise ValueError.
     mode = "browser" if include_structure else settings.get("mode")
@@ -100,6 +103,7 @@ async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchR
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
         extract_structure=include_structure,
+        compact_structure=compact_structure,
     )
     return [result]
 
@@ -115,6 +119,7 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
         print("\n  Error: the file does not contain any URLs.")
         return []
     include_structure = settings.get("include_structure", False) or settings.get("format") == "structure"
+    compact_structure = bool(settings.get("compact_structure")) and include_structure
     # Page structure is only meaningful in browser mode; auto-promote so the
     # batch call does not raise ValueError for the first URL.
     mode = "browser" if include_structure else settings.get("mode")
@@ -126,6 +131,7 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
         extract_structure=include_structure,
+        compact_structure=compact_structure,
     )
 
 
@@ -178,8 +184,15 @@ def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEvent
     output_format = settings.get("format", "markdown")
     include_html = settings.get("include_html", False)
     include_structure = settings.get("include_structure", False) or output_format == "structure"
+    compact_structure = bool(settings.get("compact_structure")) and include_structure
 
-    rendered = _render_results(results, output_format, include_html, include_structure)
+    rendered = _render_results(
+        results,
+        output_format,
+        include_html,
+        include_structure,
+        compact_structure,
+    )
     output_file = settings.get("output")
 
     if output_file:

@@ -38,7 +38,7 @@ from .processing.non_html import (
     process_text,
     process_xml,
 )
-from .processing.structure import extract_structure
+from .processing.structure import StructureLimits, extract_structure
 from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
 from .proxy.providers import (
     _inject_session_id,
@@ -226,6 +226,7 @@ class PageFetch:
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
         extract_structure: bool = False,
+        compact_structure: bool = False,
     ) -> FetchResult:
         """Fetch one URL and return a structured result.
 
@@ -248,6 +249,17 @@ class PageFetch:
             scraper-oriented :class:`~pagefetch.models.PageStructure` on
             ``FetchResult.structure``. This requires ``mode='browser'``
             (default ``False``).
+        compact_structure : bool
+            When ``True`` (and ``extract_structure=True``), request the
+            LLM-friendly variant of the structure tree: the
+            ``unique_selector`` query is skipped, non-essential attributes
+            are filtered out, and inline ``<style>``/``<script>`` content is
+            returned as ``{length, preview}`` rather than the full source.
+            ``compact_structure`` only affects future calls to
+            :meth:`FetchResult.to_dict` / :meth:`FetchResult.json` via the
+            ``compact_structure`` flag — it does not change the in-memory
+            representation, so callers can still access the verbose fields
+            on :attr:`FetchResult.structure` directly.
 
         Returns
         -------
@@ -309,6 +321,7 @@ class PageFetch:
                 ),
                 "block_images": self.config.block_images,
                 "block_level": self.config.block_level,
+                "compact_structure": compact_structure,
                 "confidence_threshold": self.config.confidence_threshold,
                 "extract_structure": extract_structure,
                 "humanize": self.config.humanize,
@@ -335,11 +348,19 @@ class PageFetch:
             try:
                 if selected_mode == "browser":
                     result = await self._fetch_browser(
-                        normalized_url, selected_proxy, status_code=None, extract_structure=extract_structure
+                        normalized_url,
+                        selected_proxy,
+                        status_code=None,
+                        extract_structure=extract_structure,
+                        compact_structure=compact_structure,
                     )
                 else:
                     result = await self._fetch_http_or_auto(
-                        normalized_url, selected_mode, selected_proxy, extract_structure=extract_structure
+                        normalized_url,
+                        selected_mode,
+                        selected_proxy,
+                        extract_structure=extract_structure,
+                        compact_structure=compact_structure,
                     )
             except (TransportFailure, ProxyConfigurationError) as exc:
                 error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
@@ -387,6 +408,7 @@ class PageFetch:
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
         extract_structure: bool = False,
+        compact_structure: bool = False,
     ) -> list[FetchResult]:
         """Fetch unique URLs concurrently while preserving input order.
 
@@ -408,6 +430,9 @@ class PageFetch:
             When ``True``, attach a scraper-oriented
             :class:`~pagefetch.models.PageStructure` to each result. This
             requires ``mode='browser'`` (default ``False``).
+        compact_structure : bool
+            Forwarded to each underlying :meth:`fetch` call; selects the
+            LLM-friendly variant of the structure payload.
 
         Returns
         -------
@@ -426,6 +451,7 @@ class PageFetch:
             _cache_ttl: str | int | None = cache_ttl,
             _raise_on_error: bool | None = raise_on_error,
             _extract_structure: bool = extract_structure,
+            _compact_structure: bool = compact_structure,
         ) -> FetchResult:
             item_start = time.perf_counter()
             try:
@@ -437,6 +463,7 @@ class PageFetch:
                     cache_ttl=_cache_ttl,
                     raise_on_error=_raise_on_error,
                     extract_structure=_extract_structure,
+                    compact_structure=_compact_structure,
                 )
             except PageFetchError as exc:
                 # Use the raw item string — normalize_url would re-raise
@@ -498,6 +525,7 @@ class PageFetch:
         mode: Literal["auto", "http", "browser"],
         proxy: str,
         extract_structure: bool = False,
+        compact_structure: bool = False,
     ) -> FetchResult:
         try:
             fetcher = await self._http_fetcher(proxy, url)
@@ -533,7 +561,11 @@ class PageFetch:
                 # stacks (httpx → Camoufox) back-to-back — a strong bot signal.
                 await asyncio.sleep(random.uniform(0.5, 3.0))
                 return await self._fetch_browser(
-                    url, proxy, status_code=response.status_code, extract_structure=extract_structure
+                    url,
+                    proxy,
+                    status_code=response.status_code,
+                    extract_structure=extract_structure,
+                    compact_structure=compact_structure,
                 )
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
             raise TransportFailure(
@@ -566,7 +598,11 @@ class PageFetch:
             await asyncio.sleep(random.uniform(0.5, 3.0))
             try:
                 rendered = await self._fetch_browser(
-                    url, proxy, status_code=response.status_code, extract_structure=extract_structure
+                    url,
+                    proxy,
+                    status_code=response.status_code,
+                    extract_structure=extract_structure,
+                    compact_structure=compact_structure,
                 )
             except TransportFailure:
                 available = self._result_from_html(
@@ -582,6 +618,7 @@ class PageFetch:
                     soup=raw_soup,
                     confidence=report,
                     include_structure=extract_structure,
+                    compact_structure=compact_structure,
                 )
                 available.warnings.extend(
                     [
@@ -604,6 +641,7 @@ class PageFetch:
                     soup=raw_soup,
                     confidence=report,
                     include_structure=extract_structure,
+                    compact_structure=compact_structure,
                 )
                 available.warnings.extend(
                     [
@@ -627,6 +665,7 @@ class PageFetch:
             soup=raw_soup,
             confidence=report,
             include_structure=extract_structure,
+            compact_structure=compact_structure,
         )
         if mode == "http" and report.score < self.config.confidence_threshold:
             result.warnings.append("HTTP content may be incomplete; browser fallback is disabled.")
@@ -639,6 +678,7 @@ class PageFetch:
         status_code: int | None,
         *,
         extract_structure: bool = False,
+        compact_structure: bool = False,
     ) -> FetchResult:
         if self.config.session_rotation == "rotate" and proxy != "none":
             settings = resolve_proxy(proxy)
@@ -673,6 +713,7 @@ class PageFetch:
             soup=raw_soup,
             confidence=response.confidence,
             include_structure=extract_structure,
+            compact_structure=compact_structure,
         )
         result.warnings.extend(response.warnings)
         report = response.confidence
@@ -820,6 +861,7 @@ class PageFetch:
         soup: BeautifulSoup | None = None,
         confidence: ConfidenceReport | None = None,
         include_structure: bool = False,
+        compact_structure: bool = False,
     ) -> FetchResult:
         try:
             processed = process_html(html, final_url, response_headers, soup=soup, confidence=confidence)
@@ -828,7 +870,10 @@ class PageFetch:
                 FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
             ) from exc
         structure_source = soup if soup is not None else html
-        structure = extract_structure(structure_source, final_url) if include_structure else None
+        limits = StructureLimits(compact=compact_structure) if compact_structure else None
+        structure = (
+            extract_structure(structure_source, final_url, limits=limits) if include_structure else None
+        )
         return FetchResult(
             url=original_url,
             final_url=final_url,
