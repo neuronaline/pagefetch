@@ -20,7 +20,7 @@ def build_cache_key(
         "url": normalize_url(url),
         "mode": mode,
         "proxy": proxy,
-        "processing_version": 2,
+        "processing_version": 3,
         "settings": settings or {},
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)

@@ -60,9 +60,19 @@ def _confirm(prompt_text: str, default: bool = True) -> bool:
     return answer in ("y", "yes")
 
 
-def _render_results(results: list[FetchResult], output_format: str, include_html: bool) -> str:
+def _render_results(
+    results: list[FetchResult],
+    output_format: str,
+    include_html: bool,
+    include_structure: bool = False,
+) -> str:
     """Render fetch results in the chosen format."""
-    return render_results(results, output_format, include_html=include_html)
+    return render_results(
+        results,
+        output_format,
+        include_html=include_html,
+        include_structure=include_structure,
+    )
 
 
 def _apply_debug(settings: dict) -> None:
@@ -85,6 +95,8 @@ async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchR
         proxy=settings.get("proxy"),
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
+        extract_structure=settings.get("include_structure", False)
+        or settings.get("format") == "structure",
     )
     return [result]
 
@@ -106,6 +118,8 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
         proxy=settings.get("proxy"),
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
+        extract_structure=settings.get("include_structure", False)
+        or settings.get("format") == "structure",
     )
 
 
@@ -157,8 +171,9 @@ def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEvent
 
     output_format = settings.get("format", "markdown")
     include_html = settings.get("include_html", False)
+    include_structure = settings.get("include_structure", False) or output_format == "structure"
 
-    rendered = _render_results(results, output_format, include_html)
+    rendered = _render_results(results, output_format, include_html, include_structure)
     output_file = settings.get("output")
 
     if output_file:
@@ -201,6 +216,7 @@ def _settings_menu(settings: dict) -> None:
         cache_ttl = settings.get("cache_ttl") or "(config/default)"
         output = settings.get("output", "none")
         include_html = "yes" if settings.get("include_html") else "no"
+        include_structure = "yes" if settings.get("include_structure") else "no"
         debug = "yes" if settings.get("debug") else "no"
         config_file = settings.get("config_file", "none")
         no_cache = "yes" if settings.get("no_cache") else "no"
@@ -211,9 +227,10 @@ def _settings_menu(settings: dict) -> None:
         print(f"  4. Cache TTL           : {cache_ttl}")
         print(f"  5. Output file         : {output}")
         print(f"  6. Include raw HTML    : {include_html}")
-        print(f"  7. Debug logging       : {debug}")
-        print(f"  8. Disable cache       : {no_cache}")
-        print(f"  9. Config file (YAML)  : {config_file}")
+        print(f"  7. Include structure   : {include_structure}")
+        print(f"  8. Debug logging       : {debug}")
+        print(f"  9. Disable cache       : {no_cache}")
+        print(f" 10. Config file (YAML)  : {config_file}")
         print("  0. Back to main menu")
         print()
 
@@ -238,9 +255,9 @@ def _settings_menu(settings: dict) -> None:
                 print(f"  Invalid proxy: {val}")
                 input("  Press Enter...")
         elif choice == "3":
-            print("\n  Options: markdown, json, html")
+            print("\n  Options: markdown, json, html, structure")
             val = _prompt("  Output format", fmt)
-            if val in ("markdown", "json", "html"):
+            if val in ("markdown", "json", "html", "structure"):
                 settings["format"] = val
             else:
                 print(f"  Invalid format: {val}")
@@ -256,15 +273,20 @@ def _settings_menu(settings: dict) -> None:
         elif choice == "6":
             settings["include_html"] = _confirm("  Include raw HTML in output?", default=settings.get("include_html", False))
         elif choice == "7":
+            settings["include_structure"] = _confirm(
+                "  Include page structure summary?",
+                default=settings.get("include_structure", False),
+            )
+        elif choice == "8":
             settings["debug"] = _confirm("  Enable debug logging?", default=settings.get("debug", False))
             _apply_debug(settings)
-        elif choice == "8":
+        elif choice == "9":
             settings["no_cache"] = _confirm("  Disable cache?", default=settings.get("no_cache", False))
             if settings.get("no_cache"):
                 settings["use_cache"] = False
             else:
                 settings.pop("use_cache", None)
-        elif choice == "9":
+        elif choice == "10":
             val = _prompt("  Config file path (leave empty for defaults)", config_file if config_file != "none" else "")
             settings["config_file"] = val if val else None
 
@@ -292,9 +314,10 @@ def _view_config(settings: dict) -> None:
     print(f"  Format       : {settings.get('format', 'markdown')}")
     print(f"  Cache TTL    : {settings.get('cache_ttl', '24h')}")
     print(f"  Output file  : {settings.get('output', 'none')}")
-    print(f"  Include HTML : {'yes' if settings.get('include_html') else 'no'}")
-    print(f"  Debug        : {'yes' if settings.get('debug') else 'no'}")
-    print(f"  No cache     : {'yes' if settings.get('no_cache') else 'no'}")
+    print(f"  Include HTML     : {'yes' if settings.get('include_html') else 'no'}")
+    print(f"  Include structure: {'yes' if settings.get('include_structure') else 'no'}")
+    print(f"  Debug            : {'yes' if settings.get('debug') else 'no'}")
+    print(f"  No cache         : {'yes' if settings.get('no_cache') else 'no'}")
     print()
 
     input("  Press Enter to continue...")
@@ -345,6 +368,7 @@ def interactive_main() -> int:
     settings: dict = {
         "format": "markdown",
         "include_html": False,
+        "include_structure": False,
         "debug": False,
         "cache_ttl": None,
         "output": None,

@@ -94,7 +94,7 @@ async def test_auto_falls_back_for_spa_shell(tmp_path):
     )
     calls = 0
 
-    async def fake_browser(url: str, proxy: str, status_code: int | None):
+    async def fake_browser(url: str, proxy: str, status_code: int | None, **_kwargs):
         nonlocal calls
         calls += 1
         return client._result_from_html(
@@ -149,7 +149,7 @@ async def test_auto_falls_back_for_403(tmp_path):
     client = PageFetch(mode="auto", cache_enabled=False, retries_http=0)
     attach_transport(client, lambda request: httpx.Response(403, text="blocked", request=request))
 
-    async def fake_browser(url: str, proxy: str, status_code: int | None):
+    async def fake_browser(url: str, proxy: str, status_code: int | None, **_kwargs):
         assert status_code == 403
         return client._result_from_html(
             original_url=url,
@@ -365,7 +365,7 @@ async def test_failed_browser_result_does_not_discard_usable_http_content():
         ),
     )
 
-    async def blocked_browser(url: str, proxy: str, status_code: int | None):
+    async def blocked_browser(url: str, proxy: str, status_code: int | None, **_kwargs):
         from pagefetch.models import FetchErrorInfo, FetchResult
 
         return FetchResult(

@@ -8,17 +8,20 @@ from .links import extract_links
 from .markdown import MarkdownConverter, html_to_markdown
 from .metadata import extract_metadata
 from .non_html import ProcessedDocument, process_pdf, process_text, process_xml
+from .structure import StructureLimits, extract_structure
 
 __all__ = [
     "ConfidenceReport",
     "MarkdownConverter",
     "ProcessedDocument",
     "ProcessedHTML",
+    "StructureLimits",
     "analyze_html",
     "clean_html",
     "extract_images",
     "extract_links",
     "extract_metadata",
+    "extract_structure",
     "html_to_markdown",
     "process_html",
     "process_pdf",

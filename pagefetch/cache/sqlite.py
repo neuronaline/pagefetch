@@ -82,7 +82,7 @@ class SQLiteCache:
             return
         now = time.time()
         try:
-            payload = result.json(include_html=True)
+            payload = result.json(include_html=True, include_structure=True)
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"Failed to serialize fetch result for cache key {key!r}: {exc}"

@@ -18,12 +18,13 @@ from .utils.urls import read_urls_from_file
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pagefetch", description="Fetch complete web page content")
     parser.add_argument("input", metavar="URL_OR_FILE")
-    parser.add_argument("--format", choices=("markdown", "json", "html"), default="markdown")
+    parser.add_argument("--format", choices=("markdown", "json", "html", "structure"), default="markdown")
     parser.add_argument("-c", "--config", type=Path, metavar="PATH", help="Path to config.yaml")
     parser.add_argument("--mode", choices=("auto", "http", "browser"), default=argparse.SUPPRESS)
     parser.add_argument("--proxy", choices=("none", "decodo", "dataimpulse"), default=argparse.SUPPRESS)
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("--include-html", action="store_true")
+    parser.add_argument("--include-structure", action="store_true", help="Attach a bounded PageStructure summary to every result.")
     parser.add_argument(
         "--cache-ttl",
         metavar="DURATION",
@@ -95,8 +96,18 @@ def _inputs(value: str) -> list[str]:
     return read_urls_from_file(value)
 
 
-def _render(results: list[FetchResult], output_format: str, include_html: bool) -> str:
-    return render_results(results, output_format, include_html=include_html)
+def _render(
+    results: list[FetchResult],
+    output_format: str,
+    include_html: bool,
+    include_structure: bool = False,
+) -> str:
+    return render_results(
+        results,
+        output_format,
+        include_html=include_html,
+        include_structure=include_structure,
+    )
 
 
 def _build_config(args: argparse.Namespace) -> PageFetchConfig:
@@ -190,6 +201,7 @@ async def _run(args: argparse.Namespace) -> int:
     if not urls:
         raise ValueError("the input file does not contain any URLs")
     config = _build_config(args)
+    extract_structure = args.format == "structure" or getattr(args, "include_structure", False)
     async with PageFetch(
         mode=config.mode,
         proxy=config.proxy,
@@ -215,8 +227,8 @@ async def _run(args: argparse.Namespace) -> int:
         proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
     ) as client:
-        results = await client.fetch_many(urls)
-    rendered = _render(results, args.format, args.include_html)
+        results = await client.fetch_many(urls, extract_structure=extract_structure)
+    rendered = _render(results, args.format, args.include_html, include_structure=extract_structure)
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")
     else:

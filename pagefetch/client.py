@@ -38,6 +38,7 @@ from .processing.non_html import (
     process_text,
     process_xml,
 )
+from .processing.structure import extract_structure
 from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
 from .proxy.providers import (
     _inject_session_id,
@@ -224,6 +225,7 @@ class PageFetch:
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
+        extract_structure: bool = False,
     ) -> FetchResult:
         """Fetch one URL and return a structured result.
 
@@ -241,6 +243,10 @@ class PageFetch:
             Override the default cache TTL.
         raise_on_error : bool | None
             Override the default ``raise_on_error`` flag.
+        extract_structure : bool
+            When ``True``, the returned result also carries a bounded
+            :class:`~pagefetch.models.PageStructure` summary on
+            ``FetchResult.structure`` (default ``False``).
 
         Returns
         -------
@@ -301,6 +307,7 @@ class PageFetch:
                 "block_images": self.config.block_images,
                 "block_level": self.config.block_level,
                 "confidence_threshold": self.config.confidence_threshold,
+                "extract_structure": extract_structure,
                 "humanize": self.config.humanize,
                 "max_redirects": self.config.max_redirects,
                 "proxy_geo": self.config.proxy_geo,
@@ -324,9 +331,13 @@ class PageFetch:
         try:
             try:
                 if selected_mode == "browser":
-                    result = await self._fetch_browser(normalized_url, selected_proxy, status_code=None)
+                    result = await self._fetch_browser(
+                        normalized_url, selected_proxy, status_code=None, extract_structure=extract_structure
+                    )
                 else:
-                    result = await self._fetch_http_or_auto(normalized_url, selected_mode, selected_proxy)
+                    result = await self._fetch_http_or_auto(
+                        normalized_url, selected_mode, selected_proxy, extract_structure=extract_structure
+                    )
             except (TransportFailure, ProxyConfigurationError) as exc:
                 error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
                     "connection_error", str(exc), False, type(exc).__name__
@@ -372,6 +383,7 @@ class PageFetch:
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
+        extract_structure: bool = False,
     ) -> list[FetchResult]:
         """Fetch unique URLs concurrently while preserving input order.
 
@@ -389,6 +401,9 @@ class PageFetch:
             Override the default cache TTL.
         raise_on_error : bool | None
             Override the default ``raise_on_error`` flag.
+        extract_structure : bool
+            When ``True``, attach a bounded :class:`~pagefetch.models.PageStructure`
+            to each result (default ``False``).
 
         Returns
         -------
@@ -406,6 +421,7 @@ class PageFetch:
             _use_cache: bool = use_cache,
             _cache_ttl: str | int | None = cache_ttl,
             _raise_on_error: bool | None = raise_on_error,
+            _extract_structure: bool = extract_structure,
         ) -> FetchResult:
             item_start = time.perf_counter()
             try:
@@ -416,6 +432,7 @@ class PageFetch:
                     use_cache=_use_cache,
                     cache_ttl=_cache_ttl,
                     raise_on_error=_raise_on_error,
+                    extract_structure=_extract_structure,
                 )
             except PageFetchError as exc:
                 # Use the raw item string — normalize_url would re-raise
@@ -458,7 +475,13 @@ class PageFetch:
             results.append(result)
         return results
 
-    async def _fetch_http_or_auto(self, url: str, mode: Literal["auto", "http", "browser"], proxy: str) -> FetchResult:
+    async def _fetch_http_or_auto(
+        self,
+        url: str,
+        mode: Literal["auto", "http", "browser"],
+        proxy: str,
+        extract_structure: bool = False,
+    ) -> FetchResult:
         try:
             fetcher = await self._http_fetcher(proxy, url)
             per_request_proxy: str | None = None
@@ -492,7 +515,9 @@ class PageFetch:
                 # the same proxy/source IP does not emit two different TLS
                 # stacks (httpx → Camoufox) back-to-back — a strong bot signal.
                 await asyncio.sleep(random.uniform(0.5, 3.0))
-                return await self._fetch_browser(url, proxy, status_code=response.status_code)
+                return await self._fetch_browser(
+                    url, proxy, status_code=response.status_code, extract_structure=extract_structure
+                )
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
             raise TransportFailure(
                 FetchErrorInfo(code, f"HTTP request returned status {response.status_code}", retryable),
@@ -523,7 +548,9 @@ class PageFetch:
             # ── auto-mode double-hit softening ──
             await asyncio.sleep(random.uniform(0.5, 3.0))
             try:
-                rendered = await self._fetch_browser(url, proxy, status_code=response.status_code)
+                rendered = await self._fetch_browser(
+                    url, proxy, status_code=response.status_code, extract_structure=extract_structure
+                )
             except TransportFailure:
                 available = self._result_from_html(
                     original_url=url,
@@ -537,6 +564,7 @@ class PageFetch:
                     response_headers=response.headers,
                     soup=raw_soup,
                     confidence=report,
+                    include_structure=extract_structure,
                 )
                 available.warnings.extend(
                     [
@@ -558,6 +586,7 @@ class PageFetch:
                     response_headers=response.headers,
                     soup=raw_soup,
                     confidence=report,
+                    include_structure=extract_structure,
                 )
                 available.warnings.extend(
                     [
@@ -580,12 +609,20 @@ class PageFetch:
             response_headers=response.headers,
             soup=raw_soup,
             confidence=report,
+            include_structure=extract_structure,
         )
         if mode == "http" and report.score < self.config.confidence_threshold:
             result.warnings.append("HTTP content may be incomplete; browser fallback is disabled.")
         return result
 
-    async def _fetch_browser(self, url: str, proxy: str, status_code: int | None) -> FetchResult:
+    async def _fetch_browser(
+        self,
+        url: str,
+        proxy: str,
+        status_code: int | None,
+        *,
+        extract_structure: bool = False,
+    ) -> FetchResult:
         if self.config.session_rotation == "rotate" and proxy != "none":
             settings = resolve_proxy(proxy)
             proxy_url = (
@@ -618,6 +655,7 @@ class PageFetch:
             method="browser",
             soup=raw_soup,
             confidence=response.confidence,
+            include_structure=extract_structure,
         )
         result.warnings.extend(response.warnings)
         report = response.confidence
@@ -764,6 +802,7 @@ class PageFetch:
         response_headers: httpx.Headers | None = None,
         soup: BeautifulSoup | None = None,
         confidence: ConfidenceReport | None = None,
+        include_structure: bool = False,
     ) -> FetchResult:
         try:
             processed = process_html(html, final_url, response_headers, soup=soup, confidence=confidence)
@@ -771,6 +810,7 @@ class PageFetch:
             raise TransportFailure(
                 FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
             ) from exc
+        structure = extract_structure(soup, final_url) if include_structure else None
         return FetchResult(
             url=original_url,
             final_url=final_url,
@@ -785,6 +825,7 @@ class PageFetch:
             metadata=processed.metadata,
             links=processed.links,
             images=processed.images,
+            structure=structure,
             fetch_method=method,
             proxy_provider=proxy,
             content_confidence=processed.confidence.score,

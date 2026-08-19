@@ -183,12 +183,14 @@ client = PageFetch(
 
 ### Methods
 
-**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
+**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False) → FetchResult`**
 
 Fetch a single URL. All keyword arguments override the client-level defaults
-for this individual request only.
+for this individual request only. Pass `extract_structure=True` to attach a
+bounded `PageStructure` summary to `FetchResult.structure` (the default is
+`False`, keeping the result shape unchanged).
 
-**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
+**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False) → list[FetchResult]`**
 
 Fetch multiple URLs concurrently. Deduplicates identical inputs internally,
 preserves the original input order, and isolates individual failures — one
@@ -218,6 +220,7 @@ class FetchResult:
     metadata: dict              # OpenGraph, Twitter Cards, meta tags
     links: list[LinkInfo]       # All <a> tags with text, URL, rel
     images: list[ImageInfo]     # All <img> tags with url, alt, title
+    structure: PageStructure | None  # Bounded DOM/stylesheet/script summary (only when requested)
     fetch_method: str | None    # "http" or "browser"
     proxy_provider: str         # "none", "decodo", or "dataimpulse"
     content_confidence: float | None  # 0–1 completeness score (None for browser mode)
@@ -231,17 +234,60 @@ class FetchResult:
 ### Serialization
 
 ```python
-# JSON output (HTML excluded by default for compactness)
+# JSON output (HTML and structure excluded by default for compactness)
 print(result.json(indent=2))
-print(result.json(include_html=True))   # Include raw HTML
+print(result.json(include_html=True))          # Include raw HTML
+print(result.json(include_structure=True))     # Include PageStructure summary
 
 # Python dict
 data = result.to_dict()
 data = result.to_dict(include_html=True)
+data = result.to_dict(include_structure=True)
 
 # Reconstruct from cached JSON
 reconstructed = FetchResult.from_dict(data)
 ```
+
+### Page Structure (Developer Inspection)
+
+When you want to understand a page *before* writing scraping rules, opt in to
+the static structure summary:
+
+```python
+async with PageFetch() as client:
+    result = await client.fetch("https://example.com", extract_structure=True)
+    structure = result.structure
+```
+
+`FetchResult.structure` is `None` unless `extract_structure=True` is passed, so
+the default result shape is unchanged. When present, it carries:
+
+- A nested DOM tree (tag, id/class selector, filtered attributes, short text,
+  children) bounded by `max_depth` and `max_nodes` so the payload stays
+  predictable even on enormous pages.
+- External stylesheet URLs (`<link rel="stylesheet">`) with `media`,
+  `integrity`, and `crossorigin` hints.
+- Inline `<style>` blocks with a per-block preview and a `truncated` flag.
+- External script URLs (`<script src="…">`) with `type`, `async`, `defer`,
+  `integrity`, and `crossorigin`.
+- Inline `<script>` blocks with a per-block preview, `type`, and a `truncated`
+  flag.
+
+The summary never downloads external CSS/JavaScript, never walks Shadow DOM,
+and never captures runtime state — it is a static reflection of the markup.
+In HTTP mode it describes the HTML the server returned; in browser mode it
+describes the DOM after JavaScript rendered.
+
+Use the lower-level helper directly when you already have parsed HTML:
+
+```python
+from pagefetch import StructureLimits, extract_structure
+
+structure = extract_structure(html, base_url="https://example.com/")
+```
+
+`StructureLimits` exposes `max_depth`, `max_nodes`, `text_preview`, and
+`inline_source_limit` for callers that need different safety bounds.
 
 ---
 
@@ -265,6 +311,12 @@ pagefetch https://example.com --mode browser -o output.md
 # Structured JSON with raw HTML included
 pagefetch https://example.com --format json --include-html
 
+# Inspect the page structure as Markdown
+pagefetch https://example.com --format structure
+
+# Include a PageStructure summary inside the regular JSON output
+pagefetch https://example.com --format json --include-structure
+
 # Multiple URLs from a file (one URL per line)
 pagefetch urls.txt --format json --mode auto
 
@@ -278,7 +330,7 @@ pagefetch https://example.com --cache-ttl 1h --block-images
 CLI arguments map directly to the Python API — `--mode`, `--proxy`, `--timeout`,
 `--browser-timeout`, `--http-concurrency`, `--browser-concurrency`, `--cache-ttl`,
 `--no-cache`, `--block-images` / `--no-block-images`, `--include-html`,
-`--debug`, and `--config` are all supported.
+`--include-structure`, `--debug`, and `--config` are all supported.
 
 ---
 

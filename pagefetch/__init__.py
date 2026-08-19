@@ -21,7 +21,19 @@ from .bootstrap import RuntimeBootstrapError, auto_bootstrap_browser, ensure_run
 from .client import PageFetch
 from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
 from .exceptions import PageFetchError
-from .models import FetchErrorInfo, FetchResult, ImageInfo, LinkInfo
+from .models import (
+    FetchErrorInfo,
+    FetchResult,
+    ImageInfo,
+    InlineScript,
+    InlineStylesheet,
+    LinkInfo,
+    PageStructure,
+    ScriptInfo,
+    StructureNode,
+    StylesheetInfo,
+)
+from .processing import StructureLimits, extract_structure
 
 # Attach a NullHandler so library consumers that do not configure logging
 # never see "No handler found" warnings.
@@ -36,13 +48,21 @@ __all__ = [
     "FetchErrorInfo",
     "FetchResult",
     "ImageInfo",
+    "InlineScript",
+    "InlineStylesheet",
     "LinkInfo",
     "PageFetch",
     "PageFetchConfig",
     "PageFetchError",
+    "PageStructure",
     "RuntimeBootstrapError",
+    "ScriptInfo",
+    "StructureLimits",
+    "StructureNode",
+    "StylesheetInfo",
     "VALID_MODES",
     "VALID_PROXIES",
     "auto_bootstrap_browser",
     "ensure_runtime_requirements",
+    "extract_structure",
 ]
