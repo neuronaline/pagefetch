@@ -166,38 +166,41 @@ def test_no_event_handlers_or_inline_styles_appear_in_attrs():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["http", "auto"])
-async def test_extract_structure_requires_browser_mode(tmp_path, mode):
-    client = PageFetch(mode=mode, cache_path=tmp_path / f"{mode}.sqlite3")
-    with pytest.raises(ValueError, match="requires mode='browser'"):
-        await client.fetch("https://example.com", extract_structure=True)
+async def test_extract_requires_browser_mode(tmp_path, monkeypatch):
+    """``extract()`` always forces mode='browser'; invalid URLs surface as failures."""
+    client = PageFetch(mode="auto", cache_path=tmp_path / "cache.sqlite3")
+    monkeypatch.setattr(
+        client, "_fetch_browser_extract", lambda *a, **k: pytest.skip("not reached")
+    )
+    async with client:
+        result = await client.extract("ftp://example.com")
+    assert not result.success
+    assert result.error is not None
+    assert result.error.code == "unsupported_scheme"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["http", "auto"])
-async def test_fetch_many_extract_structure_invalid_arg_returns_per_url_error(tmp_path, mode):
-    """``fetch`` raises ValueError for non-browser modes; ``fetch_many``
-    must convert each URL into a structured failure rather than aborting
-    the entire batch."""
-    client = PageFetch(mode=mode, cache_path=tmp_path / f"{mode}.sqlite3")
+async def test_extract_many_invalid_url_returns_per_url_error(tmp_path, monkeypatch):
+    """A batched extract over invalid URLs surfaces each as a structured failure."""
+    client = PageFetch(mode="auto", cache_path=tmp_path / "cache.sqlite3")
+    monkeypatch.setattr(
+        client, "_fetch_browser_extract", lambda *a, **k: pytest.skip("not reached")
+    )
     async with client:
-        results = await client.fetch_many(
-            ["https://a.example/", "https://b.example/"],
-            extract_structure=True,
-        )
-    assert len(results) == 2
-    for result in results:
-        assert not result.success
-        assert result.error is not None
-        assert result.error.code == "invalid_argument"
-        assert "requires mode='browser'" in result.error.message
+        good = await client.extract("https://a.example/", use_cache=False)
+        bad = await client.extract("ftp://b.example/", use_cache=False)
+    assert good.success
+    assert not bad.success
+    assert bad.error.code == "unsupported_scheme"
 
 
 @pytest.mark.asyncio
 async def test_browser_mode_attaches_structure_when_requested(tmp_path, monkeypatch):
     client = PageFetch(mode="browser", cache_path=tmp_path / "cache.sqlite3")
 
-    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False, compact_structure=False):
+    async def fake_fetch_browser_extract(
+        url, proxy, *, structure, compact_structure, screenshot, screenshot_format
+    ):
         return client._result_from_html(
             original_url=url,
             final_url=url,
@@ -207,14 +210,14 @@ async def test_browser_mode_attaches_structure_when_requested(tmp_path, monkeypa
             encoding="utf-8",
             proxy=proxy,
             method="browser",
-            include_structure=extract_structure,
+            include_structure=structure,
             compact_structure=compact_structure,
         )
 
-    monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
+    monkeypatch.setattr(client, "_fetch_browser_extract", fake_fetch_browser_extract)
     async with client:
-        structured = await client.fetch("https://example.com", extract_structure=True)
-        without = await client.fetch("https://example.com", use_cache=False)
+        structured = await client.extract("https://example.com")
+        without = await client.extract("https://example.com", use_cache=False, structure=False)
     assert structured.success
     assert structured.fetch_method == "browser"
     assert structured.structure is not None
@@ -231,7 +234,9 @@ async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
 
     client = PageFetch(mode="browser", cache_path=cache_path)
 
-    async def fake_fetch_browser(url, proxy, status_code=None, *, extract_structure=False, compact_structure=False):
+    async def fake_fetch_browser_extract(
+        url, proxy, *, structure, compact_structure, screenshot, screenshot_format
+    ):
         return client._result_from_html(
             original_url=url,
             final_url=url,
@@ -241,14 +246,14 @@ async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
             encoding="utf-8",
             proxy=proxy,
             method="browser",
-            include_structure=extract_structure,
+            include_structure=structure,
             compact_structure=compact_structure,
         )
 
-    monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
+    monkeypatch.setattr(client, "_fetch_browser_extract", fake_fetch_browser_extract)
     async with client:
-        plain = await client.fetch("https://example.com")
-        structured = await client.fetch("https://example.com", extract_structure=True)
+        plain = await client.extract("https://example.com", structure=False)
+        structured = await client.extract("https://example.com")
     assert plain.structure is None
     assert structured.structure is not None
     # Both runs were freshly fetched — different cache keys.
@@ -257,7 +262,7 @@ async def test_structure_setting_partitions_cache(tmp_path, monkeypatch):
 
     cached_client = PageFetch(mode="browser", cache_path=cache_path)
     async with cached_client:
-        reused = await cached_client.fetch("https://example.com", extract_structure=True)
+        reused = await cached_client.extract("https://example.com")
     assert reused.from_cache is True
     assert reused.structure is not None
 
@@ -361,8 +366,8 @@ async def test_compact_mode_partitions_cache(tmp_path, monkeypatch):
 
     captured: list[bool] = []
 
-    async def fake_fetch_browser(
-        url, proxy, status_code=None, *, extract_structure=False, compact_structure=False
+    async def fake_fetch_browser_extract(
+        url, proxy, *, structure, compact_structure, screenshot, screenshot_format
     ):
         captured.append(compact_structure)
         return client._result_from_html(
@@ -374,22 +379,16 @@ async def test_compact_mode_partitions_cache(tmp_path, monkeypatch):
             encoding="utf-8",
             proxy=proxy,
             method="browser",
-            include_structure=extract_structure,
+            include_structure=structure,
             compact_structure=compact_structure,
         )
 
-    monkeypatch.setattr(client, "_fetch_browser", fake_fetch_browser)
+    monkeypatch.setattr(client, "_fetch_browser_extract", fake_fetch_browser_extract)
     async with client:
-        verbose = await client.fetch("https://example.com", extract_structure=True)
-        compact = await client.fetch(
-            "https://example.com", extract_structure=True, compact_structure=True
-        )
-        verbose_again = await client.fetch(
-            "https://example.com", extract_structure=True
-        )
-        compact_again = await client.fetch(
-            "https://example.com", extract_structure=True, compact_structure=True
-        )
+        verbose = await client.extract("https://example.com", compact_structure=False)
+        compact = await client.extract("https://example.com", compact_structure=True)
+        verbose_again = await client.extract("https://example.com", compact_structure=False)
+        compact_again = await client.extract("https://example.com", compact_structure=True)
     # Verbose and compact must be cached under distinct keys: both first calls
     # are misses, the cached-key reuses for each variant are hits.
     assert captured == [False, True]

@@ -21,7 +21,7 @@ def extract_links(soup: BeautifulSoup, base_url: str) -> list[LinkInfo]:
             continue
         text = anchor.get_text(" ", strip=True)
         rel_value = anchor.get("rel") or []
-        rel = rel_value.split() if isinstance(rel_value, str) else list(rel_value) if isinstance(rel_value, (list, tuple)) else []
+        rel = rel_value.split() if isinstance(rel_value, str) else list(rel_value) if isinstance(rel_value, list | tuple) else []
         target = anchor.get("target")
         record = (text, absolute, tuple(rel), target)
         if record in seen:

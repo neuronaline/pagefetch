@@ -12,7 +12,7 @@ def parse_duration(value: str | int | float) -> int:
     """Parse seconds or a compact duration such as ``24h`` into seconds."""
     if isinstance(value, bool):
         raise ValueError("duration must be a positive number or duration string")
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         if value < 0:
             raise ValueError("duration cannot be negative")
         return round(value)

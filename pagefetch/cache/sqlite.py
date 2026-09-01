@@ -38,12 +38,17 @@ class SQLiteCache:
         )
         await self._db.commit()
 
-    async def get(self, key: str) -> FetchResult | None:
+    async def get(self, key: str, *, requested_screenshot: bool = False) -> FetchResult | None:
         """Return the cached result for *key*, or ``None`` when the key is missing
         or the cached entry has expired.
 
         Expired entries are automatically deleted from the database before
         returning ``None``.
+
+        When ``requested_screenshot=True`` and the cached payload had no
+        screenshot (screenshots are never persisted; see :meth:`set`), a
+        warning is appended to the returned result so callers can re-fetch
+        with ``use_cache=False`` if they need one.
         """
         if self._db is None:
             raise RuntimeError("cache has not been started")
@@ -68,13 +73,19 @@ class SQLiteCache:
             return None
         result.from_cache = True
         result.fetch_method = "cache"
+        if requested_screenshot and result.screenshot is None:
+            result.warnings.append(
+                "Screenshot is not cached; pass use_cache=False to re-fetch."
+            )
         return result
 
     async def set(self, key: str, result: FetchResult, ttl: int) -> None:
         """Persist *result* in the cache with the given *ttl* (in seconds).
 
-        Only successful results are cached.  If the result cannot be serialized
-        a :exc:`RuntimeError` is raised with details about the failure.
+        Only successful results are cached. Screenshots are intentionally
+        dropped from the persisted payload (see § 6 of the extract plan) to
+        avoid bloating the SQLite store with large, perishable blobs; HTML
+        and structure round-trip intact.
         """
         if self._db is None:
             raise RuntimeError("cache has not been started")
@@ -82,7 +93,11 @@ class SQLiteCache:
             return
         now = time.time()
         try:
-            payload = result.json(include_html=True, include_structure=True)
+            payload = result.json(
+                include_html=True,
+                include_structure=True,
+                include_screenshot=False,
+            )
         except (TypeError, ValueError) as exc:
             raise RuntimeError(
                 f"Failed to serialize fetch result for cache key {key!r}: {exc}"

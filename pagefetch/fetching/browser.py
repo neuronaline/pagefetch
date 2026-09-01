@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import sys
 import time
@@ -11,6 +12,8 @@ from typing import Any
 from urllib.parse import urldefrag, urljoin
 
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger("pagefetch.fetching.browser")
 
 from ..models import FetchErrorInfo
 from ..processing.detector import ConfidenceReport, analyze_html
@@ -49,6 +52,12 @@ class BrowserResponse:
     html: str
     warnings: list[str]
     confidence: ConfidenceReport
+    screenshot: bytes | None = None
+    screenshot_format: str | None = None
+
+
+_VALID_SCREENSHOT_MODES = frozenset({"none", "viewport", "full"})
+_VALID_SCREENSHOT_FORMATS = frozenset({"png", "jpeg"})
 
 
 class BrowserFetcher:
@@ -168,7 +177,15 @@ class BrowserFetcher:
                 ) from exc
             self._needs_reset = False
 
-    async def fetch(self, url: str, *, proxy: ProxySettings | None = None) -> BrowserResponse:
+    async def fetch(
+        self,
+        url: str,
+        *,
+        proxy: ProxySettings | None = None,
+        screenshot: str = "none",
+        screenshot_format: str = "png",
+        screenshot_max_bytes: int = 50 * 1024 * 1024,
+    ) -> BrowserResponse:
         """Fetch a URL through the browser with adaptive retries.
 
         The semaphore is acquired only during browser I/O, not during HTML
@@ -178,7 +195,20 @@ class BrowserFetcher:
         A browser process has one immutable proxy configuration. Callers that
         need a different proxy must create a separate fetcher; changing it
         while pages are active would close contexts belonging to other tasks.
+
+        ``screenshot`` selects capture mode: ``"none"`` (default) skips the
+        capture, ``"viewport"`` captures the initial visible area,
+        ``"full"`` captures the entire scrollable page. ``screenshot_format``
+        is ``"png"`` (default) or ``"jpeg"``. Captures exceeding
+        ``screenshot_max_bytes`` are discarded with a warning.
         """
+        if screenshot not in _VALID_SCREENSHOT_MODES:
+            raise ValueError(f"screenshot must be one of {sorted(_VALID_SCREENSHOT_MODES)}")
+        if screenshot_format not in _VALID_SCREENSHOT_FORMATS:
+            raise ValueError(f"screenshot_format must be one of {sorted(_VALID_SCREENSHOT_FORMATS)}")
+        if not isinstance(screenshot_max_bytes, int) or isinstance(screenshot_max_bytes, bool) or screenshot_max_bytes <= 0:
+            raise ValueError("screenshot_max_bytes must be a positive integer")
+
         if proxy is not None and proxy != self.proxy:
             raise TransportFailure(
                 FetchErrorInfo(
@@ -210,6 +240,9 @@ class BrowserFetcher:
                             scroll_sleep_early=scroll_sleep_early,
                             scroll_sleep_late=scroll_sleep_late,
                             page_timeout=remaining,
+                            screenshot=screenshot,
+                            screenshot_format=screenshot_format,
+                            screenshot_max_bytes=screenshot_max_bytes,
                         )
                     # ── analysis outside semaphore ──
                     report = analyze_html(result.html)
@@ -261,6 +294,9 @@ class BrowserFetcher:
         scroll_sleep_early: float = 0.10,
         scroll_sleep_late: float = 0.15,
         page_timeout: float,
+        screenshot: str = "none",
+        screenshot_format: str = "png",
+        screenshot_max_bytes: int = 50 * 1024 * 1024,
     ) -> BrowserResponse:
         """Navigate, wait for stability, optionally scroll, and return raw HTML.
 
@@ -397,12 +433,40 @@ class BrowserFetcher:
                     raise TransportFailure(
                         FetchErrorInfo("content_too_large", "rendered content exceeds maximum size", False)
                     )
+
+                # ── optional screenshot capture ──
+                screenshot_bytes: bytes | None = None
+                screenshot_ext: str | None = None
+                if screenshot != "none":
+                    try:
+                        full_page = screenshot == "full"
+                        # Playwright's type argument is "png" / "jpeg".
+                        screenshot_bytes = await page.screenshot(
+                            full_page=full_page,
+                            type=screenshot_format,
+                        )
+                        if len(screenshot_bytes) > screenshot_max_bytes:
+                            warnings.append("Screenshot exceeded max size; discarded.")
+                            screenshot_bytes = None
+                            screenshot_ext = None
+                        else:
+                            screenshot_ext = screenshot_format
+                    except Exception as exc:
+                        logger.warning(
+                            "screenshot capture failed: %s", exc, exc_info=True
+                        )
+                        warnings.append("Screenshot capture failed; continuing without it.")
+                        screenshot_bytes = None
+                        screenshot_ext = None
+
                 return BrowserResponse(
                     url=page.url,
                     status_code=response.status if response else None,
                     html=html,
                     warnings=warnings,
                     confidence=ConfidenceReport(1.0, ()),
+                    screenshot=screenshot_bytes,
+                    screenshot_format=screenshot_ext,
                 )
         except TransportFailure:
             raise

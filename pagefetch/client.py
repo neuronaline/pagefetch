@@ -85,6 +85,7 @@ class PageFetch:
         stealth_level: Literal["off", "balanced", "max"] = "off",
         proxy_geo: str | None = None,
         raise_on_error: bool = False,
+        screenshot_max_bytes: int = 50 * 1024 * 1024,
     ) -> None:
         self.config = PageFetchConfig.build(
             mode=mode,
@@ -110,6 +111,7 @@ class PageFetch:
             stealth_level=stealth_level,
             proxy_geo=proxy_geo,
             raise_on_error=raise_on_error,
+            screenshot_max_bytes=screenshot_max_bytes,
         )
         self._http_semaphore = asyncio.Semaphore(self.config.http_concurrency)
         self._browser_semaphore = asyncio.Semaphore(self.config.browser_concurrency)
@@ -225,8 +227,6 @@ class PageFetch:
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
-        extract_structure: bool = False,
-        compact_structure: bool = False,
     ) -> FetchResult:
         """Fetch one URL and return a structured result.
 
@@ -244,22 +244,8 @@ class PageFetch:
             Override the default cache TTL.
         raise_on_error : bool | None
             Override the default ``raise_on_error`` flag.
-        extract_structure : bool
-            When ``True``, capture the rendered DOM as a bounded,
-            scraper-oriented :class:`~pagefetch.models.PageStructure` on
-            ``FetchResult.structure``. This requires ``mode='browser'``
-            (default ``False``).
-        compact_structure : bool
-            When ``True`` (and ``extract_structure=True``), request the
-            LLM-friendly variant of the structure tree: the
-            ``unique_selector`` query is skipped, non-essential attributes
-            are filtered out, and inline ``<style>``/``<script>`` content is
-            returned as ``{length, preview}`` rather than the full source.
-            ``compact_structure`` only affects future calls to
-            :meth:`FetchResult.to_dict` / :meth:`FetchResult.json` via the
-            ``compact_structure`` flag — it does not change the in-memory
-            representation, so callers can still access the verbose fields
-            on :attr:`FetchResult.structure` directly.
+
+        For structural / RAW HTML / screenshot capture use :meth:`extract` instead.
 
         Returns
         -------
@@ -270,8 +256,6 @@ class PageFetch:
         selected_mode = mode or self.config.mode
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
-        if extract_structure and selected_mode != "browser":
-            raise ValueError("extract_structure=True requires mode='browser'")
         try:
             self._validate_fetch_options(selected_mode, selected_proxy)
             validate_url(url)
@@ -321,9 +305,7 @@ class PageFetch:
                 ),
                 "block_images": self.config.block_images,
                 "block_level": self.config.block_level,
-                "compact_structure": compact_structure,
                 "confidence_threshold": self.config.confidence_threshold,
-                "extract_structure": extract_structure,
                 "humanize": self.config.humanize,
                 "max_redirects": self.config.max_redirects,
                 "proxy_geo": self.config.proxy_geo,
@@ -351,16 +333,12 @@ class PageFetch:
                         normalized_url,
                         selected_proxy,
                         status_code=None,
-                        extract_structure=extract_structure,
-                        compact_structure=compact_structure,
                     )
                 else:
                     result = await self._fetch_http_or_auto(
                         normalized_url,
                         selected_mode,
                         selected_proxy,
-                        extract_structure=extract_structure,
-                        compact_structure=compact_structure,
                     )
             except (TransportFailure, ProxyConfigurationError) as exc:
                 error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
@@ -407,8 +385,6 @@ class PageFetch:
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
-        extract_structure: bool = False,
-        compact_structure: bool = False,
     ) -> list[FetchResult]:
         """Fetch unique URLs concurrently while preserving input order.
 
@@ -426,13 +402,6 @@ class PageFetch:
             Override the default cache TTL.
         raise_on_error : bool | None
             Override the default ``raise_on_error`` flag.
-        extract_structure : bool
-            When ``True``, attach a scraper-oriented
-            :class:`~pagefetch.models.PageStructure` to each result. This
-            requires ``mode='browser'`` (default ``False``).
-        compact_structure : bool
-            Forwarded to each underlying :meth:`fetch` call; selects the
-            LLM-friendly variant of the structure payload.
 
         Returns
         -------
@@ -450,8 +419,6 @@ class PageFetch:
             _use_cache: bool = use_cache,
             _cache_ttl: str | int | None = cache_ttl,
             _raise_on_error: bool | None = raise_on_error,
-            _extract_structure: bool = extract_structure,
-            _compact_structure: bool = compact_structure,
         ) -> FetchResult:
             item_start = time.perf_counter()
             try:
@@ -462,8 +429,6 @@ class PageFetch:
                     use_cache=_use_cache,
                     cache_ttl=_cache_ttl,
                     raise_on_error=_raise_on_error,
-                    extract_structure=_extract_structure,
-                    compact_structure=_compact_structure,
                 )
             except PageFetchError as exc:
                 # Use the raw item string — normalize_url would re-raise
@@ -481,8 +446,7 @@ class PageFetch:
                     fetched_at=datetime.now(UTC),
                 )
             except ValueError as exc:
-                # ``fetch`` raises ValueError for argument-validation failures
-                # such as ``extract_structure=True`` outside browser mode.
+                # ``fetch`` raises ValueError for argument-validation failures.
                 # Surface them as per-URL failures so one bad URL does not
                 # abort the rest of the batch.
                 return FetchResult(
@@ -519,13 +483,159 @@ class PageFetch:
             results.append(result)
         return results
 
+    async def extract(
+        self,
+        url: str,
+        *,
+        structure: bool = True,
+        compact_structure: bool = False,
+        screenshot: Literal["none", "viewport", "full"] = "none",
+        screenshot_format: Literal["png", "jpeg"] = "png",
+        proxy: Literal["none", "decodo", "dataimpulse"] | None = None,
+        use_cache: bool = True,
+        cache_ttl: str | int | None = None,
+        raise_on_error: bool | None = None,
+    ) -> FetchResult:
+        """Fetch a page and return its RAW HTML, structural summary, and/or
+        screenshot.
+
+        Always uses ``mode='browser'`` — there is no HTTP→browser pipeline
+        because the goal here is a complete, rendered page shell, not an
+        article-shaped extraction. The :meth:`fetch` coroutine remains the
+        right tool for the information layer (markdown, metadata, links).
+        """
+        started_at = time.perf_counter()
+        selected_proxy = proxy or self.config.proxy
+        should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
+        try:
+            self._validate_fetch_options("browser", selected_proxy)
+            validate_url(url)
+            normalized_url = normalize_url(url)
+        except (TypeError, ValueError) as exc:
+            code = "unsupported_scheme" if "scheme" in str(exc) else "invalid_url"
+            result = self._finish_error(
+                url=str(url),
+                proxy=selected_proxy,
+                error=FetchErrorInfo(code, str(exc), False, type(exc).__name__),
+                started_at=started_at,
+                should_raise=should_raise,
+            )
+            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            return result
+
+        await self.start()
+        if self._closed:
+            return self._finish_error(
+                url=normalized_url,
+                proxy=selected_proxy,
+                error=FetchErrorInfo("client_closed", "PageFetch client has been closed", False),
+                started_at=started_at,
+                should_raise=should_raise,
+            )
+        try:
+            ttl = self.config.cache_ttl if cache_ttl is None else parse_duration(cache_ttl)
+        except (TypeError, ValueError) as exc:
+            result = self._finish_error(
+                url=normalized_url,
+                proxy=selected_proxy,
+                error=FetchErrorInfo("invalid_cache_ttl", f"Invalid cache_ttl: {exc}", False, type(exc).__name__),
+                started_at=started_at,
+                should_raise=should_raise,
+            )
+            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            return result
+
+        requested_screenshot = screenshot != "none"
+        cache_key = build_cache_key(
+            normalized_url,
+            mode="browser",
+            proxy=selected_proxy,
+            settings={
+                "accept_language": (
+                    GEO_MAP[self.config.proxy_geo]["accept_language"]
+                    if self.config.proxy_geo
+                    else self.config.accept_language
+                ),
+                "block_images": self.config.block_images,
+                "block_level": self.config.block_level,
+                "compact_structure": compact_structure,
+                "confidence_threshold": self.config.confidence_threshold,
+                "humanize": self.config.humanize,
+                "max_redirects": self.config.max_redirects,
+                "proxy_geo": self.config.proxy_geo,
+                "screenshot": screenshot,
+                "screenshot_format": screenshot_format,
+                "session_rotation": self.config.session_rotation,
+                "structure": structure,
+            },
+        )
+        fetch_warnings = list(self._startup_warnings)
+        if self._cache and use_cache:
+            try:
+                cached = await self._cache.get(
+                    cache_key, requested_screenshot=requested_screenshot
+                )
+                if cached:
+                    cached.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                    logger.debug("cache hit for %s", normalized_url)
+                    return cached
+            except Exception as exc:
+                fetch_warnings.append("Cache read failed; content was fetched normally.")
+                logger.warning("cache read failed: %s", type(exc).__name__)
+
+        async with self._active_fetches_lock:
+            self._active_fetches += 1
+        try:
+            try:
+                result = await self._fetch_browser_extract(
+                    normalized_url,
+                    selected_proxy,
+                    structure=structure,
+                    compact_structure=compact_structure,
+                    screenshot=screenshot,
+                    screenshot_format=screenshot_format,
+                )
+            except (TransportFailure, ProxyConfigurationError) as exc:
+                error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
+                    "connection_error", str(exc), False, type(exc).__name__
+                )
+                result = self._finish_error(
+                    url=normalized_url,
+                    proxy=selected_proxy,
+                    error=error,
+                    status_code=getattr(exc, "status_code", None),
+                    started_at=started_at,
+                    should_raise=should_raise,
+                )
+            except Exception as exc:
+                result = self._finish_error(
+                    url=normalized_url,
+                    proxy=selected_proxy,
+                    error=FetchErrorInfo("unknown_error", "An unexpected error occurred while extracting the page.", False, type(exc).__name__),
+                    started_at=started_at,
+                    should_raise=should_raise,
+                )
+        finally:
+            async with self._active_fetches_lock:
+                self._active_fetches -= 1
+
+        result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        result.warnings[:0] = fetch_warnings
+        if not result.success and should_raise and result.error:
+            raise PageFetchError(result.error, url=result.url)
+        if self._cache and use_cache and result.success and not self._uncacheable(result):
+            try:
+                await self._cache.set(cache_key, result, ttl)
+            except Exception as exc:
+                result.warnings.append("Result could not be written to cache.")
+                logger.warning("cache write failed: %s", type(exc).__name__)
+        return result
+
     async def _fetch_http_or_auto(
         self,
         url: str,
         mode: Literal["auto", "http", "browser"],
         proxy: str,
-        extract_structure: bool = False,
-        compact_structure: bool = False,
     ) -> FetchResult:
         try:
             fetcher = await self._http_fetcher(proxy, url)
@@ -564,8 +674,6 @@ class PageFetch:
                     url,
                     proxy,
                     status_code=response.status_code,
-                    extract_structure=extract_structure,
-                    compact_structure=compact_structure,
                 )
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
             raise TransportFailure(
@@ -601,8 +709,6 @@ class PageFetch:
                     url,
                     proxy,
                     status_code=response.status_code,
-                    extract_structure=extract_structure,
-                    compact_structure=compact_structure,
                 )
             except TransportFailure:
                 available = self._result_from_html(
@@ -617,8 +723,6 @@ class PageFetch:
                     response_headers=response.headers,
                     soup=raw_soup,
                     confidence=report,
-                    include_structure=extract_structure,
-                    compact_structure=compact_structure,
                 )
                 available.warnings.extend(
                     [
@@ -640,8 +744,6 @@ class PageFetch:
                     response_headers=response.headers,
                     soup=raw_soup,
                     confidence=report,
-                    include_structure=extract_structure,
-                    compact_structure=compact_structure,
                 )
                 available.warnings.extend(
                     [
@@ -664,8 +766,6 @@ class PageFetch:
             response_headers=response.headers,
             soup=raw_soup,
             confidence=report,
-            include_structure=extract_structure,
-            compact_structure=compact_structure,
         )
         if mode == "http" and report.score < self.config.confidence_threshold:
             result.warnings.append("HTTP content may be incomplete; browser fallback is disabled.")
@@ -676,9 +776,6 @@ class PageFetch:
         url: str,
         proxy: str,
         status_code: int | None,
-        *,
-        extract_structure: bool = False,
-        compact_structure: bool = False,
     ) -> FetchResult:
         if self.config.session_rotation == "rotate" and proxy != "none":
             settings = resolve_proxy(proxy)
@@ -712,9 +809,87 @@ class PageFetch:
             method="browser",
             soup=raw_soup,
             confidence=response.confidence,
-            include_structure=extract_structure,
+        )
+        result.warnings.extend(response.warnings)
+        report = response.confidence
+        if response.status_code is not None and response.status_code >= 400:
+            result.success = False
+            code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
+            result.error = FetchErrorInfo(
+                code,
+                f"browser navigation returned status {response.status_code}",
+                response.status_code in RETRYABLE_STATUS_CODES,
+            )
+        elif report.challenge:
+            result.success = False
+            result.error = FetchErrorInfo("captcha_detected", "challenge page remained after browser retries", False)
+        elif report.score < self.config.confidence_threshold:
+            result.warnings.append("Rendered content may still be incomplete.")
+        return result
+
+    async def _fetch_browser_extract(
+        self,
+        url: str,
+        proxy: str,
+        *,
+        structure: bool,
+        compact_structure: bool,
+        screenshot: str,
+        screenshot_format: str,
+    ) -> FetchResult:
+        """Browser-backed extraction flow used by :meth:`extract`.
+
+        Unlike :meth:`_fetch_browser` this captures a screenshot (when
+        requested) and always runs the structural extractor so the result
+        is the rendered DOM plus the structural summary on demand.
+        """
+        if self.config.session_rotation == "rotate" and proxy != "none":
+            settings = resolve_proxy(proxy)
+            proxy_url = (
+                _inject_session_id(settings.url, make_random_session())
+                if settings.url
+                else None
+            )
+            fetcher = self._new_browser_fetcher(
+                ProxySettings(provider=settings.provider, url=proxy_url)
+            )
+            try:
+                response = await fetcher.fetch(
+                    url,
+                    screenshot=screenshot,
+                    screenshot_format=screenshot_format,
+                    screenshot_max_bytes=self.config.screenshot_max_bytes,
+                )
+            finally:
+                await self._close_browser_quietly(fetcher)
+        else:
+            cache_key, fetcher = await self._acquire_browser_fetcher(proxy, url)
+            try:
+                response = await fetcher.fetch(
+                    url,
+                    screenshot=screenshot,
+                    screenshot_format=screenshot_format,
+                    screenshot_max_bytes=self.config.screenshot_max_bytes,
+                )
+            finally:
+                await self._release_browser_fetcher(cache_key)
+        raw_soup = BeautifulSoup(response.html, "lxml")
+        result = self._result_from_html(
+            original_url=url,
+            final_url=response.url,
+            status_code=response.status_code,
+            html=response.html,
+            content_type="text/html",
+            encoding="utf-8",
+            proxy=proxy,
+            method="browser",
+            soup=raw_soup,
+            confidence=response.confidence,
+            include_structure=structure,
             compact_structure=compact_structure,
         )
+        result.screenshot = response.screenshot
+        result.screenshot_format = response.screenshot_format
         result.warnings.extend(response.warnings)
         report = response.confidence
         if response.status_code is not None and response.status_code >= 400:

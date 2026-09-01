@@ -14,11 +14,16 @@ def render_results(
     include_html: bool = False,
     include_structure: bool = False,
     compact_structure: bool = False,
+    include_screenshot: bool = False,
 ) -> str:
-    """Render fetch results in the chosen format (markdown, json, html, or structure).
+    """Render fetch results in the chosen format.
 
-    ``compact_structure`` only affects JSON output and is forwarded to
-    :meth:`FetchResult.to_dict`.
+    Supported formats: ``markdown``, ``json``, ``html``, ``structure``, and
+    ``raw``. ``raw`` emits a single JSON array document where each element is
+    the serialized result (raw HTML, optional structure summary, optional
+    base64-encoded screenshot) — the whole payload is parseable by
+    ``json.load`` without custom splitting. ``compact_structure`` only
+    affects JSON output and is forwarded to :meth:`FetchResult.to_dict`.
     """
     if output_format == "json":
         values = [
@@ -26,10 +31,30 @@ def render_results(
                 include_html=include_html,
                 include_structure=include_structure,
                 compact_structure=compact_structure,
+                include_screenshot=include_screenshot,
             )
             for result in results
         ]
         return json.dumps(values, ensure_ascii=False, indent=2)
+    if output_format == "raw":
+        # ``raw`` emits a single, parseable JSON document carrying one
+        # serialized result per item. The wrapper is a JSON array so
+        # downstream consumers can pipe the output straight into
+        # ``json.load`` without custom splitting. The element separator is
+        # the standard JSON comma; ``_RAW_BOUNDARY`` is intentionally not
+        # used between elements because it would invalidate the array —
+        # base64 screenshot payloads are guaranteed not to produce
+        # structural commas inside a JSON value.
+        documents = [
+            result.json(
+                include_html=True,
+                include_structure=result.structure is not None,
+                include_screenshot=result.screenshot is not None,
+                indent=2,
+            )
+            for result in results
+        ]
+        return "[" + ",".join(documents) + "]"
     if output_format == "html":
         documents = [result.html or result.text or "" for result in results]
     elif output_format == "structure":

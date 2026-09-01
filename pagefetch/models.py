@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import logging
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from typing import Any
+
+
+_LOGGER = logging.getLogger("pagefetch.models")
 
 # Compact serialization bounds. Kept conservative so the LLM-facing JSON
 # payload never balloons even for pages with megabyte-sized inline scripts.
@@ -141,6 +146,8 @@ class FetchResult:
     links: list[LinkInfo] | None = None
     images: list[ImageInfo] | None = None
     structure: PageStructure | None = None
+    screenshot: bytes | None = None
+    screenshot_format: str | None = None
     fetch_method: str | None = None
     proxy_provider: str = "none"
     content_confidence: float | None = None
@@ -162,6 +169,7 @@ class FetchResult:
         include_html: bool = False,
         include_structure: bool = False,
         compact_structure: bool = False,
+        include_screenshot: bool = False,
     ) -> dict[str, Any]:
         """Return a JSON-compatible dictionary.
 
@@ -173,12 +181,18 @@ class FetchResult:
         stylesheet/script entries shrink to ``{"url": ...}``, and inline
         ``<style>``/``<script>`` previews are returned as ``{length, preview}``
         instead of the full content.
+
+        ``include_screenshot=True`` opt-in emits the screenshot bytes as a
+        base64-encoded ``screenshot`` field alongside ``screenshot_format``.
+        Screenshots are never serialized by default.
         """
         output: dict[str, Any] = {}
         for field in fields(self):
             if field.name == "html" and not include_html:
                 continue
             if field.name == "structure" and not include_structure:
+                continue
+            if field.name == "screenshot" and not include_screenshot:
                 continue
             value = getattr(self, field.name)
             if isinstance(value, datetime):
@@ -189,6 +203,8 @@ class FetchResult:
                 output[field.name] = asdict(value)
             elif field.name == "structure" and value is not None:
                 output[field.name] = _structure_to_dict(value, compact=compact_structure)
+            elif field.name == "screenshot" and value is not None:
+                output[field.name] = base64.b64encode(value).decode("ascii")
             else:
                 output[field.name] = value
         return output
@@ -199,18 +215,21 @@ class FetchResult:
         include_html: bool = False,
         include_structure: bool = False,
         compact_structure: bool = False,
+        include_screenshot: bool = False,
         indent: int | None = None,
     ) -> str:
         """Serialize the result as UTF-8 friendly JSON.
 
         ``compact_structure`` mirrors :meth:`to_dict` and only affects the
-        payload when ``include_structure=True``.
+        payload when ``include_structure=True``. ``include_screenshot=True``
+        opt-in emits the screenshot bytes as base64.
         """
         return json.dumps(
             self.to_dict(
                 include_html=include_html,
                 include_structure=include_structure,
                 compact_structure=compact_structure,
+                include_screenshot=include_screenshot,
             ),
             ensure_ascii=False,
             indent=indent,
@@ -226,6 +245,24 @@ class FetchResult:
         values["error"] = FetchErrorInfo(**error) if error else None
         structure = values.get("structure")
         values["structure"] = _structure_from_dict(structure) if structure else None
+        screenshot = values.get("screenshot")
+        if isinstance(screenshot, str):
+            try:
+                values["screenshot"] = base64.b64decode(screenshot, validate=True)
+            except (ValueError, TypeError):
+                values["screenshot"] = None
+        elif screenshot is not None:
+            # Cache corruption / schema drift: ``screenshot`` should be a
+            # base64 string or ``None`` — silently coercing other types
+            # to ``None`` would mask the bug downstream as a misleading
+            # "screenshot not cached" warning.
+            _LOGGER.warning(
+                "FetchResult.from_dict received unexpected screenshot type %s; "
+                "expected str or None — dropping to None.",
+                type(screenshot).__name__,
+            )
+            values["screenshot"] = None
+        values["screenshot_format"] = values.get("screenshot_format")
         fetched_at = values.get("fetched_at")
         if isinstance(fetched_at, str):
             values["fetched_at"] = datetime.fromisoformat(fetched_at)

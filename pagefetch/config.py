@@ -86,6 +86,7 @@ class PageFetchConfig:
     stealth_level: Literal["off", "balanced", "max"] = "off"
     proxy_geo: str | None = None
     raise_on_error: bool = False
+    screenshot_max_bytes: int = 50 * 1024 * 1024
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PageFetchConfig:
@@ -145,6 +146,7 @@ class PageFetchConfig:
             stealth_level=flat.get("stealth_level", "off"),
             proxy_geo=flat.get("proxy_geo"),
             raise_on_error=flat.get("raise_on_error", False),
+            screenshot_max_bytes=flat.get("screenshot_max_bytes", 50 * 1024 * 1024),
         )
 
     @classmethod
@@ -174,6 +176,7 @@ class PageFetchConfig:
         stealth_level: Literal["off", "balanced", "max"] = "off",
         proxy_geo: str | None = None,
         raise_on_error: bool = False,
+        screenshot_max_bytes: int = 50 * 1024 * 1024,
     ) -> PageFetchConfig:
         if not isinstance(stealth_level, str) or stealth_level not in VALID_STEALTH_LEVELS:
             raise ValueError(f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}")
@@ -202,14 +205,14 @@ class PageFetchConfig:
                 raise ValueError(f"{name} must be a non-negative integer")
         for name, value in {"http_timeout": http_timeout, "browser_timeout": browser_timeout}.items():
             if (
-                not isinstance(value, (int, float))
+                not isinstance(value, int | float)
                 or isinstance(value, bool)
                 or not math.isfinite(value)
                 or value <= 0
             ):
                 raise ValueError(f"{name} must be a positive finite number")
         if (
-            not isinstance(confidence_threshold, (int, float))
+            not isinstance(confidence_threshold, int | float)
             or isinstance(confidence_threshold, bool)
             or not math.isfinite(confidence_threshold)
             or not 0 <= confidence_threshold <= 1
@@ -226,12 +229,18 @@ class PageFetchConfig:
         if not isinstance(session_rotation, str) or session_rotation not in VALID_SESSION_ROTATION:
             raise ValueError(f"session_rotation must be one of {sorted(VALID_SESSION_ROTATION)}")
         if (
-            not isinstance(request_pacing, (int, float))
+            not isinstance(request_pacing, int | float)
             or isinstance(request_pacing, bool)
             or not math.isfinite(request_pacing)
             or request_pacing < 0
         ):
             raise ValueError("request_pacing must be a non-negative finite number")
+        if (
+            not isinstance(screenshot_max_bytes, int)
+            or isinstance(screenshot_max_bytes, bool)
+            or screenshot_max_bytes <= 0
+        ):
+            raise ValueError("screenshot_max_bytes must be a positive integer")
         if proxy_geo is not None:
             if not isinstance(proxy_geo, str) or proxy_geo not in GEO_MAP:
                 raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")
@@ -261,4 +270,5 @@ class PageFetchConfig:
             stealth_level=stealth_level,
             proxy_geo=proxy_geo.strip() if proxy_geo else None,
             raise_on_error=raise_on_error,
+            screenshot_max_bytes=screenshot_max_bytes,
         )

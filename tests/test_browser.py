@@ -30,6 +30,141 @@ def make_fetcher(
 
 
 @pytest.mark.asyncio
+async def test_browser_response_carries_screenshot(monkeypatch):
+    """A non-default ``screenshot`` mode invokes ``page.screenshot`` and
+    attaches the bytes to ``BrowserResponse``."""
+    fetcher = make_fetcher()
+    screenshot_calls: list[dict] = []
+
+    class Page:
+        url = "https://example.com/"
+        frames = []
+        closed = False
+
+        def on(self, _event, _handler):
+            return None
+
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def goto(self, *_args, **_kwargs):
+            return SimpleNamespace(status=200)
+
+        async def evaluate(self, _script):
+            return 1000
+
+        async def content(self):
+            return "<html><body><p>ok</p></body></html>"
+
+        async def screenshot(self, *, full_page=False, type="png"):
+            screenshot_calls.append({"full_page": full_page, "type": type})
+            return b"\x89PNG-FAKE"
+
+        async def close(self):
+            self.closed = True
+
+    async def stable(*_args, **_kwargs):
+        return None
+
+    async def scroll(*_args, **_kwargs):
+        return False
+
+    async def probe(*_args, **_kwargs):
+        return {"text": 1000, "mainText": 500, "challenge": False}
+
+    main_frame = SimpleNamespace(url="https://example.com/", parent_frame=None)
+    page = Page()
+    page.frames = [main_frame]
+    async def new_page():
+        return page
+    mock_context = SimpleNamespace(new_page=new_page)
+
+    async def new_context():
+        return mock_context
+
+    fetcher._browser = SimpleNamespace(new_context=new_context)
+    monkeypatch.setattr(browser_module, "wait_for_stability", stable)
+    monkeypatch.setattr(browser_module, "controlled_scroll", scroll)
+    monkeypatch.setattr(browser_module, "in_page_metrics", probe)
+    response = await fetcher._fetch_page_once(
+        "https://example.com/",
+        page_timeout=10.0,
+        screenshot="viewport",
+        screenshot_format="png",
+        screenshot_max_bytes=1024 * 1024,
+    )
+    assert response.screenshot == b"\x89PNG-FAKE"
+    assert response.screenshot_format == "png"
+    assert screenshot_calls == [{"full_page": False, "type": "png"}]
+
+
+@pytest.mark.asyncio
+async def test_browser_oversized_screenshot_emits_warning(monkeypatch):
+    """A screenshot exceeding ``screenshot_max_bytes`` is discarded with a warning."""
+    fetcher = make_fetcher()
+
+    class Page:
+        url = "https://example.com/"
+        frames = []
+        closed = False
+
+        def on(self, _event, _handler):
+            return None
+
+        async def route(self, _pattern, _handler):
+            return None
+
+        async def goto(self, *_args, **_kwargs):
+            return SimpleNamespace(status=200)
+
+        async def evaluate(self, _script):
+            return 1000
+
+        async def content(self):
+            return "<html><body><p>ok</p></body></html>"
+
+        async def screenshot(self, *, full_page=False, type="png"):
+            return b"\xff" * 2048
+
+        async def close(self):
+            self.closed = True
+
+    async def stable(*_args, **_kwargs):
+        return None
+
+    async def scroll(*_args, **_kwargs):
+        return False
+
+    async def probe(*_args, **_kwargs):
+        return {"text": 1000, "mainText": 500, "challenge": False}
+
+    main_frame = SimpleNamespace(url="https://example.com/", parent_frame=None)
+    page = Page()
+    page.frames = [main_frame]
+    async def new_page():
+        return page
+    mock_context = SimpleNamespace(new_page=new_page)
+
+    async def new_context():
+        return mock_context
+
+    fetcher._browser = SimpleNamespace(new_context=new_context)
+    monkeypatch.setattr(browser_module, "wait_for_stability", stable)
+    monkeypatch.setattr(browser_module, "controlled_scroll", scroll)
+    monkeypatch.setattr(browser_module, "in_page_metrics", probe)
+    response = await fetcher._fetch_page_once(
+        "https://example.com/",
+        page_timeout=10.0,
+        screenshot="full",
+        screenshot_format="png",
+        screenshot_max_bytes=512,  # smaller than the 2 KiB fake payload
+    )
+    assert response.screenshot is None
+    assert response.screenshot_format is None
+    assert any("discarded" in w.lower() for w in response.warnings)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("block_images", "image_decision"),
     [(True, "abort"), (False, "continue")],

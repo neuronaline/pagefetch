@@ -26,6 +26,11 @@ browser_concurrency: 4
 browser_timeout: 45.0       # seconds
 retries_browser: 2
 
+# Maximum bytes for ``extract(screenshot=…)`` captures. Oversized
+# screenshots are discarded with a warning so the SQLite cache stays
+# small. Comment in to override the 50 MiB default.
+# screenshot_max_bytes: 52428800
+
 # ── Proxy ───────────────────────────────────────────────────
 # Provider:  none  |  decodo  |  dataimpulse
 # Credentials are read from environment variables:

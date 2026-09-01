@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import random
 import sys
 from pathlib import Path
 
@@ -18,22 +19,23 @@ from .utils.urls import read_urls_from_file
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pagefetch", description="Fetch complete web page content")
     parser.add_argument("input", metavar="URL_OR_FILE")
-    parser.add_argument("--format", choices=("markdown", "json", "html", "structure"), default="markdown")
+    parser.add_argument("--format", choices=("markdown", "json", "html", "structure", "raw"), default="markdown")
     parser.add_argument("-c", "--config", type=Path, metavar="PATH", help="Path to config.yaml")
     parser.add_argument("--mode", choices=("auto", "http", "browser"), default=argparse.SUPPRESS)
     parser.add_argument("--proxy", choices=("none", "decodo", "dataimpulse"), default=argparse.SUPPRESS)
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("--include-html", action="store_true")
-    parser.add_argument("--include-structure", action="store_true", help="Attach a bounded PageStructure summary to every result.")
     parser.add_argument(
-        "--compact-structure",
-        action="store_true",
-        help=(
-            "Emit the LLM-friendly variant of the structure tree when "
-            "--include-structure/--format=structure is active: skip the "
-            "unique_selector query, filter non-essential attributes, and "
-            "trim inline <script>/<style> content to {length, preview}."
-        ),
+        "--screenshot",
+        choices=("none", "viewport", "full"),
+        default=argparse.SUPPRESS,
+        help="Capture a screenshot (forces mode=browser). 'viewport' = visible area, 'full' = entire scrollable page.",
+    )
+    parser.add_argument(
+        "--screenshot-format",
+        choices=("png", "jpeg"),
+        default=argparse.SUPPRESS,
+        help="Screenshot encoding (default: png).",
     )
     parser.add_argument(
         "--cache-ttl",
@@ -112,6 +114,7 @@ def _render(
     include_html: bool,
     include_structure: bool = False,
     compact_structure: bool = False,
+    include_screenshot: bool = False,
 ) -> str:
     return render_results(
         results,
@@ -119,6 +122,7 @@ def _render(
         include_html=include_html,
         include_structure=include_structure,
         compact_structure=compact_structure,
+        include_screenshot=include_screenshot,
     )
 
 
@@ -213,12 +217,25 @@ async def _run(args: argparse.Namespace) -> int:
     if not urls:
         raise ValueError("the input file does not contain any URLs")
     config = _build_config(args)
-    extract_structure = args.format == "structure" or getattr(args, "include_structure", False)
-    compact_structure = bool(getattr(args, "compact_structure", False)) and extract_structure
-    # Page structure is only meaningful in browser mode (the rendered DOM);
-    # auto-promote when the user asked for it so we don't surface a raw
-    # ``ValueError`` from PageFetch.fetch.
-    effective_mode = "browser" if extract_structure else config.mode
+    output_format = args.format
+    extract_structure = output_format in {"structure", "raw"}
+    screenshot = getattr(args, "screenshot", "none") or "none"
+    screenshot_format = getattr(args, "screenshot_format", "png") or "png"
+    include_screenshot = screenshot != "none" and output_format == "raw"
+    # Screenshot capture (and structure/raw output) requires the rendered DOM;
+    # auto-promote to browser mode so the call doesn't surface a
+    # ``ValueError`` from PageFetch.extract. When the user explicitly
+    # asked for ``http`` or ``auto`` we surface the override on stderr so
+    # the divergence between the requested and effective mode is visible
+    # in CI logs.
+    use_extract = extract_structure or screenshot != "none"
+    effective_mode = "browser" if use_extract else config.mode
+    if use_extract and config.mode != "browser":
+        print(
+            f"pagefetch: --format {output_format}/--screenshot forced mode=browser "
+            f"(was {config.mode})",
+            file=sys.stderr,
+        )
     async with PageFetch(
         mode=effective_mode,
         proxy=config.proxy,
@@ -243,18 +260,32 @@ async def _run(args: argparse.Namespace) -> int:
         stealth_level=config.stealth_level,
         proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
+        screenshot_max_bytes=config.screenshot_max_bytes,
     ) as client:
-        results = await client.fetch_many(
-            urls,
-            extract_structure=extract_structure,
-            compact_structure=compact_structure,
-        )
+        if use_extract:
+            results = []
+            pacing = config.request_pacing or 0.0
+            for idx, item in enumerate(urls):
+                # Stagger browser navigations to avoid a synchronized burst —
+                # a stronger bot signal than the parallel fetch_many path.
+                if pacing > 0 and idx > 0:
+                    await asyncio.sleep(random.uniform(0, pacing))
+                results.append(
+                    await client.extract(
+                        item,
+                        structure=extract_structure,
+                        screenshot=screenshot,
+                        screenshot_format=screenshot_format,
+                    )
+                )
+        else:
+            results = await client.fetch_many(urls)
     rendered = _render(
         results,
-        args.format,
+        output_format,
         args.include_html,
         include_structure=extract_structure,
-        compact_structure=compact_structure,
+        include_screenshot=include_screenshot,
     )
     if args.output:
         args.output.write_text(rendered, encoding="utf-8")

@@ -66,6 +66,7 @@ def _render_results(
     include_html: bool,
     include_structure: bool = False,
     compact_structure: bool = False,
+    include_screenshot: bool = False,
 ) -> str:
     """Render fetch results in the chosen format."""
     return render_results(
@@ -74,6 +75,7 @@ def _render_results(
         include_html=include_html,
         include_structure=include_structure,
         compact_structure=compact_structure,
+        include_screenshot=include_screenshot,
     )
 
 
@@ -91,19 +93,27 @@ def _apply_debug(settings: dict) -> None:
 
 async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
     """Fetch a single URL."""
-    include_structure = settings.get("include_structure", False) or settings.get("format") == "structure"
-    compact_structure = bool(settings.get("compact_structure")) and include_structure
-    # Page structure is only meaningful in browser mode; auto-promote so the
-    # call does not raise ValueError.
-    mode = "browser" if include_structure else settings.get("mode")
     result = await client.fetch(
         url,
-        mode=mode,
+        mode=settings.get("mode"),
         proxy=settings.get("proxy"),
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
-        extract_structure=include_structure,
-        compact_structure=compact_structure,
+    )
+    return [result]
+
+
+async def _extract_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
+    """Extract a single URL (RAW HTML + optional structure/screenshot)."""
+    result = await client.extract(
+        url,
+        structure=settings.get("structure", True),
+        compact_structure=settings.get("compact_structure", False),
+        screenshot=settings.get("screenshot", "none"),
+        screenshot_format=settings.get("screenshot_format", "png"),
+        proxy=settings.get("proxy"),
+        use_cache=settings.get("use_cache", True),
+        cache_ttl=settings.get("cache_ttl"),
     )
     return [result]
 
@@ -118,20 +128,13 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
     if not urls:
         print("\n  Error: the file does not contain any URLs.")
         return []
-    include_structure = settings.get("include_structure", False) or settings.get("format") == "structure"
-    compact_structure = bool(settings.get("compact_structure")) and include_structure
-    # Page structure is only meaningful in browser mode; auto-promote so the
-    # batch call does not raise ValueError for the first URL.
-    mode = "browser" if include_structure else settings.get("mode")
     print(f"\n  Fetching {len(urls)} URL(s)...\n")
     return await client.fetch_many(
         urls,
-        mode=mode,
+        mode=settings.get("mode"),
         proxy=settings.get("proxy"),
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
-        extract_structure=include_structure,
-        compact_structure=compact_structure,
     )
 
 
@@ -183,15 +186,13 @@ def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEvent
 
     output_format = settings.get("format", "markdown")
     include_html = settings.get("include_html", False)
-    include_structure = settings.get("include_structure", False) or output_format == "structure"
-    compact_structure = bool(settings.get("compact_structure")) and include_structure
+    include_structure = output_format == "structure"
 
     rendered = _render_results(
         results,
         output_format,
         include_html,
         include_structure,
-        compact_structure,
     )
     output_file = settings.get("output")
 
@@ -222,6 +223,78 @@ def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEvent
     input("\n  Press Enter to continue...")
 
 
+def _handle_extract(client: PageFetch, settings: dict, loop: asyncio.AbstractEventLoop) -> None:
+    """Interactive extract flow: RAW HTML + structure + screenshot for a URL."""
+    _clear_screen()
+    _banner()
+    _header("Extract")
+
+    print("  Extract fetches the page via the browser and returns the raw HTML,")
+    print("  an optional structure tree, and an optional screenshot.\n")
+
+    url = _prompt("  URL")
+    if not url:
+        return
+    if not url.startswith(("http://", "https://")):
+        if _confirm(f"  No scheme detected. Use 'https://{url}'?", default=True):
+            url = f"https://{url}"
+
+    _apply_debug(settings)
+    results = loop.run_until_complete(_extract_url(client, url, settings))
+
+    if not results:
+        return
+
+    _clear_screen()
+    _banner()
+    _header("Results")
+
+    result = results[0]
+    status = "OK" if result.success else "FAIL"
+    title = result.title or "(no title)"
+    duration = f"{result.duration_ms:.0f}ms" if result.duration_ms else "N/A"
+    cache_tag = " [cache]" if result.from_cache else ""
+    method = result.fetch_method or "?"
+    tag = f"[{method}]{cache_tag}"
+    print(f"  [{status}] {duration} {tag}")
+    print(f"       {title}")
+    print(f"       {result.url}")
+    if result.error:
+        print(f"       Error: {result.error.message}")
+    print()
+    has_structure = result.structure is not None
+    has_screenshot = result.screenshot is not None
+    print(f"  RAW HTML: {len(result.html or ''):,} chars")
+    print(f"  Structure: {'yes' if has_structure else 'no'}")
+    if has_screenshot:
+        print(f"  Screenshot: {len(result.screenshot):,} bytes ({result.screenshot_format})")
+    else:
+        print("  Screenshot: no")
+    if result.warnings:
+        print("\n  Warnings:")
+        for warning in result.warnings:
+            print(f"    - {warning}")
+    print()
+
+    output_format = settings.get("format", "markdown")
+    rendered = _render_results(
+        [result],
+        output_format,
+        include_html=False,
+        include_structure=has_structure,
+        include_screenshot=has_screenshot,
+    )
+    output_file = settings.get("output")
+    if output_file:
+        path = Path(output_file)
+        path.write_text(rendered, encoding="utf-8")
+        print(f"  Results saved to: {path.resolve()}\n")
+    else:
+        print(rendered)
+
+    input("\n  Press Enter to continue...")
+
+
 def _settings_menu(settings: dict) -> None:
     """Interactive settings submenu."""
     while True:
@@ -235,7 +308,10 @@ def _settings_menu(settings: dict) -> None:
         cache_ttl = settings.get("cache_ttl") or "(config/default)"
         output = settings.get("output", "none")
         include_html = "yes" if settings.get("include_html") else "no"
-        include_structure = "yes" if settings.get("include_structure") else "no"
+        structure = "yes" if settings.get("structure", True) else "no"
+        compact_structure = "yes" if settings.get("compact_structure") else "no"
+        screenshot = settings.get("screenshot", "none")
+        screenshot_format = settings.get("screenshot_format", "png")
         debug = "yes" if settings.get("debug") else "no"
         config_file = settings.get("config_file", "none")
         no_cache = "yes" if settings.get("no_cache") else "no"
@@ -246,10 +322,13 @@ def _settings_menu(settings: dict) -> None:
         print(f"  4. Cache TTL           : {cache_ttl}")
         print(f"  5. Output file         : {output}")
         print(f"  6. Include raw HTML    : {include_html}")
-        print(f"  7. Include structure   : {include_structure}")
-        print(f"  8. Debug logging       : {debug}")
-        print(f"  9. Disable cache       : {no_cache}")
-        print(f" 10. Config file (YAML)  : {config_file}")
+        print(f"  7. Extract structure   : {structure}")
+        print(f"  8. Compact structure   : {compact_structure}")
+        print(f"  9. Screenshot          : {screenshot}")
+        print(f" 10. Screenshot format   : {screenshot_format}")
+        print(f" 11. Debug logging       : {debug}")
+        print(f" 12. Disable cache       : {no_cache}")
+        print(f" 13. Config file (YAML)  : {config_file}")
         print("  0. Back to main menu")
         print()
 
@@ -274,9 +353,9 @@ def _settings_menu(settings: dict) -> None:
                 print(f"  Invalid proxy: {val}")
                 input("  Press Enter...")
         elif choice == "3":
-            print("\n  Options: markdown, json, html, structure")
+            print("\n  Options: markdown, json, html, structure, raw")
             val = _prompt("  Output format", fmt)
-            if val in ("markdown", "json", "html", "structure"):
+            if val in ("markdown", "json", "html", "structure", "raw"):
                 settings["format"] = val
             else:
                 print(f"  Invalid format: {val}")
@@ -292,20 +371,41 @@ def _settings_menu(settings: dict) -> None:
         elif choice == "6":
             settings["include_html"] = _confirm("  Include raw HTML in output?", default=settings.get("include_html", False))
         elif choice == "7":
-            settings["include_structure"] = _confirm(
-                "  Include page structure summary?",
-                default=settings.get("include_structure", False),
+            settings["structure"] = _confirm(
+                "  Extract the page structure tree?",
+                default=settings.get("structure", True),
             )
         elif choice == "8":
+            settings["compact_structure"] = _confirm(
+                "  Use the compact (LLM-friendly) structure variant?",
+                default=settings.get("compact_structure", False),
+            )
+        elif choice == "9":
+            print("\n  Options: none, viewport, full")
+            val = _prompt("  Screenshot mode", screenshot)
+            if val in ("none", "viewport", "full"):
+                settings["screenshot"] = val
+            else:
+                print(f"  Invalid screenshot mode: {val}")
+                input("  Press Enter...")
+        elif choice == "10":
+            print("\n  Options: png, jpeg")
+            val = _prompt("  Screenshot format", screenshot_format)
+            if val in ("png", "jpeg"):
+                settings["screenshot_format"] = val
+            else:
+                print(f"  Invalid screenshot format: {val}")
+                input("  Press Enter...")
+        elif choice == "11":
             settings["debug"] = _confirm("  Enable debug logging?", default=settings.get("debug", False))
             _apply_debug(settings)
-        elif choice == "9":
+        elif choice == "12":
             settings["no_cache"] = _confirm("  Disable cache?", default=settings.get("no_cache", False))
             if settings.get("no_cache"):
                 settings["use_cache"] = False
             else:
                 settings.pop("use_cache", None)
-        elif choice == "10":
+        elif choice == "13":
             val = _prompt("  Config file path (leave empty for defaults)", config_file if config_file != "none" else "")
             settings["config_file"] = val if val else None
 
@@ -333,10 +433,13 @@ def _view_config(settings: dict) -> None:
     print(f"  Format       : {settings.get('format', 'markdown')}")
     print(f"  Cache TTL    : {settings.get('cache_ttl', '24h')}")
     print(f"  Output file  : {settings.get('output', 'none')}")
-    print(f"  Include HTML     : {'yes' if settings.get('include_html') else 'no'}")
-    print(f"  Include structure: {'yes' if settings.get('include_structure') else 'no'}")
-    print(f"  Debug            : {'yes' if settings.get('debug') else 'no'}")
-    print(f"  No cache         : {'yes' if settings.get('no_cache') else 'no'}")
+    print(f"  Include HTML      : {'yes' if settings.get('include_html') else 'no'}")
+    print(f"  Extract structure : {'yes' if settings.get('structure', True) else 'no'}")
+    print(f"  Compact structure : {'yes' if settings.get('compact_structure') else 'no'}")
+    print(f"  Screenshot        : {settings.get('screenshot', 'none')}")
+    print(f"  Screenshot format : {settings.get('screenshot_format', 'png')}")
+    print(f"  Debug             : {'yes' if settings.get('debug') else 'no'}")
+    print(f"  No cache          : {'yes' if settings.get('no_cache') else 'no'}")
     print()
 
     input("  Press Enter to continue...")
@@ -379,6 +482,34 @@ def _init_client(settings: dict) -> PageFetch:
         stealth_level=config.stealth_level,
         proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
+        screenshot_max_bytes=config.screenshot_max_bytes,
+    )
+
+
+# Settings keys that influence ``PageFetch`` construction. Changing any
+# other key (``format``, ``screenshot``, ``include_html``, etc.) only
+# affects how results are rendered and does NOT require rebuilding the
+# client — which (for browser mode) means a fresh Camoufox process.
+_CLIENT_FINGERPRINT_KEYS = (
+    "mode",
+    "proxy",
+    "use_cache",
+    "no_cache",
+    "cache_ttl",
+    "config_file",
+)
+
+
+def _client_fingerprint(settings: dict) -> tuple:
+    """Return a stable hash of the settings that determine client config.
+
+    Output-formatting settings (e.g. ``format``, ``screenshot``,
+    ``include_html``, ``debug``) are intentionally excluded so the menu
+    loop can avoid re-spawning the client (and re-launching the browser
+    process) when only those change.
+    """
+    return tuple(
+        (key, settings.get(key)) for key in _CLIENT_FINGERPRINT_KEYS
     )
 
 
@@ -387,7 +518,10 @@ def interactive_main() -> int:
     settings: dict = {
         "format": "markdown",
         "include_html": False,
-        "include_structure": False,
+        "structure": True,
+        "compact_structure": False,
+        "screenshot": "none",
+        "screenshot_format": "png",
         "debug": False,
         "cache_ttl": None,
         "output": None,
@@ -402,6 +536,12 @@ def interactive_main() -> int:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     client = _init_client(settings)
+    # Tracks the client-relevant subset of ``settings`` at the time of
+    # the last ``_init_client`` call. We only respawn the client (and
+    # therefore the browser process) when this fingerprint actually
+    # changes — output-format settings like ``format`` or ``screenshot``
+    # are excluded because they don't affect the client.
+    last_client_fingerprint = _client_fingerprint(settings)
 
     try:
         while True:
@@ -409,9 +549,10 @@ def interactive_main() -> int:
             _banner()
 
             print("  1. Fetch URL(s)")
-            print("  2. Settings")
-            print("  3. View current config")
-            print("  4. Exit")
+            print("  2. Extract URL (RAW HTML + structure + screenshot)")
+            print("  3. Settings")
+            print("  4. View current config")
+            print("  5. Exit")
             print()
 
             choice = _prompt("  Choose", "1")
@@ -419,23 +560,42 @@ def interactive_main() -> int:
             try:
                 if choice == "1":
                     _handle_fetch(client, settings, loop)
-                    # Re-create client in case settings changed
-                    try:
-                        loop.run_until_complete(client.close())
-                    except Exception:
-                        pass
-                    client = _init_client(settings)
+                    # Re-create the client only when settings that
+                    # actually shape it have changed — otherwise the
+                    # browser pool would be torn down needlessly.
+                    current_fingerprint = _client_fingerprint(settings)
+                    if current_fingerprint != last_client_fingerprint:
+                        try:
+                            loop.run_until_complete(client.close())
+                        except Exception:
+                            pass
+                        client = _init_client(settings)
+                        last_client_fingerprint = current_fingerprint
                 elif choice == "2":
-                    _settings_menu(settings)
-                    # Re-create client with new settings
-                    try:
-                        loop.run_until_complete(client.close())
-                    except Exception:
-                        pass
-                    client = _init_client(settings)
+                    _handle_extract(client, settings, loop)
+                    current_fingerprint = _client_fingerprint(settings)
+                    if current_fingerprint != last_client_fingerprint:
+                        try:
+                            loop.run_until_complete(client.close())
+                        except Exception:
+                            pass
+                        client = _init_client(settings)
+                        last_client_fingerprint = current_fingerprint
                 elif choice == "3":
-                    _view_config(settings)
+                    _settings_menu(settings)
+                    # Settings may have changed — refresh the client
+                    # only if the change actually affects it.
+                    current_fingerprint = _client_fingerprint(settings)
+                    if current_fingerprint != last_client_fingerprint:
+                        try:
+                            loop.run_until_complete(client.close())
+                        except Exception:
+                            pass
+                        client = _init_client(settings)
+                        last_client_fingerprint = current_fingerprint
                 elif choice == "4":
+                    _view_config(settings)
+                elif choice == "5":
                     print("\n  Goodbye!")
                     break
             except KeyboardInterrupt:

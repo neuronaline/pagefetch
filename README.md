@@ -229,26 +229,38 @@ client = PageFetch(
 
 ### Methods
 
-**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False, compact_structure=False) → FetchResult`**
+**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
 Fetch a single URL. All keyword arguments override the client-level defaults
-for this individual request only. Pass `extract_structure=True` with
-`mode="browser"` to attach a scraper-oriented `PageStructure` to
-`FetchResult.structure`. Structure extraction requires browser mode so it
-always describes the rendered DOM rather than incomplete server markup.
-Pass `compact_structure=True` (with `extract_structure=True`) to request the
-LLM-friendly variant — `unique_selector` is dropped, non-essential attributes
-are filtered, and inline `<style>`/`<script>` content is trimmed to
-`{length, preview}`. `compact_structure` only affects subsequent
-`to_dict()` / `json()` calls; the in-memory `FetchResult.structure` still
-carries the full fields.
+for this individual request only. For structural / RAW HTML / screenshot
+capture use `extract()` instead — it always runs in browser mode and
+returns the rendered page shell.
 
-**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None, extract_structure=False, compact_structure=False) → list[FetchResult]`**
+**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
 
 Fetch multiple URLs concurrently. Deduplicates identical inputs internally,
 preserves the original input order, and isolates individual failures — one
-bad URL never affects the others. The `extract_structure` / `compact_structure`
-flags are forwarded to each underlying `fetch()` call.
+bad URL never affects the others.
+
+**`extract(url, *, structure=True, compact_structure=False, screenshot="none", screenshot_format="png", proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
+
+Fetch a page and return the rendered DOM plus, on demand, a structural
+summary and/or a screenshot. `extract()` always uses `mode="browser"` —
+there is no HTTP→browser pipeline because the goal is the full page shell,
+not the article-shaped extraction. Returns a `FetchResult` populated with:
+
+- `result.html` — the browser-rendered HTML.
+- `result.structure` — `PageStructure` summary (when `structure=True`).
+- `result.screenshot` / `result.screenshot_format` — captured screenshot
+  bytes (when `screenshot != "none"`); `screenshot="viewport"` captures
+  the visible area, `screenshot="full"` captures the entire scrollable
+  page, encoded as `screenshot_format` (`png` or `jpeg`).
+
+Screenshots are bounded by `PageFetchConfig.screenshot_max_bytes` (default
+50 MiB) — oversized captures are discarded with a warning. Screenshots are
+**not** persisted in the SQLite cache; when a cached result is returned
+and a screenshot was requested, `result.warnings` carries a hint to
+re-fetch with `use_cache=False`.
 
 ### Public API Exports
 
@@ -293,6 +305,8 @@ class FetchResult:
     links: list[LinkInfo]       # All <a> tags with text, URL, rel
     images: list[ImageInfo]     # All <img> tags with url, alt, title
     structure: PageStructure | None  # Bounded DOM/stylesheet/script summary (only when requested)
+    screenshot: bytes | None         # PNG/JPEG screenshot bytes (only when requested)
+    screenshot_format: str | None    # "png" or "jpeg"
     fetch_method: str | None    # "http" or "browser"
     proxy_provider: str         # "none", "decodo", or "dataimpulse"
     content_confidence: float | None  # 0–1 completeness score (None for browser mode)
@@ -306,37 +320,55 @@ class FetchResult:
 ### Serialization
 
 ```python
-# JSON output (HTML and structure excluded by default for compactness)
+# JSON output (HTML, structure, and screenshot excluded by default for compactness)
 print(result.json(indent=2))
 print(result.json(include_html=True))          # Include raw HTML
 print(result.json(include_structure=True))     # Include PageStructure summary
+print(result.json(include_screenshot=True))    # Include base64-encoded screenshot
 
 # Python dict
 data = result.to_dict()
 data = result.to_dict(include_html=True)
 data = result.to_dict(include_structure=True)
+data = result.to_dict(include_screenshot=True)
 
 # Reconstruct from cached JSON
 reconstructed = FetchResult.from_dict(data)
 ```
 
-### Page Structure (Developer Inspection)
+### Extraction (RAW HTML, Structure, Screenshot)
 
-When you want to understand a page *before* writing scraping rules, opt in to
-the static structure summary:
+When you want the full rendered page shell — RAW HTML plus the optional
+structural summary and/or screenshot — call `extract()` instead of
+`fetch()`. `extract()` always uses browser mode (no auto fallback) and
+returns a `FetchResult` with the rendered DOM:
 
 ```python
-async with PageFetch(mode="browser") as client:
-    result = await client.fetch("https://example.com", extract_structure=True)
-    structure = result.structure
+async with PageFetch() as client:
+    # RAW HTML + structural summary (no screenshot)
+    result = await client.extract("https://example.com")
+    print(result.html)
+    print(result.structure.root.selector)
+
+    # Capture a full-page PNG screenshot too
+    captured = await client.extract(
+        "https://example.com",
+        screenshot="full",
+        screenshot_format="png",
+    )
+    with open("page.png", "wb") as fh:
+        fh.write(captured.screenshot)
 ```
 
-`extract_structure=True` is valid only in browser mode. `PageFetch.fetch` raises
-`ValueError` for `auto` or `http`, preventing an incomplete server-rendered tree
-from being mistaken for the page structure.
+`extract()` runs the same readiness / scroll pipeline as a browser-mode
+`fetch()`, so the captured HTML matches what a visitor sees. Screenshots
+follow Playwright's `page.screenshot()` semantics — `screenshot="viewport"`
+captures the initial visible area, `screenshot="full"` captures the
+entire scrollable page. Use `--screenshot-format=jpeg` (or
+`screenshot_format="jpeg"` in Python) to compress full-page captures.
 
-`FetchResult.structure` is `None` unless `extract_structure=True` is passed, so
-the default result shape is unchanged. When present, it carries:
+The structural summary is identical to the one `fetch(extract_structure=True)`
+used to return:
 
 - A nested DOM tree with filtered attributes, short direct-text previews, a
   compact selector, a deterministic CSS path, and a verified
@@ -350,10 +382,6 @@ the default result shape is unchanged. When present, it carries:
   `integrity`, and `crossorigin`.
 - Inline `<script>` blocks with a per-block preview, `type`, and a `truncated`
   flag.
-
-The summary never downloads external CSS/JavaScript, never walks Shadow DOM,
-and never captures runtime state beyond the rendered DOM snapshot. Browser mode
-performs its normal controlled scroll and readiness waits before capture.
 
 Use the lower-level helper directly when you already have parsed HTML:
 
@@ -391,8 +419,11 @@ pagefetch https://example.com --format json --include-html
 # Inspect the page structure as Markdown
 pagefetch https://example.com --format structure
 
+# Raw page shell: HTML + structure + (optionally) screenshot, single JSON doc
+pagefetch https://example.com --format raw --screenshot full --screenshot-format png
+
 # Include a PageStructure summary inside the regular JSON output
-pagefetch https://example.com --format json --include-structure
+pagefetch https://example.com --format json --include-html
 
 # Multiple URLs from a file (one URL per line)
 pagefetch urls.txt --format json --mode auto
@@ -430,12 +461,16 @@ CLI arguments map directly to the Python API:
 | `--request-pacing SECONDS` | `request_pacing` |
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
 | `--proxy-geo CC` | `proxy_geo` |
-| `--include-html` / `--include-structure` | `FetchResult.json(include_html=…, include_structure=…)` |
-| `--compact-structure` | `compact_structure=True` for `to_dict()` / `json()` / `render_results()` |
-| `--format {markdown,json,html,structure}` | output renderer |
+| `--include-html` | `FetchResult.json(include_html=…)` |
+| `--screenshot {none,viewport,full}` | `PageFetch.extract(screenshot=…)` |
+| `--screenshot-format {png,jpeg}` | `PageFetch.extract(screenshot_format=…)` |
+| `--format {markdown,json,html,structure,raw}` | output renderer |
 | `-o PATH` / `--output PATH` | write rendered output to a file |
 | `-c PATH` / `--config PATH` | `PageFetchConfig.from_yaml` |
 | `--debug` | enable DEBUG logging on the `pagefetch` logger |
+
+The `--screenshot` flag (and `--format raw`) auto-promote the request to
+`browser` mode and route through `PageFetch.extract()`.
 
 Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error,
 `3` partial failure.
@@ -511,8 +546,8 @@ PageFetch handles content types beyond HTML natively:
 | Content Type | Detection | Extraction |
 |---|---|---|
 | **PDF** | Magic bytes + `Content-Type` | Text via optional `pagefetch[pdf]` support |
-| **XML** | `Content-Type` matching `+xml` or `application/xml` | Preserved as `.text` |
-| **Plain text** | Fallback when no structured type matches | Served as `.text` directly |
+| **XML** | `Content-Type` matching `+xml` or `application/xml` | Strictly parsed with `lxml`; visible text surfaces as `.text` and the original tree is preserved as `.markdown` inside a fenced XML block |
+| **Plain text** | Fallback when no structured type matches | Served as `.text` and `.markdown` directly |
 
 No browser overhead is incurred for non-HTML content — detection happens
 at the HTTP response level before any processing pipeline runs.
@@ -546,6 +581,7 @@ at the HTTP response level before any processing pipeline runs.
 | `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
 | `proxy_geo` | `str \| None` | `None` | ISO 3166-1 alpha-2 (e.g. `"US"`, `"DE"`) to align locale/timezone/Accept-Language with proxy exit country |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
+| `screenshot_max_bytes` | `int` | `50 MiB` | Maximum bytes for an `extract(screenshot=…)` capture; oversized screenshots are discarded with a warning |
 
 ---
 
