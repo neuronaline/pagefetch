@@ -433,3 +433,55 @@ async def test_controlled_scroll_stops_after_unchanged_bottom(monkeypatch):
     limit_reached = await readiness_module.controlled_scroll(page, max_scrolls=6)
     assert limit_reached is False
     assert page.returned_to_top is True
+
+
+# ---------------------------------------------------------------------------
+# browser_pre_check_byte_margin + content_too_large retryable semantics
+# ---------------------------------------------------------------------------
+
+
+def test_browser_fetcher_accepts_browser_pre_check_byte_margin():
+    """New config kwarg round-trips through the constructor."""
+    fetcher = BrowserFetcher(
+        asyncio.Semaphore(4),
+        timeout=1.0,
+        retries=0,
+        proxy=ProxySettings("none", None),
+        max_content_size=100_000,
+        browser_pre_check_byte_margin=1.25,
+    )
+    assert fetcher.browser_pre_check_byte_margin == 1.25
+
+
+def test_browser_fetcher_defaults_browser_pre_check_byte_margin():
+    """Backward-compatible default of 1.5 (the historical hard-coded value)."""
+    fetcher = BrowserFetcher(
+        asyncio.Semaphore(4),
+        timeout=1.0,
+        retries=0,
+        proxy=ProxySettings("none", None),
+        max_content_size=100_000,
+    )
+    assert fetcher.browser_pre_check_byte_margin == 1.5
+
+
+def test_page_fetch_config_exposes_new_field():
+    from pagefetch.config import PageFetchConfig
+
+    cfg = PageFetchConfig()
+    assert cfg.browser_pre_check_byte_margin == 1.5
+    cfg2 = PageFetchConfig.build(browser_pre_check_byte_margin=1.1)
+    assert cfg2.browser_pre_check_byte_margin == 1.1
+
+
+def test_page_fetch_config_rejects_invalid_browser_pre_check_byte_margin():
+    from pagefetch.config import PageFetchConfig
+
+    import pytest
+
+    with pytest.raises(ValueError, match="browser_pre_check_byte_margin"):
+        PageFetchConfig.build(browser_pre_check_byte_margin=0.9)
+    with pytest.raises(ValueError, match="browser_pre_check_byte_margin"):
+        PageFetchConfig.build(browser_pre_check_byte_margin=float("nan"))
+    with pytest.raises(ValueError, match="browser_pre_check_byte_margin"):
+        PageFetchConfig.build(browser_pre_check_byte_margin=float("inf"))

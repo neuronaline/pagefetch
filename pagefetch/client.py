@@ -969,6 +969,7 @@ class PageFetch:
             retries=self.config.retries_browser,
             proxy=proxy,
             max_content_size=self.config.max_content_size,
+            browser_pre_check_byte_margin=self.config.browser_pre_check_byte_margin,
             confidence_threshold=self.config.confidence_threshold,
             block_images=self.config.block_images,
             block_level=self.config.block_level,

@@ -115,7 +115,7 @@ class HTTPFetcher:
                 declared = response.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > self.max_content_size:
                     raise TransportFailure(
-                        FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
+                        FetchErrorInfo("content_too_large", "response exceeds maximum content size", True),
                         status_code=response.status_code,
                     )
                 chunks: list[bytes] = []
@@ -124,7 +124,7 @@ class HTTPFetcher:
                     size += len(chunk)
                     if size > self.max_content_size:
                         raise TransportFailure(
-                            FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
+                            FetchErrorInfo("content_too_large", "response exceeds maximum content size", True),
                             status_code=response.status_code,
                         )
                     chunks.append(chunk)

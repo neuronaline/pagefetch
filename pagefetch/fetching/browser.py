@@ -71,6 +71,7 @@ class BrowserFetcher:
         retries: int,
         proxy: ProxySettings,
         max_content_size: int,
+        browser_pre_check_byte_margin: float = 1.5,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
         block_level: str = "aggressive",
@@ -83,6 +84,7 @@ class BrowserFetcher:
         self.retries = retries
         self.proxy = proxy
         self.max_content_size = max_content_size
+        self.browser_pre_check_byte_margin = browser_pre_check_byte_margin
         self.confidence_threshold = confidence_threshold
         self.block_images = block_images
         self.block_level = block_level
@@ -414,11 +416,22 @@ class BrowserFetcher:
                 pre_size = await page.evaluate(
                     "() => (document.documentElement?.outerHTML.length || 0)"
                 )
-                # Convert char length to approximate byte length (1.5× for
-                # multi-byte UTF-8 safety margin).
-                if pre_size > self.max_content_size * 1.5:
+                # Convert char length to approximate byte length using the
+                # configured margin over max_content_size. The default
+                # browser_pre_check_byte_margin is 1.5 (multi-byte UTF-8
+                # safety margin); lower values reject pages earlier and
+                # higher values are more permissive. The error is marked
+                # retryable=True because callers can legitimately retry
+                # with a larger max_content_size or more aggressive
+                # cleaning_level.
+                margin = self.browser_pre_check_byte_margin
+                if pre_size > self.max_content_size * margin:
                     raise TransportFailure(
-                        FetchErrorInfo("content_too_large", "rendered content exceeds maximum size", False)
+                        FetchErrorInfo(
+                            "content_too_large",
+                            "rendered content exceeds maximum size",
+                            True,
+                        )
                     )
                 html = await page.content()
 
@@ -431,7 +444,11 @@ class BrowserFetcher:
 
                 if len(html.encode("utf-8")) > self.max_content_size:
                     raise TransportFailure(
-                        FetchErrorInfo("content_too_large", "rendered content exceeds maximum size", False)
+                        FetchErrorInfo(
+                            "content_too_large",
+                            "rendered content exceeds maximum size",
+                            True,
+                        )
                     )
 
                 # ── optional screenshot capture ──

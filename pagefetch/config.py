@@ -89,6 +89,13 @@ class PageFetchConfig:
     proxy_geo: str | None = None
     raise_on_error: bool = False
     screenshot_max_bytes: int = 50 * 1024 * 1024
+    # Browser-mode renders the page first and then measures the resulting DOM.
+    # The char-length pre-check uses a multiplicative byte margin over the
+    # configured max_content_size to account for multi-byte UTF-8. The
+    # default of 1.5 mirrors the historical behaviour; lower values reject
+    # pages earlier (saving render time) at the cost of more frequent
+    # content_too_large errors on legitimate pages.
+    browser_pre_check_byte_margin: float = 1.5
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PageFetchConfig:
@@ -150,6 +157,7 @@ class PageFetchConfig:
             proxy_geo=flat.get("proxy_geo"),
             raise_on_error=flat.get("raise_on_error", False),
             screenshot_max_bytes=flat.get("screenshot_max_bytes", 50 * 1024 * 1024),
+            browser_pre_check_byte_margin=flat.get("browser_pre_check_byte_margin", 1.5),
         )
 
     @classmethod
@@ -181,6 +189,7 @@ class PageFetchConfig:
         proxy_geo: str | None = None,
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
+        browser_pre_check_byte_margin: float = 1.5,
     ) -> PageFetchConfig:
         if not isinstance(stealth_level, str) or stealth_level not in VALID_STEALTH_LEVELS:
             raise ValueError(f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}")
@@ -247,6 +256,13 @@ class PageFetchConfig:
             or screenshot_max_bytes <= 0
         ):
             raise ValueError("screenshot_max_bytes must be a positive integer")
+        if (
+            not isinstance(browser_pre_check_byte_margin, (int, float))
+            or isinstance(browser_pre_check_byte_margin, bool)
+            or not math.isfinite(browser_pre_check_byte_margin)
+            or browser_pre_check_byte_margin < 1.0
+        ):
+            raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
         if proxy_geo is not None:
             if not isinstance(proxy_geo, str) or proxy_geo not in GEO_MAP:
                 raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")
@@ -278,4 +294,5 @@ class PageFetchConfig:
             proxy_geo=proxy_geo.strip() if proxy_geo else None,
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
+            browser_pre_check_byte_margin=float(browser_pre_check_byte_margin),
         )
