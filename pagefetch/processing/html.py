@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from bs4 import BeautifulSoup
 
@@ -35,17 +35,23 @@ def process_html(
     response_headers: Mapping[str, str] | None = None,
     soup: BeautifulSoup | None = None,
     confidence: ConfidenceReport | None = None,
+    cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
 ) -> ProcessedHTML:
     """Extract a high-fidelity structured representation from HTML.
 
     *soup* and *confidence* avoid redundant parse/analysis when the caller
     already has a BeautifulSoup tree or ConfidenceReport from an earlier step.
+    *cleaning_level* selects how aggressively non-content DOM (cookie banners,
+    navigation, sidebars, comments) is removed before extraction. ``standard``
+    preserves the conservative behavior of earlier releases; ``minimal`` only
+    applies universally safe rules; ``maximum`` additionally strips navigation,
+    asides, site chrome, and explicit comments/share/related blocks.
     """
     raw_soup = soup or BeautifulSoup(html, "lxml")
     title, metadata, warnings = extract_metadata(raw_soup, base_url, response_headers)
     if confidence is None:
         confidence = analyze_html(html, soup=raw_soup)
-    cleaned = clean_html(raw_soup)
+    cleaned = clean_html(raw_soup, cleaning_level)
     links = extract_links(cleaned, base_url)
     images = extract_images(cleaned, base_url)
     markdown = html_to_markdown(cleaned, base_url)

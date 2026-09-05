@@ -277,8 +277,8 @@ async def test_extract_requires_running_client(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_extract_processing_version_bump_invalidates_old_cache(tmp_path, monkeypatch):
-    """An entry persisted under ``processing_version=3`` is treated as a miss
-    after the bump to v4 (the cache key changes)."""
+    """An entry persisted under ``processing_version=4`` is treated as a miss
+    after the bump to v5 (the cache key changes)."""
     import hashlib
 
     from pagefetch.cache import keys as cache_keys
@@ -288,7 +288,7 @@ async def test_extract_processing_version_bump_invalidates_old_cache(tmp_path, m
     settings = {"legacy": True}
     normalized = cache_keys.normalize_url(url)
 
-    # The current code path emits a v4 key for this input.
+    # The current code path emits a v5 key for this input.
     current_key = cache_keys.build_cache_key(
         url, mode="browser", proxy="none", settings=settings
     )
@@ -299,7 +299,7 @@ async def test_extract_processing_version_bump_invalidates_old_cache(tmp_path, m
                 "url": normalized,
                 "mode": "browser",
                 "proxy": "none",
-                "processing_version": 4,
+                "processing_version": 5,
                 "settings": settings,
             },
             sort_keys=True,
@@ -308,16 +308,16 @@ async def test_extract_processing_version_bump_invalidates_old_cache(tmp_path, m
         ).encode("utf-8")
     ).hexdigest()
 
-    # Simulate the legacy v3 key derivation: same payload except the
-    # ``processing_version`` field is set to ``3``. The hash MUST differ
-    # from the v4 key, otherwise an upgrade would silently reuse stale
+    # Simulate the legacy v4 key derivation: same payload except the
+    # ``processing_version`` field is set to ``4``. The hash MUST differ
+    # from the v5 key, otherwise an upgrade would silently reuse stale
     # cache entries.
     legacy_payload = json.dumps(
         {
             "url": normalized,
             "mode": "browser",
             "proxy": "none",
-            "processing_version": 3,
+            "processing_version": 4,
             "settings": settings,
         },
         sort_keys=True,
@@ -327,7 +327,7 @@ async def test_extract_processing_version_bump_invalidates_old_cache(tmp_path, m
     legacy_key = hashlib.sha256(legacy_payload.encode("utf-8")).hexdigest()
     assert legacy_key != current_key
 
-    # Sanity check: if the keys module is accidentally reverted to v3, the
+    # Sanity check: if the keys module is accidentally reverted to v4, the
     # "current" key recomputed through the public helper must equal the
     # legacy hash above — proving the bump is what invalidates entries.
     def _legacy_build_cache_key(url, *, mode, proxy, settings=None):
@@ -335,7 +335,7 @@ async def test_extract_processing_version_bump_invalidates_old_cache(tmp_path, m
             "url": cache_keys.normalize_url(url),
             "mode": mode,
             "proxy": proxy,
-            "processing_version": 3,
+            "processing_version": 4,
             "settings": settings or {},
         }
         raw = json.dumps(

@@ -91,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Align locale/timezone/lang with proxy exit country (ISO 3166-1 alpha-2, e.g. US, DE, TR)",
     )
+    parser.add_argument(
+        "--cleaning-level",
+        choices=("minimal", "standard", "maximum"),
+        default=argparse.SUPPRESS,
+        help="How aggressively to strip non-content DOM (default: standard)",
+    )
     return parser
 
 
@@ -166,6 +172,8 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         overrides["stealth_level"] = args.stealth_level
     if hasattr(args, "proxy_geo"):
         overrides["proxy_geo"] = args.proxy_geo
+    if hasattr(args, "cleaning_level"):
+        overrides["cleaning_level"] = args.cleaning_level
 
     if not overrides and not args.no_cache:
         return config
@@ -208,6 +216,7 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         ),
         stealth_level=overrides.get("stealth_level", config.stealth_level),
         proxy_geo=overrides.get("proxy_geo", config.proxy_geo),
+        cleaning_level=overrides.get("cleaning_level", config.cleaning_level),
         raise_on_error=config.raise_on_error,
     )
 
@@ -259,6 +268,7 @@ async def _run(args: argparse.Namespace) -> int:
         request_pacing=config.request_pacing,
         stealth_level=config.stealth_level,
         proxy_geo=config.proxy_geo,
+        cleaning_level=config.cleaning_level,
         raise_on_error=config.raise_on_error,
         screenshot_max_bytes=config.screenshot_max_bytes,
     ) as client:

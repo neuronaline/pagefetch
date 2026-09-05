@@ -185,3 +185,89 @@ def test_markdown_handles_spans_fences_and_image_title_fallback():
     assert "````python" in result.markdown
     assert "![Photo title](https://example.com/photo.png \"Photo title\")" in result.markdown
     assert "[Frame info](https://frames.test/info)" in result.markdown
+
+
+def test_processing_default_matches_explicit_standard():
+    """``cleaning_level`` defaults to ``standard`` and must not change output."""
+    base = process_html(RICH_HTML, "https://example.com/article")
+    explicit = process_html(
+        RICH_HTML, "https://example.com/article", cleaning_level="standard"
+    )
+    assert base.markdown == explicit.markdown
+    assert base.text == explicit.text
+    assert [l.url for l in base.links] == [l.url for l in explicit.links]
+
+
+def test_cleaning_levels_remove_different_subsets():
+    """Each level should remove a distinct superset of non-content blocks."""
+    minimal = process_html(RICH_HTML, "https://example.com/article", cleaning_level="minimal")
+    standard = process_html(
+        RICH_HTML, "https://example.com/article", cleaning_level="standard"
+    )
+    maximum = process_html(
+        RICH_HTML, "https://example.com/article", cleaning_level="maximum"
+    )
+
+    # ``standard`` and ``maximum`` drop cookie banners; ``minimal`` keeps it
+    # because only universally safe rules (display:none / hidden / 1x1) apply.
+    assert "Accept cookies" in minimal.text
+    assert "Accept cookies" not in standard.text
+    assert "Accept cookies" not in maximum.text
+
+    # The ``comments`` block is only removed at ``maximum``.
+    assert "Repeated user comment" in minimal.text
+    assert "Repeated user comment" in standard.text
+    assert "Repeated user comment" not in maximum.text
+
+    # Top-level ``<nav>`` is only removed at ``maximum``.
+    assert "Home" in minimal.text and "Home" in standard.text
+    assert "Home" not in maximum.text
+
+    # Article content must survive every level.
+    for result in (minimal, standard, maximum):
+        assert "# Example Article" in result.markdown
+        assert "![Hero]" in result.markdown
+        assert "```python" in result.markdown
+        assert "| Name | Value |" in result.markdown
+        assert "[Details](https://example.com/details)" in result.markdown
+
+
+def test_cleaning_level_rejects_unknown_value():
+    import pytest
+
+    with pytest.raises(ValueError):
+        process_html(RICH_HTML, "https://example.com/article", cleaning_level="magic")
+
+
+def test_standard_cleaning_catches_space_separated_cookie_banner():
+    """``class="cookie banner"`` (literal space) must still be removed at standard level."""
+    html = (
+        "<html><body>"
+        '<div class="cookie banner">Accept</div>'
+        "<p>Article body that survives cleaning.</p>"
+        "</body></html>"
+    )
+    result = process_html(html, "https://example.com/", cleaning_level="standard")
+    assert "Accept" not in result.text
+    assert "Article body" in result.text
+
+
+def test_maximum_cleaning_preserves_article_local_header_and_footer():
+    """Article-local <header>/<footer> (byline, tags) must survive at maximum level."""
+    html = (
+        "<html><body>"
+        "<nav><a href=\"/\">Home</a></nav>"
+        "<main><article>"
+        '<header class="article-meta">By Ada · 2026-01-02</header>'
+        "<h1>Example</h1>"
+        "<p>Body text that must survive.</p>"
+        '<footer class="article-tags">python, scraping</footer>'
+        "</article></main>"
+        "</body></html>"
+    )
+    result = process_html(html, "https://example.com/", cleaning_level="maximum")
+    assert "By Ada · 2026-01-02" in result.text
+    assert "python, scraping" in result.text
+    assert "Body text" in result.text
+    # Outside-article chrome still stripped.
+    assert "Home" not in result.text

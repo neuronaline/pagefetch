@@ -64,6 +64,7 @@ class PageFetch:
         *,
         mode: Literal["auto", "http", "browser"] = "auto",
         proxy: Literal["none", "decodo", "dataimpulse"] = "none",
+        cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
         http_concurrency: int = 10,
         browser_concurrency: int = 4,
         cache_enabled: bool = True,
@@ -90,6 +91,7 @@ class PageFetch:
         self.config = PageFetchConfig.build(
             mode=mode,
             proxy=proxy,
+            cleaning_level=cleaning_level,
             http_concurrency=http_concurrency,
             browser_concurrency=browser_concurrency,
             cache_enabled=cache_enabled,
@@ -305,6 +307,7 @@ class PageFetch:
                 ),
                 "block_images": self.config.block_images,
                 "block_level": self.config.block_level,
+                "cleaning_level": self.config.cleaning_level,
                 "confidence_threshold": self.config.confidence_threshold,
                 "humanize": self.config.humanize,
                 "max_redirects": self.config.max_redirects,
@@ -558,6 +561,7 @@ class PageFetch:
                 ),
                 "block_images": self.config.block_images,
                 "block_level": self.config.block_level,
+                "cleaning_level": self.config.cleaning_level,
                 "compact_structure": compact_structure,
                 "confidence_threshold": self.config.confidence_threshold,
                 "humanize": self.config.humanize,
@@ -1038,17 +1042,28 @@ class PageFetch:
         include_structure: bool = False,
         compact_structure: bool = False,
     ) -> FetchResult:
-        try:
-            processed = process_html(html, final_url, response_headers, soup=soup, confidence=confidence)
-        except Exception as exc:
-            raise TransportFailure(
-                FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
-            ) from exc
+        # Build the structural summary from the unmodified DOM before the
+        # processing pipeline mutates the soup. This avoids the cleaner
+        # dropping the very nodes the structural extractor needs to report
+        # without paying for an extra DOM copy.
         structure_source = soup if soup is not None else html
         limits = StructureLimits(compact=compact_structure) if compact_structure else None
         structure = (
             extract_structure(structure_source, final_url, limits=limits) if include_structure else None
         )
+        try:
+            processed = process_html(
+                html,
+                final_url,
+                response_headers,
+                soup=soup,
+                confidence=confidence,
+                cleaning_level=self.config.cleaning_level,
+            )
+        except Exception as exc:
+            raise TransportFailure(
+                FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
+            ) from exc
         return FetchResult(
             url=original_url,
             final_url=final_url,

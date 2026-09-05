@@ -16,6 +16,7 @@ from .utils.durations import parse_duration
 
 VALID_MODES = frozenset({"auto", "http", "browser"})
 VALID_PROXIES = frozenset({"none", "decodo", "dataimpulse"})
+VALID_CLEANING_LEVELS = frozenset({"minimal", "standard", "maximum"})
 VALID_BLOCK_LEVELS = frozenset({"minimal", "balanced", "aggressive"})
 VALID_SESSION_ROTATION = frozenset({"sticky", "rotate"})
 VALID_STEALTH_LEVELS = frozenset({"off", "balanced", "max"})
@@ -65,6 +66,7 @@ def _interpolate_env(value: Any) -> Any:
 class PageFetchConfig:
     mode: Literal["auto", "http", "browser"] = "auto"
     proxy: Literal["none", "decodo", "dataimpulse"] = "none"
+    cleaning_level: Literal["minimal", "standard", "maximum"] = "standard"
     http_concurrency: int = 10
     browser_concurrency: int = 4
     cache_enabled: bool = True
@@ -125,6 +127,7 @@ class PageFetchConfig:
         return cls.build(
             mode=flat.get("mode", "auto"),
             proxy=flat.get("proxy", "none"),
+            cleaning_level=flat.get("cleaning_level", "standard"),
             http_concurrency=flat.get("http_concurrency", 10),
             browser_concurrency=flat.get("browser_concurrency", 4),
             cache_enabled=flat.get("cache_enabled", True),
@@ -155,6 +158,7 @@ class PageFetchConfig:
         *,
         mode: Literal["auto", "http", "browser"] = "auto",
         proxy: Literal["none", "decodo", "dataimpulse"] = "none",
+        cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
         http_concurrency: int = 10,
         browser_concurrency: int = 4,
         cache_enabled: bool = True,
@@ -192,6 +196,8 @@ class PageFetchConfig:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
         if not isinstance(proxy, str) or proxy not in VALID_PROXIES:
             raise ValueError(f"proxy must be one of {sorted(VALID_PROXIES)}")
+        if not isinstance(cleaning_level, str) or cleaning_level not in VALID_CLEANING_LEVELS:
+            raise ValueError(f"cleaning_level must be one of {sorted(VALID_CLEANING_LEVELS)}")
         for name, value in {
             "http_concurrency": http_concurrency,
             "browser_concurrency": browser_concurrency,
@@ -249,6 +255,7 @@ class PageFetchConfig:
         return cls(
             mode=mode,
             proxy=proxy,
+            cleaning_level=cleaning_level,
             http_concurrency=http_concurrency,
             browser_concurrency=browser_concurrency,
             cache_enabled=cache_enabled,

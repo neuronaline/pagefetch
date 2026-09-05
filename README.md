@@ -112,6 +112,7 @@ country:
 | `request_pacing` | Fixed seconds of delay between browser requests (`0.0` = none). |
 | `accept_language` | Value sent as the `Accept-Language` header. |
 | `proxy_geo` | ISO 3166-1 alpha-2 country code (e.g. `"US"`, `"DE"`, `"TR"`); aligns locale, timezone, and `Accept-Language` with the exit country. |
+| `cleaning_level` | How aggressively non-content DOM is stripped before extraction: `"minimal"` (display:none / hidden / 1×1 pixels only), `"standard"` (default — also drops cookie banners, ad slots, tracking pixels), `"maximum"` (additionally removes nav, asides, site chrome, and explicit comments/share/related blocks). Article title, tables, code blocks, and images are preserved at every level. |
 
 ```python
 # Quiet, fast default for open sites
@@ -130,7 +131,7 @@ async with PageFetch(
 
 The CLI exposes every knob via `--stealth-level`, `--block-level`,
 `--humanize` / `--no-humanize`, `--session-rotation`, `--request-pacing`,
-`--accept-language`, and `--proxy-geo`.
+`--accept-language`, `--proxy-geo`, and `--cleaning-level`.
 
 ---
 

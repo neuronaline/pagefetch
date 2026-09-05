@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from .client import PageFetch
-from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
+from .config import VALID_CLEANING_LEVELS, VALID_MODES, VALID_PROXIES, PageFetchConfig
 from .models import FetchResult
 from .utils.rendering import render_results
 from .utils.urls import read_urls_from_file
@@ -304,6 +304,7 @@ def _settings_menu(settings: dict) -> None:
 
         mode = settings.get("mode") or "auto"
         proxy = settings.get("proxy") or "none"
+        cleaning_level = settings.get("cleaning_level") or "standard"
         fmt = settings.get("format", "markdown")
         cache_ttl = settings.get("cache_ttl") or "(config/default)"
         output = settings.get("output", "none")
@@ -329,6 +330,7 @@ def _settings_menu(settings: dict) -> None:
         print(f" 11. Debug logging       : {debug}")
         print(f" 12. Disable cache       : {no_cache}")
         print(f" 13. Config file (YAML)  : {config_file}")
+        print(f" 14. Cleaning level      : {cleaning_level}")
         print("  0. Back to main menu")
         print()
 
@@ -408,6 +410,14 @@ def _settings_menu(settings: dict) -> None:
         elif choice == "13":
             val = _prompt("  Config file path (leave empty for defaults)", config_file if config_file != "none" else "")
             settings["config_file"] = val if val else None
+        elif choice == "14":
+            print(f"\n  Options: {', '.join(sorted(VALID_CLEANING_LEVELS))}")
+            val = _prompt("  Cleaning level", cleaning_level)
+            if val in VALID_CLEANING_LEVELS:
+                settings["cleaning_level"] = val
+            else:
+                print(f"  Invalid cleaning level: {val}")
+                input("  Press Enter...")
 
 
 def _view_config(settings: dict) -> None:
@@ -422,15 +432,18 @@ def _view_config(settings: dict) -> None:
         config = PageFetchConfig.from_yaml(config_file)
         print(f"  Mode         : {config.mode}")
         print(f"  Proxy        : {config.proxy}")
+        print(f"  Cleaning     : {config.cleaning_level}")
     else:
         print("  Config file  : (defaults)")
 
     mode = settings.get("mode") or "auto"
     proxy = settings.get("proxy") or "none"
+    cleaning_level = settings.get("cleaning_level") or config.cleaning_level if config_file else "standard"
 
-    print(f"  Mode         : {mode}")
-    print(f"  Proxy        : {proxy}")
-    print(f"  Format       : {settings.get('format', 'markdown')}")
+    print(f"  Mode             : {mode}")
+    print(f"  Proxy            : {proxy}")
+    print(f"  Cleaning level   : {cleaning_level}")
+    print(f"  Format           : {settings.get('format', 'markdown')}")
     print(f"  Cache TTL    : {settings.get('cache_ttl', '24h')}")
     print(f"  Output file  : {settings.get('output', 'none')}")
     print(f"  Include HTML      : {'yes' if settings.get('include_html') else 'no'}")
@@ -455,12 +468,16 @@ def _init_client(settings: dict) -> PageFetch:
 
     mode = settings.get("mode") if settings.get("mode") is not None else config.mode
     proxy = settings.get("proxy") if settings.get("proxy") is not None else config.proxy
+    cleaning_level = (
+        settings.get("cleaning_level") if settings.get("cleaning_level") is not None else config.cleaning_level
+    )
     use_cache = settings.get("use_cache", config.cache_enabled)
     cache_ttl = settings.get("cache_ttl") or config.cache_ttl
 
     return PageFetch(
         mode=mode,
         proxy=proxy,
+        cleaning_level=cleaning_level,
         cache_enabled=use_cache,
         cache_ttl=cache_ttl,
         cache_path=config.cache_path,
@@ -497,6 +514,7 @@ _CLIENT_FINGERPRINT_KEYS = (
     "no_cache",
     "cache_ttl",
     "config_file",
+    "cleaning_level",
 )
 
 
@@ -529,6 +547,7 @@ def interactive_main() -> int:
         "mode": None,
         "proxy": None,
         "config_file": None,
+        "cleaning_level": None,
     }
 
     _apply_debug(settings)

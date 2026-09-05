@@ -14,6 +14,13 @@ mode: auto
 # content is usable or a browser fallback is needed.
 confidence_threshold: 0.80
 
+# How aggressively to strip non-content DOM before extraction.
+#   minimal  — only universally safe rules (display:none, hidden, 1×1 pixels)
+#   standard — also drops cookie banners, ad slots, tracking pixels (default)
+#   maximum  — additionally removes nav, asides, site chrome, and
+#              explicit comments / share / related blocks
+cleaning_level: standard
+
 # ── HTTP ────────────────────────────────────────────────────
 http_concurrency: 10
 http_timeout: 20.0          # seconds

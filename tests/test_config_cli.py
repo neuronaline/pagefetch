@@ -10,7 +10,16 @@ from pagefetch.interactive import _init_client
 from pagefetch.models import FetchResult
 
 
-@pytest.mark.parametrize("kwargs", [{"mode": "magic"}, {"proxy": "auto"}, {"http_concurrency": 0}, {"confidence_threshold": 2}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"mode": "magic"},
+        {"proxy": "auto"},
+        {"http_concurrency": 0},
+        {"confidence_threshold": 2},
+        {"cleaning_level": "magic"},
+    ],
+)
 def test_constructor_validates_immediately(kwargs):
     with pytest.raises(ValueError):
         PageFetch(**kwargs)
@@ -45,6 +54,47 @@ def test_stealth_preset_applies_to_python_api_and_cli():
         cli_config.request_pacing,
         cli_config.session_rotation,
     ) == (True, "balanced", 0.5, "rotate")
+
+
+def test_cleaning_level_round_trips_through_python_and_cli():
+    assert PageFetch(cleaning_level="maximum").config.cleaning_level == "maximum"
+    assert PageFetch(cleaning_level="minimal").config.cleaning_level == "minimal"
+    # Default is ``standard`` — matches the no-arg constructor.
+    assert PageFetch().config.cleaning_level == "standard"
+
+    args = build_parser().parse_args(
+        ["https://example.com", "--cleaning-level", "maximum"]
+    )
+    cli_config = _build_config(args)
+    assert cli_config.cleaning_level == "maximum"
+
+
+def test_cleaning_level_yaml_round_trip(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "mode: auto\nproxy: none\ncleaning_level: maximum\n",
+        encoding="utf-8",
+    )
+    config = _build_config(build_parser().parse_args(["https://example.com", "-c", str(path)]))
+    assert config.cleaning_level == "maximum"
+
+
+def test_cleaning_level_yaml_defaults_to_standard(tmp_path):
+    """A YAML file without ``cleaning_level`` must keep the ``standard`` default."""
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: auto\nproxy: none\n", encoding="utf-8")
+    config = _build_config(build_parser().parse_args(["https://example.com", "-c", str(path)]))
+    assert config.cleaning_level == "standard"
+
+
+def test_cleaning_level_yaml_rejects_unknown_value(tmp_path):
+    """An invalid ``cleaning_level`` in YAML must raise ``ValueError``."""
+    from pagefetch.config import PageFetchConfig
+
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: auto\nproxy: none\ncleaning_level: bogus\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        PageFetchConfig.from_yaml(path)
 
 
 def test_explicit_values_override_stealth_preset():
@@ -97,6 +147,7 @@ raise_on_error: true
             "mode": None,
             "proxy": None,
             "cache_ttl": None,
+            "cleaning_level": None,
         }
     )
     config = client.config
@@ -112,3 +163,41 @@ raise_on_error: true
     assert config.humanize is True
     assert config.session_rotation == "rotate"
     assert config.proxy_geo == "TR"
+
+
+def test_interactive_init_client_overrides_cleaning_level_from_settings():
+    client = _init_client(
+        {
+            "config_file": None,
+            "mode": None,
+            "proxy": None,
+            "cache_ttl": None,
+            "cleaning_level": "maximum",
+        }
+    )
+    assert client.config.cleaning_level == "maximum"
+
+
+def test_cleaning_level_segregates_cache_keys():
+    from pagefetch.cache import build_cache_key
+
+    base = {"accept_language": "en", "block_images": True, "block_level": None}
+    standard = build_cache_key(
+        "https://example.com/",
+        mode="auto",
+        proxy="none",
+        settings={**base, "cleaning_level": "standard"},
+    )
+    maximum = build_cache_key(
+        "https://example.com/",
+        mode="auto",
+        proxy="none",
+        settings={**base, "cleaning_level": "maximum"},
+    )
+    minimal = build_cache_key(
+        "https://example.com/",
+        mode="auto",
+        proxy="none",
+        settings={**base, "cleaning_level": "minimal"},
+    )
+    assert len({standard, maximum, minimal}) == 3
