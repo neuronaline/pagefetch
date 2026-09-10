@@ -125,9 +125,14 @@ class BrowserFetcher:
             # Auto-install camoufox + browser binary on first use so the
             # import and launch below do not fail with a "not installed"
             # error.  No-op when everything is already in place.
-            from ..bootstrap import auto_bootstrap_browser
+            from ..bootstrap import RuntimeBootstrapError, bootstrap_browser
 
-            auto_bootstrap_browser()
+            try:
+                await bootstrap_browser()
+            except RuntimeBootstrapError as exc:
+                raise TransportFailure(
+                    FetchErrorInfo("browser_bootstrap_error", str(exc), True, type(exc).__name__)
+                ) from exc
 
             try:
                 from camoufox.async_api import AsyncCamoufox
@@ -142,6 +147,10 @@ class BrowserFetcher:
                 }
                 if self.block_images:
                     options["block_images"] = True
+                    # Suppress the camoufox LeakWarning that fires when
+                    # block_images is enabled; the operator has explicitly
+                    # opted into the speed/footprint trade-off.
+                    options["i_know_what_im_doing"] = True
                 if self.geo_timezone:
                     options["timezone_id"] = self.geo_timezone
                 host_os = self._detect_os()

@@ -16,6 +16,8 @@ Quick start::
 from __future__ import annotations
 
 import logging
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 from .bootstrap import RuntimeBootstrapError, auto_bootstrap_browser, ensure_runtime_requirements
 from .client import PageFetch
@@ -43,6 +45,15 @@ logging.getLogger("pagefetch").addHandler(logging.NullHandler())
 # first browser use.  Call ensure_runtime_requirements() for an up-front
 # check without installation; call auto_bootstrap_browser() to force
 # installation at any point.
+
+# Single source of truth is ``pyproject.toml``. ``importlib.metadata`` is the
+# canonical lookup and works for installed wheels / sdists; the fallback keeps
+# ``pagefetch.__version__`` usable in source-checkout / editable environments
+# where the distribution metadata is not yet present.
+try:
+    __version__ = _pkg_version("pagefetch")
+except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
+    __version__ = "0.8.5"
 
 __all__ = [
     "FetchErrorInfo",

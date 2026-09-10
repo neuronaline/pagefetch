@@ -21,6 +21,10 @@ Perfect for **web scraping**, **content aggregation**, **LLM data pipelines**,
 **SEO analysis**, **archiving**, and any workflow that needs reliable page
 content without fighting bot detection.
 
+Supported environments: Windows 10/11 x64 and Ubuntu 22.04/24.04 x64 on
+Python 3.11–3.13. Browser mode relies on the corresponding upstream Camoufox
+artifact.
+
 ---
 
 ## Table of Contents
@@ -178,9 +182,10 @@ pip install ".[pdf]"
 pip install ".[all]"
 ```
 
-PageFetch never runs `pip` or downloads browser binaries implicitly. HTTP mode
-therefore works without Camoufox, while `auto` and `browser` users can provision
-the browser feature explicitly.
+HTTP mode works without Camoufox. On the first use of browser fallback or
+`browser` mode, PageFetch installs the optional browser package and runtime
+automatically (unless `PAGEFETCH_AUTO_INSTALL=0` is set). The commands above
+remain available when you want to provision the browser feature explicitly.
 
 ---
 
@@ -196,6 +201,7 @@ from pagefetch import PageFetch
 client = PageFetch(
     mode="auto",              # "auto" | "http" | "browser"
     proxy="none",             # "none" | "decodo" | "dataimpulse"
+    cleaning_level="standard", # "minimal" | "standard" | "maximum" — how aggressively to strip non-content DOM
     http_concurrency=10,      # Max parallel HTTP requests
     browser_concurrency=4,    # Max parallel browser instances
     cache_enabled=True,       # Enable SQLite disk cache
@@ -217,6 +223,7 @@ client = PageFetch(
     stealth_level="off",      # "off" | "balanced" | "max" preset (sets humanize, block_level, pacing, session_rotation)
     proxy_geo=None,           # ISO 3166-1 alpha-2 (e.g. "US", "DE") to align locale + Accept-Language
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
+    screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…); oversized captures are dropped
 )
 ```
 
@@ -280,6 +287,10 @@ Everything PageFetch ships in its top-level `pagefetch` namespace:
 Browser dependencies are auto-installed on first browser use. Call
 `ensure_runtime_requirements()` for an up-front check without installing,
 or `auto_bootstrap_browser()` to force installation at any point.
+
+Set `PAGEFETCH_AUTO_INSTALL=0` (also accepts `false`, `no`, or `off`) to
+disable automatic browser installation. In that case, install
+`pagefetch[browser]` and run `python -m camoufox fetch` before browser use.
 
 ---
 
@@ -561,6 +572,7 @@ at the HTTP response level before any processing pipeline runs.
 |---|---|---|---|
 | `mode` | `str` | `"auto"` | Fetch strategy: `"auto"`, `"http"`, or `"browser"` |
 | `proxy` | `str` | `"none"` | Proxy provider: `"none"`, `"decodo"`, or `"dataimpulse"` |
+| `cleaning_level` | `str` | `"standard"` | How aggressively to strip non-content DOM before extraction: `"minimal"`, `"standard"`, or `"maximum"` |
 | `http_concurrency` | `int` | `10` | Maximum concurrent HTTP connections |
 | `browser_concurrency` | `int` | `4` | Maximum concurrent browser instances |
 | `cache_enabled` | `bool` | `True` | Enable SQLite disk cache |

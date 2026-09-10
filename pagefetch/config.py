@@ -110,7 +110,7 @@ class PageFetchConfig:
         import yaml
 
         raw: dict[str, Any] = {}
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             raw = yaml.safe_load(fh) or {}
 
         resolved = _interpolate_env(raw)

@@ -70,7 +70,7 @@ def read_urls_from_file(path: str) -> list[str]:
     p = Path(path)
     if not p.is_file():
         raise FileNotFoundError(f"file not found: {path!r}")
-    return [line.strip() for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [line.strip() for line in p.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
 
 
 def registrable_host(url: str) -> str:

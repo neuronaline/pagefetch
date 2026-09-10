@@ -16,6 +16,17 @@ from .utils.rendering import render_results
 from .utils.urls import read_urls_from_file
 
 
+def _configure_unicode_streams() -> None:
+    """Use UTF-8 output where the active streams support reconfiguration."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8", errors="backslashreplace")
+            except (OSError, ValueError):
+                pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pagefetch", description="Fetch complete web page content")
     parser.add_argument("input", metavar="URL_OR_FILE")
@@ -318,6 +329,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_unicode_streams()
     args = build_parser().parse_args(argv)
     if args.debug:
         handler = logging.StreamHandler()

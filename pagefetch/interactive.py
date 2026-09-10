@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sys
 from pathlib import Path
 
 from .client import PageFetch
@@ -15,7 +17,12 @@ from .utils.urls import read_urls_from_file
 
 def _clear_screen() -> None:
     """Clear the terminal screen."""
-    print("\033[2J\033[H", end="")
+    if not sys.stdout.isatty():
+        return
+    if os.name == "nt":
+        os.system("cls")
+    else:
+        print("\033[2J\033[H", end="")
 
 
 def _banner() -> None:

@@ -48,7 +48,7 @@ proxy: none
 # ── Cache ───────────────────────────────────────────────────
 cache_enabled: true
 cache_ttl: 24h               # s, m, h, d  suffixes accepted
-cache_path: ~/.cache/pagefetch/cache.sqlite3
+# cache_path: ./pagefetch-cache.sqlite3  # default uses the native user cache directory
 
 # ── Error handling ──────────────────────────────────────────
 raise_on_error: false

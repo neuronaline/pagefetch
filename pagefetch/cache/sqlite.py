@@ -25,6 +25,7 @@ class SQLiteCache:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute(
             """
@@ -140,6 +141,17 @@ class SQLiteCache:
 
     async def close(self) -> None:
         if self._db is not None:
+            # Run a passive WAL checkpoint before closing so short-lived CLI
+            # invocations (separate processes) see the writes immediately
+            # instead of waiting for the next auto-checkpoint or connection
+            # close to flush the WAL back to the main DB. Without this the
+            # first read in a fresh process after a write can transiently
+            # miss the just-written row.
+            try:
+                await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                await self._db.commit()
+            except Exception:
+                # Never let a checkpoint failure mask a normal close.
+                pass
             await self._db.close()
             self._db = None
-
