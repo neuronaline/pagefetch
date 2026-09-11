@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import sys
 import time
@@ -21,6 +22,7 @@ from ..proxy.providers import ProxySettings
 from ..utils.urls import registrable_host
 from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
+from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
 
 # Resource-type blocking sets per stealth level.
 #   minimal:   only pure overhead (media, beacon) + websocket
@@ -97,6 +99,11 @@ class BrowserFetcher:
         self._active_count = 0
         self._active_lock = asyncio.Lock()
         self._needs_reset = False
+        # Linux runs the browser headed against an in-process Xvfb to avoid
+        # the fingerprinting tells of Firefox's native headless mode. On
+        # Windows/macOS we stay on native headless — no display server is
+        # needed there.
+        self._xvfb: XvfbDisplay | None = None
 
     def _detect_os(self) -> str | None:
         """Return a Camoufox-compatible OS string matching the host."""
@@ -137,8 +144,41 @@ class BrowserFetcher:
             try:
                 from camoufox.async_api import AsyncCamoufox
 
+                host_os = self._detect_os()
+                # Linux: headed against an in-process Xvfb. Other platforms:
+                # Firefox's native headless (no display server available).
+                use_xvfb = host_os == "linux"
+                if use_xvfb:
+                    if self._xvfb is None or not self._xvfb.is_running:
+                        try:
+                            xvfb = XvfbDisplay()
+                            xvfb.start()
+                        except XvfbNotFound as exc:
+                            raise TransportFailure(
+                                FetchErrorInfo(
+                                    "xvfb_missing",
+                                    str(exc),
+                                    False,
+                                    "XvfbNotFound",
+                                )
+                            ) from exc
+                        except XvfbLaunchError as exc:
+                            raise TransportFailure(
+                                FetchErrorInfo(
+                                    "xvfb_launch_error",
+                                    str(exc),
+                                    True,
+                                    "XvfbLaunchError",
+                                )
+                            ) from exc
+                        self._xvfb = xvfb
+                    # AsyncCamoufox spawns Firefox as a child process and
+                    # inherits ``os.environ`` at fork time; setting DISPLAY
+                    # right before launch is the standard X11 wiring.
+                    os.environ["DISPLAY"] = self._xvfb.display
+
                 options: dict[str, Any] = {
-                    "headless": True,
+                    "headless": not use_xvfb,
                     "humanize": self.humanize,
                     "enable_cache": True,
                     "block_webrtc": True,
@@ -153,7 +193,6 @@ class BrowserFetcher:
                     options["i_know_what_im_doing"] = True
                 if self.geo_timezone:
                     options["timezone_id"] = self.geo_timezone
-                host_os = self._detect_os()
                 if host_os is not None:
                     options["os"] = host_os
                 browser_proxy = self.proxy.browser_config()
@@ -590,3 +629,6 @@ class BrowserFetcher:
             finally:
                 self._manager = None
                 self._browser = None
+        if self._xvfb is not None:
+            self._xvfb.stop()
+            self._xvfb = None

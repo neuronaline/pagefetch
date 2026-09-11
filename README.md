@@ -137,6 +137,21 @@ The CLI exposes every knob via `--stealth-level`, `--block-level`,
 `--humanize` / `--no-humanize`, `--session-rotation`, `--request-pacing`,
 `--accept-language`, `--proxy-geo`, and `--cleaning-level`.
 
+### Platform-aware headless mode
+
+Camoufox launches in a different mode per OS so the fingerprint stays
+realistic on every host:
+
+- **Linux** — `headless=False` against an in-process `Xvfb`. The browser
+  renders a real window into the virtual display, avoiding the
+  fingerprinting tells that come with Firefox's `--headless` flag.
+- **Windows / macOS** — Firefox's native `headless=True`. No display server
+  is required.
+
+On Linux, `Xvfb` must be installed (e.g. `apt install xvfb` on Debian/Ubuntu,
+`dnf install xorg-x11-server-Xvfb` on Fedora/RHEL). When the binary is
+missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
+
 ---
 
 ## How It Works

@@ -647,3 +647,217 @@ async def test_concurrent_close_does_not_hang_when_first_teardown_fails(tmp_path
     finally:
         blocker.set()
         await client.aclose() if hasattr(client, "aclose") else None
+
+
+# ---------------------------------------------------------------------------
+# Virtual display (Xvfb) + platform-aware headless decision
+# ---------------------------------------------------------------------------
+
+
+def test_xvfb_start_reports_missing_binary(monkeypatch):
+    """``XvfbDisplay.start()`` raises XvfbNotFound when ``Xvfb`` is not on PATH."""
+    import shutil
+
+    from pagefetch.fetching.virtual_display import XvfbDisplay, XvfbNotFound
+
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+    with pytest.raises(XvfbNotFound):
+        XvfbDisplay().start()
+
+
+def test_xvfb_display_free_respects_lockfile(tmp_path, monkeypatch):
+    """A stale ``/tmp/.X{n}-lock`` file marks the display as occupied."""
+    from pathlib import Path
+
+    from pagefetch.fetching.virtual_display import XvfbDisplay
+
+    # Make the helper look at our tmp_path instead of the real /tmp.
+    class _FakePath(type(Path())):
+        def __new__(cls, *args, **kwargs):  # noqa: D401 - thin wrapper
+            return Path(*args, **kwargs)
+
+    real_path = Path
+
+    def _patched(name):
+        return tmp_path / real_path(name).name
+
+    monkeypatch.setattr(
+        "pagefetch.fetching.virtual_display.Path",
+        _patched,
+    )
+    (tmp_path / ".X123-lock").write_text("")
+    assert XvfbDisplay._is_display_free(123) is False
+
+
+@pytest.mark.skipif(
+    __import__("shutil").which("Xvfb") is None,
+    reason="Xvfb binary is not installed on this host",
+)
+def test_xvfb_lifecycle_starts_and_stops():
+    """End-to-end: Xvfb writes its lock file and ``stop()`` removes the process."""
+    from pathlib import Path
+
+    from pagefetch.fetching.virtual_display import XvfbDisplay
+
+    xvfb = XvfbDisplay(width=320, height=240)
+    display = xvfb.start()
+    try:
+        assert xvfb.is_running
+        assert display.startswith(":")
+        num = int(display.lstrip(":"))
+        # The server is up iff it has claimed its lock file.
+        assert Path(f"/tmp/.X{num}-lock").exists()
+    finally:
+        xvfb.stop()
+    assert not xvfb.is_running
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [
+        ("win32", "windows"),
+        ("darwin", "macos"),
+        ("linux", "linux"),
+        ("linux2", "linux"),
+    ],
+)
+def test_browser_fetcher_detect_os_mapping(platform, expected, monkeypatch):
+    """``_detect_os`` maps ``sys.platform`` to a Camoufox ``os`` string."""
+    from pagefetch.fetching import browser as browser_mod
+
+    monkeypatch.setattr(browser_mod.sys, "platform", platform)
+    fetcher = browser_mod.BrowserFetcher.__new__(browser_mod.BrowserFetcher)
+    assert fetcher._detect_os() == expected
+
+
+@pytest.mark.asyncio
+async def test_browser_fetcher_linux_spawns_xvfb_and_heads_browser(monkeypatch):
+    """Linux path: Xvfb starts, DISPLAY is exported, ``headless=False``."""
+    import os
+    import sys
+    import types
+    from unittest.mock import MagicMock
+
+    from pagefetch import bootstrap as bootstrap_mod
+    from pagefetch.fetching import browser as browser_mod
+
+    monkeypatch.setattr(browser_mod.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+
+    started: list[object] = []
+
+    class _FakeXvfb:
+        display = ":123"
+        is_running = True
+
+        def start(self):
+            started.append(self)
+            return self.display
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(browser_mod, "XvfbDisplay", _FakeXvfb)
+
+    captured: dict = {}
+
+    class _FakeCamoufox:
+        def __init__(self, **opts):
+            captured.update(opts)
+
+        async def __aenter__(self):
+            return "fake-browser"
+
+        async def __aexit__(self, *exc):
+            return False
+
+    fake_async_api = types.SimpleNamespace(AsyncCamoufox=_FakeCamoufox)
+    monkeypatch.setitem(sys.modules, "camoufox", types.ModuleType("camoufox"))
+    monkeypatch.setitem(sys.modules, "camoufox.async_api", fake_async_api)
+
+    async def _no_bootstrap():
+        return None
+
+    monkeypatch.setattr(bootstrap_mod, "bootstrap_browser", _no_bootstrap)
+
+    proxy = MagicMock()
+    proxy.browser_config.return_value = None
+
+    fetcher = browser_mod.BrowserFetcher(
+        semaphore=__import__("asyncio").Semaphore(1),
+        timeout=30.0,
+        retries=0,
+        proxy=proxy,
+        max_content_size=1_000_000,
+    )
+    try:
+        await fetcher.start()
+        assert len(started) == 1
+        assert captured["headless"] is False
+        assert os.environ.get("DISPLAY") == ":123"
+        assert captured["os"] == "linux"
+    finally:
+        await fetcher.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_fetcher_windows_keeps_native_headless(monkeypatch):
+    """Windows path: no Xvfb, ``headless=True`` is preserved."""
+    import sys
+    import types
+    from unittest.mock import MagicMock
+
+    from pagefetch import bootstrap as bootstrap_mod
+    from pagefetch.fetching import browser as browser_mod
+
+    monkeypatch.setattr(browser_mod.sys, "platform", "win32")
+
+    spawn_attempts: list[object] = []
+
+    class _ShouldNotStart:
+        def __init__(self):
+            spawn_attempts.append(self)
+
+        def start(self):  # pragma: no cover - defensive
+            raise AssertionError("XvfbDisplay must not be constructed on Windows")
+
+    monkeypatch.setattr(browser_mod, "XvfbDisplay", _ShouldNotStart)
+
+    captured: dict = {}
+
+    class _FakeCamoufox:
+        def __init__(self, **opts):
+            captured.update(opts)
+
+        async def __aenter__(self):
+            return "fake-browser"
+
+        async def __aexit__(self, *exc):
+            return False
+
+    fake_async_api = types.SimpleNamespace(AsyncCamoufox=_FakeCamoufox)
+    monkeypatch.setitem(sys.modules, "camoufox", types.ModuleType("camoufox"))
+    monkeypatch.setitem(sys.modules, "camoufox.async_api", fake_async_api)
+
+    async def _no_bootstrap():
+        return None
+
+    monkeypatch.setattr(bootstrap_mod, "bootstrap_browser", _no_bootstrap)
+
+    proxy = MagicMock()
+    proxy.browser_config.return_value = None
+
+    fetcher = browser_mod.BrowserFetcher(
+        semaphore=__import__("asyncio").Semaphore(1),
+        timeout=30.0,
+        retries=0,
+        proxy=proxy,
+        max_content_size=1_000_000,
+    )
+    try:
+        await fetcher.start()
+        assert spawn_attempts == []
+        assert captured["headless"] is True
+        assert captured["os"] == "windows"
+    finally:
+        await fetcher.close()
