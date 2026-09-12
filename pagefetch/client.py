@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import random
 import time
 from collections import OrderedDict
@@ -20,7 +21,7 @@ from bs4 import BeautifulSoup
 from .cache import SQLiteCache, build_cache_key
 from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
 from .constants import (
-    _UA_POOL,
+    _UA_POOL_BY_OS,
     BLOCKED_STATUS_CODES,
     BROWSER_HEADERS,
     GEO_MAP,
@@ -49,6 +50,16 @@ from .utils.durations import parse_duration
 from .utils.urls import normalize_url, registrable_host, validate_url
 
 logger = logging.getLogger("pagefetch")
+
+# Detect the host platform once at import time so HTTP requests and the
+# browser fallback share the same OS signature (mixed-OS fingerprints
+# from the same IP are a known Cloudflare/Akamai bot-detection trigger).
+if sys.platform == "win32":
+    _HOST_OS = "windows"
+elif sys.platform == "darwin":
+    _HOST_OS = "macos"
+else:
+    _HOST_OS = "linux"
 
 
 class PageFetch:
@@ -992,8 +1003,12 @@ class PageFetch:
     def _headers_for_url(self, url: str) -> dict[str, str]:
         headers = dict(BROWSER_HEADERS)
         domain = urlsplit(url).hostname or url
-        pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(_UA_POOL)
-        headers["User-Agent"] = _UA_POOL[pool_idx]
+        # Pick the User-Agent from the pool matching the host OS so outgoing
+        # HTTP requests declare an OS consistent with the runtime; the browser
+        # fallback sets its own UA independently of these headers.
+        pool = _UA_POOL_BY_OS[_HOST_OS]
+        pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(pool)
+        headers["User-Agent"] = pool[pool_idx]
         if self.config.proxy_geo:
             headers["Accept-Language"] = GEO_MAP[self.config.proxy_geo]["accept_language"]
         else:

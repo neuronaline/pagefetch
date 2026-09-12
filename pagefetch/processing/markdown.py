@@ -86,7 +86,14 @@ class MarkdownConverter:
             if not source:
                 return node.get("alt", "")
             alt = str(node.get("alt") or node.get("title") or "").replace("]", "\\]")
-            title = f' "{str(node["title"]).replace(chr(34), "&quot;")}"' if node.get("title") else ""
+            title_value = node.get("title")
+            if title_value:
+                # Markdown titles are double-quoted; backslash-escape any
+                # embedded quote so it does not terminate the title early.
+                safe_title = str(title_value).replace('"', '\\"')
+                title = f' "{safe_title}"'
+            else:
+                title = ""
             return f"![{alt}]({urljoin(self.base_url, str(source))}{title})"
         if name == "iframe":
             source = node.get("src")
@@ -194,9 +201,12 @@ class MarkdownConverter:
             return ""
         width = max(len(row) for row in rows)
         rows = [row + [""] * (width - len(row)) for row in rows]
-        if header_index is None:
-            rows.insert(0, ["" for _ in range(width)])
-        elif header_index != 0:
+        # GFM tables treat the row immediately before the separator as the
+        # header, and the separator is unconditionally inserted at position 1
+        # below.  When no <th> row exists, the first data row already
+        # occupies that slot, so no reordering is needed.  When a <th> row
+        # is found past index 0, hoist it to the top.
+        if header_index is not None and header_index != 0:
             rows.insert(0, rows.pop(header_index))
         output = ["| " + " | ".join(row) + " |" for row in rows]
         output.insert(1, "| " + " | ".join(["---"] * width) + " |")

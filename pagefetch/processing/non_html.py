@@ -50,16 +50,26 @@ def process_pdf(content: bytes) -> ProcessedDocument:
 
 
 def process_xml(content: bytes, encoding: str | None = None) -> ProcessedDocument:
-    """Parse XML safely and retain its hierarchy in a fenced representation.
+    """Parse XML and retain its hierarchy in a fenced representation.
 
-    Uses strict XML parsing (``recover=False``).  Malformed XML – for
-    example documents with unbalanced tags, invalid characters, or
-    structural errors – raises ``lxml.etree.XMLSyntaxError`` rather
-    than attempting best-effort recovery.  This is a deliberate choice
-    to surface data-quality issues early.
+    Tries a strict parser first so well-formed documents surface no
+    warnings.  When strict parsing fails (common for RSS feeds and
+    sitemap.xml files with stray entities, unbalanced tags, or other
+    real-world issues), the function falls back to lxml's recovery
+    mode and surfaces a warning instead of raising.
     """
-    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
-    root = etree.fromstring(content, parser=parser)
+    strict_parser = etree.XMLParser(
+        resolve_entities=False, no_network=True, recover=False
+    )
+    warnings: list[str] = []
+    try:
+        root = etree.fromstring(content, parser=strict_parser)
+    except etree.XMLSyntaxError:
+        lenient_parser = etree.XMLParser(
+            resolve_entities=False, no_network=True, recover=True
+        )
+        root = etree.fromstring(content, parser=lenient_parser)
+        warnings.append("Malformed XML parsed using recovery mode.")
     pretty = etree.tostring(root, encoding="unicode", pretty_print=True)
     text_parts = [part.strip() for part in root.itertext() if part.strip()]
     title = root.get("title") or root.tag.split("}")[-1]
@@ -68,7 +78,7 @@ def process_xml(content: bytes, encoding: str | None = None) -> ProcessedDocumen
         markdown=f"```xml\n{pretty.strip()}\n```",
         text="\n".join(text_parts),
         metadata={"root_element": root.tag, "encoding": encoding},
-        warnings=[],
+        warnings=warnings,
     )
 
 

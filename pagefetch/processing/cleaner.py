@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy as _copy
 import re
 from typing import Literal
 
@@ -39,7 +40,11 @@ def clean_html(
     """
     if cleaning_level not in _VALID_CLEANING_LEVELS:
         raise ValueError(f"cleaning_level must be one of {sorted(_VALID_CLEANING_LEVELS)}")
-    soup = html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml")
+    # Work on a copy so the caller's BeautifulSoup is never mutated by
+    # ``decompose()`` side effects.  BeautifulSoup implements ``__copy__`` to
+    # walk the full subtree and produce a disconnected but fully independent
+    # tree, which is exactly the contract we need.
+    soup = _copy.copy(html) if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml")
 
     # Build a visible-text snapshot before changing the tree. This lets the
     # noscript rule distinguish a fallback that is already rendered elsewhere
@@ -63,16 +68,25 @@ def clean_html(
             continue
         style = str(tag.get("style", "")).replace(" ", "").lower()
         hidden = tag.has_attr("hidden") or "display:none" in style or "visibility:hidden" in style
-        text_length = len(tag.get_text(" ", strip=True))
-        aria_hidden = str(tag.get("aria-hidden", "")).lower() == "true" and text_length < 200
-        classes = " ".join(tag.get("class", []))
-        identity = f"{tag.get('id', '')} {classes}"
         tiny_image = tag.name == "img" and str(tag.get("width")) == "1" and str(tag.get("height")) == "1"
         common_noise = hidden or tiny_image
-        standard_noise = aria_hidden or (
-            _NOISE_RE.search(identity) is not None and text_length < 500
-        )
-        if common_noise or (cleaning_level != "minimal" and standard_noise):
+        # text_length requires traversing the whole subtree, which makes the
+        # loop O(N * D) (effectively O(N^2) on nested trees).  Only run it
+        # when the tag actually looks suspicious: either it carries an
+        # aria-hidden hint or its class/id matches the noise regex.  Standard
+        # body tags without any of those signals skip the text scan entirely.
+        aria_hidden_attr = str(tag.get("aria-hidden", "")).lower() == "true"
+        classes = " ".join(tag.get("class", []))
+        identity = f"{tag.get('id', '')} {classes}"
+        matches_noise = _NOISE_RE.search(identity) is not None
+        standard_noise = False
+        if cleaning_level != "minimal" and (aria_hidden_attr or matches_noise):
+            text_length = len(tag.get_text(" ", strip=True))
+            if aria_hidden_attr:
+                standard_noise = text_length < 200
+            else:
+                standard_noise = text_length < 500
+        if common_noise or standard_noise:
             tag.decompose()
 
     if cleaning_level == "maximum":
