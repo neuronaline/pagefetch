@@ -349,19 +349,26 @@ class FetchResult:
 ```python
 # JSON output (HTML, structure, and screenshot excluded by default for compactness)
 print(result.json(indent=2))
-print(result.json(include_html=True))          # Include raw HTML
-print(result.json(include_structure=True))     # Include PageStructure summary
-print(result.json(include_screenshot=True))    # Include base64-encoded screenshot
+print(result.json(include_html=True))                    # Include raw HTML
+print(result.json(include_structure=True))               # Include PageStructure summary
+print(result.json(include_structure=True,                # Trimmed structure payload for LLM consumers
+                  compact_structure=True))
+print(result.json(include_screenshot=True))              # Include base64-encoded screenshot
 
 # Python dict
 data = result.to_dict()
 data = result.to_dict(include_html=True)
 data = result.to_dict(include_structure=True)
+data = result.to_dict(include_structure=True, compact_structure=True)
 data = result.to_dict(include_screenshot=True)
 
 # Reconstruct from cached JSON
 reconstructed = FetchResult.from_dict(data)
 ```
+
+> **Note:** `compact_structure=True` is inspection-only — inline `<style>` / `<script>`
+> previews are returned as `{length, preview}` and the lossy payload cannot be
+> reconstructed with `FetchResult.from_dict`.
 
 ### Extraction (RAW HTML, Structure, Screenshot)
 
@@ -394,8 +401,7 @@ captures the initial visible area, `screenshot="full"` captures the
 entire scrollable page. Use `--screenshot-format=jpeg` (or
 `screenshot_format="jpeg"` in Python) to compress full-page captures.
 
-The structural summary is identical to the one `fetch(extract_structure=True)`
-used to return:
+The structural summary produced by `extract()` includes:
 
 - A nested DOM tree with filtered attributes, short direct-text previews, a
   compact selector, a deterministic CSS path, and a verified
@@ -488,6 +494,7 @@ CLI arguments map directly to the Python API:
 | `--request-pacing SECONDS` | `request_pacing` |
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
 | `--proxy-geo CC` | `proxy_geo` |
+| `--cleaning-level {minimal,standard,maximum}` | `cleaning_level` |
 | `--include-html` | `FetchResult.json(include_html=…)` |
 | `--screenshot {none,viewport,full}` | `PageFetch.extract(screenshot=…)` |
 | `--screenshot-format {png,jpeg}` | `PageFetch.extract(screenshot_format=…)` |
@@ -610,6 +617,7 @@ at the HTTP response level before any processing pipeline runs.
 | `proxy_geo` | `str \| None` | `None` | ISO 3166-1 alpha-2 (e.g. `"US"`, `"DE"`) to align locale/timezone/Accept-Language with proxy exit country |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
 | `screenshot_max_bytes` | `int` | `50 MiB` | Maximum bytes for an `extract(screenshot=…)` capture; oversized screenshots are discarded with a warning |
+| `browser_pre_check_byte_margin` | `float` | `1.5` | Multiplicative byte margin applied to `max_content_size` for the browser pre-render size check; must be ≥ 1.0 — lower values reject pages earlier (saving render time) but raise more `content_too_large` errors on legitimate pages |
 
 ---
 
