@@ -23,11 +23,10 @@ _FETCH_TIMEOUT = 300
 
 # Single source of truth for the Camoufox pip spec used by the auto-install
 # path. This MUST stay in lockstep with the ``browser`` extra defined in
-# ``pyproject.toml`` (see ``tests/test_critical.py::test_bootstrap_spec_*``).
-# Note: ``pip install`` resolves and executes arbitrary wheel code from PyPI
-# in the host Python environment with full user privileges; the spec here is a
-# trust boundary. Set ``PAGEFETCH_AUTO_INSTALL=0`` to disable this path
-# entirely and require an explicit ``pip install pagefetch[browser]``.
+# ``pyproject.toml``. ``pip install`` runs arbitrary PyPI-provided code in the
+# host Python environment with full user privileges; the spec here is a trust
+# boundary. Set ``PAGEFETCH_AUTO_INSTALL=0`` to disable this path entirely
+# and require an explicit ``pip install pagefetch[browser]``.
 _CAMOUFOX_SPEC = "camoufox>=0.5.6,<1"
 
 
@@ -154,17 +153,3 @@ async def bootstrap_browser() -> None:
             )
         return
     await asyncio.to_thread(_install_browser_sync)
-
-
-def install_camoufox_browser() -> None:
-    """Explicitly download the Camoufox binary for callers that request it."""
-    ensure_runtime_requirements(needs_browser=True)
-    try:
-        from camoufox.pkgman import camoufox_path
-
-        camoufox_path(download_if_missing=True)
-    except Exception as exc:
-        raise RuntimeBootstrapError(
-            "Camoufox could not install its browser runtime. "
-            "Run 'python -m camoufox fetch' for diagnostic output."
-        ) from exc

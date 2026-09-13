@@ -37,11 +37,18 @@ def clean_html(
     the conservative cookie/ad/tracking cleanup used by earlier releases.
     ``maximum`` additionally removes navigation, sidebars, site chrome, and
     blocks explicitly marked as comments, sharing, or related content.
+
+    .. note::
+
+        ``clean_html`` never mutates its input. When ``html`` is a
+        :class:`BeautifulSoup`, an independent copy is made (via BeautifulSoup's
+        ``__copy__``) before any ``decompose()`` runs. Callers may safely reuse
+        the original tree after cleaning.
     """
     if cleaning_level not in _VALID_CLEANING_LEVELS:
         raise ValueError(f"cleaning_level must be one of {sorted(_VALID_CLEANING_LEVELS)}")
     # Work on a copy so the caller's BeautifulSoup is never mutated by
-    # ``decompose()`` side effects.  BeautifulSoup implements ``__copy__`` to
+    # ``decompose()`` side effects. BeautifulSoup implements ``__copy__`` to
     # walk the full subtree and produce a disconnected but fully independent
     # tree, which is exactly the contract we need.
     soup = _copy.copy(html) if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml")

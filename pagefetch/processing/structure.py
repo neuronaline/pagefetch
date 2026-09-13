@@ -34,6 +34,8 @@ _DEFAULT_MAX_DEPTH = 12
 _DEFAULT_MAX_NODES = 800
 _DEFAULT_TEXT_PREVIEW = 120
 _DEFAULT_INLINE_SOURCE_LIMIT = 4_096
+_DEFAULT_MAX_ASSET_ITEMS = 100
+_DEFAULT_MAX_ASSET_BYTES = 64 * 1024
 
 # Attribute whitelist used in compact mode to keep the tree payload small.
 # We keep the selectors' building blocks (``id``/``class``) plus the fields an
@@ -84,7 +86,46 @@ class StructureLimits:
     max_nodes: int = _DEFAULT_MAX_NODES
     text_preview: int = _DEFAULT_TEXT_PREVIEW
     inline_source_limit: int = _DEFAULT_INLINE_SOURCE_LIMIT
+    max_asset_items: int = _DEFAULT_MAX_ASSET_ITEMS
+    max_asset_bytes: int = _DEFAULT_MAX_ASSET_BYTES
     compact: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("max_depth", "max_nodes", "text_preview", "inline_source_limit", "max_asset_items", "max_asset_bytes"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+
+@dataclass(slots=True)
+class _AssetBudget:
+    items_left: int
+    bytes_left: int
+    truncated: bool = False
+
+    def reserve_item(self) -> bool:
+        if self.items_left <= 0:
+            self.truncated = True
+            return False
+        self.items_left -= 1
+        return True
+
+    def content(self, text: str, per_item_limit: int) -> tuple[str, bool]:
+        # Cap by *per_item_limit* and the remaining budget in one shot, then
+        # decode the truncated byte slice so the result is always on a valid
+        # UTF-8 character boundary (cheaper and safer than the previous
+        # char-by-char binary search).
+        limit = min(per_item_limit, self.bytes_left)
+        encoded = text.encode("utf-8", errors="replace")
+        truncated = len(encoded) > limit
+        if truncated:
+            encoded = encoded[:limit]
+            content = encoded.decode("utf-8", errors="ignore")
+        else:
+            content = text
+        self.bytes_left -= len(encoded)
+        self.truncated = self.truncated or truncated
+        return content, truncated
 
 
 def extract_structure(
@@ -110,10 +151,11 @@ def extract_structure(
 
     root, node_count, truncated = _walk(soup, limits=limits)
 
-    stylesheets, inline_styles = _collect_styles(soup, base_url, limits=limits)
-    scripts, inline_scripts = _collect_scripts(soup, base_url, limits=limits)
+    budget = _AssetBudget(limits.max_asset_items, limits.max_asset_bytes)
+    stylesheets, inline_styles = _collect_styles(soup, base_url, limits=limits, budget=budget)
+    scripts, inline_scripts = _collect_scripts(soup, base_url, limits=limits, budget=budget)
 
-    truncated = truncated or any(item.truncated for item in inline_styles) or any(
+    truncated = budget.truncated or truncated or any(item.truncated for item in inline_styles) or any(
         item.truncated for item in inline_scripts
     )
 
@@ -184,6 +226,7 @@ def _describe(
     else:
         unique_selector = _unique_selector(tag, selector, path)
     children: list[StructureNode] = []
+    has_element_children = any(isinstance(child, Tag) for child in tag.children)
     if depth + 1 < limits.max_depth and counters[0] < limits.max_nodes:
         for child in tag.children:
             if not isinstance(child, Tag):
@@ -210,7 +253,7 @@ def _describe(
         path=path,
         unique_selector=unique_selector,
     )
-    if depth + 1 >= limits.max_depth:
+    if depth + 1 >= limits.max_depth and has_element_children:
         truncated = True
     return node, truncated
 
@@ -259,7 +302,7 @@ def _filtered_attrs(tag: Tag, *, compact: bool = False) -> dict[str, str]:
     for key, value in tag.attrs.items():
         if key.startswith("on") or key in _ATTR_BLACKLIST:
             continue
-        if compact and key not in _COMPACT_ATTR_WHITELIST:
+        if compact and key not in _COMPACT_ATTR_WHITELIST and not key.startswith("aria-"):
             continue
         attrs[str(key)] = _stringify(value)
     return attrs
@@ -338,6 +381,7 @@ def _collect_styles(
     base_url: str | None,
     *,
     limits: StructureLimits,
+    budget: _AssetBudget,
 ) -> tuple[list[StylesheetInfo], list[InlineStylesheet]]:
     stylesheets: list[StylesheetInfo] = []
     inline_styles: list[InlineStylesheet] = []
@@ -350,6 +394,8 @@ def _collect_styles(
             href = tag.get("href")
             if not href:
                 continue
+            if not budget.reserve_item():
+                break
             url = urljoin(base_url, str(href)) if base_url else str(href)
             stylesheets.append(
                 StylesheetInfo(
@@ -360,11 +406,13 @@ def _collect_styles(
                 )
             )
         else:
-            content = _bounded_text(tag, limits.inline_source_limit)
+            if not budget.reserve_item():
+                break
+            content, truncated = budget.content(_full_text(tag), limits.inline_source_limit)
             inline_styles.append(
                 InlineStylesheet(
                     content=content,
-                    truncated=len(_full_text(tag)) > limits.inline_source_limit,
+                    truncated=truncated,
                 )
             )
     return stylesheets, inline_styles
@@ -375,10 +423,13 @@ def _collect_scripts(
     base_url: str | None,
     *,
     limits: StructureLimits,
+    budget: _AssetBudget,
 ) -> tuple[list[ScriptInfo], list[InlineScript]]:
     scripts: list[ScriptInfo] = []
     inline_scripts: list[InlineScript] = []
     for tag in soup.find_all("script"):
+        if not budget.reserve_item():
+            break
         src = tag.get("src")
         if src:
             url = urljoin(base_url, str(src)) if base_url else str(src)
@@ -393,22 +444,15 @@ def _collect_scripts(
                 )
             )
             continue
-        content = _bounded_text(tag, limits.inline_source_limit)
+        content, truncated = budget.content(_full_text(tag), limits.inline_source_limit)
         inline_scripts.append(
             InlineScript(
                 content=content,
-                truncated=len(_full_text(tag)) > limits.inline_source_limit,
+                truncated=truncated,
                 type=str(tag.get("type")) if tag.get("type") else None,
             )
         )
     return scripts, inline_scripts
-
-
-def _bounded_text(tag: Tag, limit: int) -> str:
-    text = _full_text(tag)
-    if len(text) <= limit:
-        return text
-    return text[:limit]
 
 
 def _full_text(tag: Tag) -> str:

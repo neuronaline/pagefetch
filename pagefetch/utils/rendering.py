@@ -40,11 +40,10 @@ def render_results(
         # ``raw`` emits a single, parseable JSON document carrying one
         # serialized result per item. The wrapper is a JSON array so
         # downstream consumers can pipe the output straight into
-        # ``json.load`` without custom splitting. The element separator is
-        # the standard JSON comma; ``_RAW_BOUNDARY`` is intentionally not
-        # used between elements because it would invalidate the array —
-        # base64 screenshot payloads are guaranteed not to produce
-        # structural commas inside a JSON value.
+        # ``json.load`` without custom splitting; the element separator is
+        # the standard JSON comma, because ``_RAW_BOUNDARY`` would
+        # invalidate the array and base64 screenshot payloads are
+        # guaranteed not to produce structural commas inside a JSON value.
         documents = [
             result.json(
                 include_html=True,

@@ -20,6 +20,9 @@ VALID_CLEANING_LEVELS = frozenset({"minimal", "standard", "maximum"})
 VALID_BLOCK_LEVELS = frozenset({"minimal", "balanced", "aggressive"})
 VALID_SESSION_ROTATION = frozenset({"sticky", "rotate"})
 VALID_STEALTH_LEVELS = frozenset({"off", "balanced", "max"})
+VALID_SCREENSHOT_MODES = frozenset({"none", "viewport", "full"})
+VALID_SCREENSHOT_FORMATS = frozenset({"png", "jpeg"})
+VALID_OUTPUT_FORMATS = frozenset({"markdown", "json", "html", "structure", "raw"})
 
 # Stealth presets override multiple individual options in one shot.
 # Individual fields given to `build()` take precedence over the preset
@@ -97,6 +100,112 @@ class PageFetchConfig:
     # content_too_large errors on legitimate pages.
     browser_pre_check_byte_margin: float = 1.5
 
+    def __post_init__(self) -> None:
+        """Validate direct construction and normalize its public inputs."""
+        if not isinstance(self.mode, str) or self.mode not in VALID_MODES:
+            raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
+        if not isinstance(self.proxy, str) or self.proxy not in VALID_PROXIES:
+            raise ValueError(f"proxy must be one of {sorted(VALID_PROXIES)}")
+        if (
+            not isinstance(self.cleaning_level, str)
+            or self.cleaning_level not in VALID_CLEANING_LEVELS
+        ):
+            raise ValueError(
+                f"cleaning_level must be one of {sorted(VALID_CLEANING_LEVELS)}"
+            )
+        if not isinstance(self.stealth_level, str) or self.stealth_level not in VALID_STEALTH_LEVELS:
+            raise ValueError(
+                f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}"
+            )
+        for name, value in {
+            "http_concurrency": self.http_concurrency,
+            "browser_concurrency": self.browser_concurrency,
+            "max_redirects": self.max_redirects,
+            "max_content_size": self.max_content_size,
+            "screenshot_max_bytes": self.screenshot_max_bytes,
+        }.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, value in {
+            "cache_ttl": self.cache_ttl,
+            "retries_http": self.retries_http,
+            "retries_browser": self.retries_browser,
+        }.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        for name, value in {
+            "http_timeout": self.http_timeout,
+            "browser_timeout": self.browser_timeout,
+        }.items():
+            if (
+                not isinstance(value, int | float)
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive finite number")
+        if (
+            not isinstance(self.confidence_threshold, int | float)
+            or isinstance(self.confidence_threshold, bool)
+            or not math.isfinite(self.confidence_threshold)
+            or not 0 <= self.confidence_threshold <= 1
+        ):
+            raise ValueError("confidence_threshold must be between 0 and 1")
+        if not all(
+            isinstance(value, bool)
+            for value in (self.cache_enabled, self.raise_on_error, self.humanize, self.block_images)
+        ):
+            raise ValueError(
+                "cache_enabled, block_images, humanize, and raise_on_error must be booleans"
+            )
+        if not isinstance(self.block_level, str) or self.block_level not in VALID_BLOCK_LEVELS:
+            raise ValueError(f"block_level must be one of {sorted(VALID_BLOCK_LEVELS)}")
+        if not isinstance(self.accept_language, str) or not self.accept_language.strip():
+            raise ValueError("accept_language must be a non-empty string")
+        if (
+            not isinstance(self.session_rotation, str)
+            or self.session_rotation not in VALID_SESSION_ROTATION
+        ):
+            raise ValueError(
+                f"session_rotation must be one of {sorted(VALID_SESSION_ROTATION)}"
+            )
+        if (
+            not isinstance(self.request_pacing, int | float)
+            or isinstance(self.request_pacing, bool)
+            or not math.isfinite(self.request_pacing)
+            or self.request_pacing < 0
+        ):
+            raise ValueError("request_pacing must be a non-negative finite number")
+        if (
+            not isinstance(self.browser_pre_check_byte_margin, int | float)
+            or isinstance(self.browser_pre_check_byte_margin, bool)
+            or not math.isfinite(self.browser_pre_check_byte_margin)
+            or self.browser_pre_check_byte_margin < 1.0
+        ):
+            raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
+        if self.proxy_geo is not None:
+            if not isinstance(self.proxy_geo, str) or self.proxy_geo.strip() not in GEO_MAP:
+                raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")
+        if not isinstance(self.cache_path, str | Path):
+            raise ValueError("cache_path must be a string or Path")
+
+        object.__setattr__(self, "cache_path", Path(self.cache_path).expanduser())
+        object.__setattr__(self, "http_timeout", float(self.http_timeout))
+        object.__setattr__(self, "browser_timeout", float(self.browser_timeout))
+        object.__setattr__(self, "confidence_threshold", float(self.confidence_threshold))
+        object.__setattr__(self, "accept_language", self.accept_language.strip())
+        object.__setattr__(self, "request_pacing", float(self.request_pacing))
+        object.__setattr__(
+            self,
+            "proxy_geo",
+            self.proxy_geo.strip() if self.proxy_geo else None,
+        )
+        object.__setattr__(
+            self,
+            "browser_pre_check_byte_margin",
+            float(self.browser_pre_check_byte_margin),
+        )
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> PageFetchConfig:
         """Load configuration from a YAML file with ``${ENV_VAR}`` interpolation.
@@ -114,6 +223,8 @@ class PageFetchConfig:
             raw = yaml.safe_load(fh) or {}
 
         resolved = _interpolate_env(raw)
+        if not isinstance(resolved, dict):
+            raise ValueError("YAML configuration must contain a mapping")
 
         # Accept top-level keys plus an optional nested "proxy" / "cache" sections
         flat: dict[str, Any] = {}
@@ -130,6 +241,10 @@ class PageFetchConfig:
         # Preserve the documented stealth-level spelling.
         if flat.get("stealth_level") is False:
             flat["stealth_level"] = "off"
+
+        unsupported = sorted(set(flat).difference(cls.__dataclass_fields__))
+        if unsupported:
+            raise ValueError(f"unsupported configuration key(s): {', '.join(unsupported)}")
 
         return cls.build(
             mode=flat.get("mode", "auto"),
@@ -257,7 +372,7 @@ class PageFetchConfig:
         ):
             raise ValueError("screenshot_max_bytes must be a positive integer")
         if (
-            not isinstance(browser_pre_check_byte_margin, (int, float))
+            not isinstance(browser_pre_check_byte_margin, int | float)
             or isinstance(browser_pre_check_byte_margin, bool)
             or not math.isfinite(browser_pre_check_byte_margin)
             or browser_pre_check_byte_margin < 1.0

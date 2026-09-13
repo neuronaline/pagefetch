@@ -12,14 +12,15 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from pagefetch import PageFetch, PageFetchError
+from pagefetch import PageFetch, PageFetchError, PageStructure, StructureNode
 from pagefetch.cache.keys import build_cache_key
 from pagefetch.cache.sqlite import SQLiteCache
+from pagefetch.cli import _build_config, build_parser
+from pagefetch.config import PageFetchConfig
 from pagefetch.fetching.http import HTTPFetcher
 from pagefetch.models import FetchResult
 from pagefetch.proxy.providers import ProxyConfigurationError, redact_proxy_url, resolve_proxy
 from pagefetch.utils.urls import normalize_url, validate_url
-
 
 # ---------------------------------------------------------------------------
 # URL validation: reject unsafe schemes (SSRF / data-exfiltration prevention)
@@ -120,6 +121,110 @@ async def test_expired_cache_is_ignored(tmp_path):
         await cache.close()
 
 
+@pytest.mark.asyncio
+async def test_cache_migrates_legacy_created_at_column(tmp_path):
+    """An on-disk fetch_cache table left over from an older release still
+    carries a ``created_at REAL NOT NULL`` column. The current INSERT never
+    writes that column, so without migration every cache write fails with
+    ``IntegrityError: NOT NULL constraint failed: fetch_cache.created_at``
+    (the user-visible symptom is the ``"Result could not be written to
+    cache."`` warning on every successful fetch). ``SQLiteCache.start()``
+    must drop the legacy column in place via ``ALTER TABLE … DROP COLUMN``
+    (SQLite ≥ 3.35) and bump ``PRAGMA user_version`` so existing rows
+    survive and new writes succeed.
+    """
+    import sqlite3
+
+    path = tmp_path / "legacy.sqlite3"
+    # Pre-create the legacy schema and seed a row that mimics what a previous
+    # version of the library would have written.
+    seed = sqlite3.connect(path)
+    seed.execute(
+        """
+        CREATE TABLE fetch_cache (
+            cache_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        )
+        """
+    )
+    seed.execute(
+        "INSERT INTO fetch_cache VALUES (?, ?, ?, ?)",
+        ("legacy-key", '{"url":"https://example.com/","success":true}', 0.0, 0.0),
+    )
+    seed.commit()
+    seed.close()
+
+    cache = SQLiteCache(path)
+    await cache.start()
+    try:
+        with sqlite3.connect(path) as raw:
+            columns = [row[1] for row in raw.execute("PRAGMA table_info(fetch_cache)")]
+            assert "created_at" not in columns, columns
+            user_version = raw.execute("PRAGMA user_version").fetchone()[0]
+            assert user_version >= 1
+
+        # Writing a fresh result must now succeed — no IntegrityError.
+        await cache.set(
+            "fresh-key",
+            FetchResult(
+                url="https://example.org/",
+                success=True,
+                markdown="hi",
+                fetched_at=datetime.now(UTC),
+            ),
+            60,
+        )
+
+        cached = await cache.get("fresh-key")
+        assert cached is not None
+        assert cached.from_cache is True
+        assert cached.markdown == "hi"
+    finally:
+        await cache.close()
+
+
+# ---------------------------------------------------------------------------
+# Transport retries: backoff must not occupy the shared request slot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_http_retry_backoff_releases_shared_semaphore(monkeypatch):
+    backoff_started = asyncio.Event()
+    release_backoff = asyncio.Event()
+    healthy_request_started = asyncio.Event()
+    retry_calls = 0
+
+    async def backoff(*_args):
+        backoff_started.set()
+        await release_backoff.wait()
+
+    def handler(request):
+        nonlocal retry_calls
+        if request.url.path == "/retry":
+            retry_calls += 1
+            if retry_calls == 1:
+                return httpx.Response(503, request=request)
+        healthy_request_started.set()
+        return httpx.Response(200, request=request)
+
+    monkeypatch.setattr(HTTPFetcher, "_backoff", staticmethod(backoff))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    fetcher = HTTPFetcher(client, asyncio.Semaphore(1), retries=1, max_content_size=1024)
+    try:
+        retrying = asyncio.create_task(fetcher.fetch("https://example.com/retry"))
+        await asyncio.wait_for(backoff_started.wait(), timeout=0.5)
+        healthy = asyncio.create_task(fetcher.fetch("https://example.com/healthy"))
+        await asyncio.wait_for(healthy_request_started.wait(), timeout=0.5)
+        release_backoff.set()
+        await asyncio.gather(retrying, healthy)
+    finally:
+        release_backoff.set()
+        await client.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Mode contracts: HTTP-only clients must never escalate to a real browser
 # ---------------------------------------------------------------------------
@@ -214,6 +319,71 @@ def test_constructor_rejects_invalid_arguments(kwargs, match):
         PageFetch(**kwargs)
 
 
+def test_config_rejects_invalid_direct_values_and_unknown_yaml_keys(tmp_path):
+    with pytest.raises(ValueError, match="mode"):
+        PageFetchConfig(mode="magic")
+
+    config_path = tmp_path / "pagefetch.yaml"
+    config_path.write_text("cache_enabld: true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="cache_enabld"):
+        PageFetchConfig.from_yaml(config_path)
+
+
+def test_cli_override_preserves_yaml_safety_limits(tmp_path):
+    config_path = tmp_path / "pagefetch.yaml"
+    config_path.write_text(
+        "screenshot_max_bytes: 12345\nbrowser_pre_check_byte_margin: 2.5\n",
+        encoding="utf-8",
+    )
+
+    args = build_parser().parse_args(
+        ["https://example.com", "--config", str(config_path), "--mode", "http"]
+    )
+    config = _build_config(args)
+    client = PageFetch(
+        cache_enabled=False,
+        screenshot_max_bytes=config.screenshot_max_bytes,
+        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
+    )
+
+    assert config.screenshot_max_bytes == 12345
+    assert config.browser_pre_check_byte_margin == 2.5
+    assert client.config.screenshot_max_bytes == 12345
+    assert client.config.browser_pre_check_byte_margin == 2.5
+
+
+def test_compact_structure_rejects_lossy_deserialization_and_sparse_nodes_restore():
+    structure = PageStructure(
+        root=StructureNode(
+            tag="main",
+            selector="main",
+            attrs={},
+            text="",
+            children=[],
+            path="main",
+        ),
+        stylesheets=[],
+        inline_styles=[],
+        scripts=[],
+        inline_scripts=[],
+        truncated=False,
+        node_count=1,
+        max_depth=1,
+    )
+    result = FetchResult(url="https://example.com", structure=structure)
+
+    compact = result.to_dict(include_structure=True, compact_structure=True)
+    with pytest.raises(ValueError, match="inspection-only"):
+        FetchResult.from_dict(compact)
+
+    verbose = result.to_dict(include_structure=True)
+    del verbose["structure"]["root"]["selector"]
+    restored = FetchResult.from_dict(verbose)
+    assert restored.structure is not None
+    assert restored.structure.root is not None
+    assert restored.structure.root.selector == "main"
+
+
 # ---------------------------------------------------------------------------
 # extract(): invalid URLs must never reach the browser (SSRF boundary)
 # ---------------------------------------------------------------------------
@@ -278,7 +448,7 @@ async def test_concurrent_close_does_not_hang_when_first_teardown_fails(tmp_path
     async def run_first_close():
         try:
             await asyncio.wait_for(client.close(), timeout=0.5)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
     first_task = asyncio.create_task(run_first_close())
@@ -286,7 +456,7 @@ async def test_concurrent_close_does_not_hang_when_first_teardown_fails(tmp_path
     first_task.cancel()
     try:
         await first_task
-    except (asyncio.CancelledError, asyncio.TimeoutError):
+    except (TimeoutError, asyncio.CancelledError):
         pass
 
     try:
@@ -294,3 +464,28 @@ async def test_concurrent_close_does_not_hang_when_first_teardown_fails(tmp_path
     finally:
         blocker.set()
         await client.aclose() if hasattr(client, "aclose") else None
+
+
+@pytest.mark.asyncio
+async def test_close_finishes_after_the_initial_caller_is_cancelled(tmp_path):
+    client = PageFetch(cache_enabled=False, cache_path=tmp_path / "cache.sqlite3")
+    blocker = asyncio.Event()
+    fetcher = type("BlockingBrowser", (), {})()
+
+    async def close_when_released():
+        await blocker.wait()
+
+    fetcher.close = close_when_released
+    client._browser_fetchers["blocking"] = fetcher
+
+    first_close = asyncio.create_task(client.close())
+    await asyncio.sleep(0.05)
+    first_close.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first_close
+
+    blocker.set()
+    await asyncio.wait_for(client.close(), timeout=1.0)
+    assert client._closed is True
+    assert client._closing is False
+    assert not client._browser_fetchers

@@ -111,6 +111,7 @@ async def controlled_scroll(
         )
         height = int(metrics.get("height", 0))
         if height > max_height:
+            await page.evaluate("() => window.scrollTo(0, 0)")
             return True
         # Adaptive sleep with jitter — avoid perfectly regular intervals that
         # make bot detection trivial.  ±25 % around the base value.

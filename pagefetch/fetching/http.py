@@ -72,12 +72,10 @@ class HTTPFetcher:
                 ),
             )
             try:
-                async with self.semaphore:
-                    return await self._fetch_with_retries(url, client=client)
+                return await self._fetch_with_retries(url, client=client)
             finally:
                 await client.aclose()
-        async with self.semaphore:
-            return await self._fetch_with_retries(url, client=None, headers=headers)
+        return await self._fetch_with_retries(url, client=None, headers=headers)
 
     async def _fetch_with_retries(
         self,
@@ -86,21 +84,22 @@ class HTTPFetcher:
         client: httpx.AsyncClient | None = None,
         headers: dict[str, str] | None = None,
     ) -> HTTPResponse:
-        last_failure: TransportFailure | None = None
         for attempt in range(self.retries + 1):
             try:
-                response = await self._request(url, client=client, headers=headers)
+                async with self.semaphore:
+                    response = await self._request(url, client=client, headers=headers)
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.retries:
                     await self._backoff(attempt, response.headers.get("Retry-After"))
                     continue
                 return response
             except TransportFailure as exc:
-                last_failure = exc
                 if not exc.error.retryable or attempt >= self.retries:
                     raise
                 await self._backoff(attempt)
-        assert last_failure is not None
-        raise last_failure
+        # Unreachable: every loop iteration either ``continue``-s, ``return``-s,
+        # or ``raise``-s. The exhaustive-iteration reasoning guarantees we never
+        # fall through here; linters may flag this and that is fine.
+        raise RuntimeError("unreachable: HTTP retry loop exited without terminating")
 
     async def _request(
         self,
@@ -115,7 +114,7 @@ class HTTPFetcher:
                 declared = response.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > self.max_content_size:
                     raise TransportFailure(
-                        FetchErrorInfo("content_too_large", "response exceeds maximum content size", True),
+                        FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
                         status_code=response.status_code,
                     )
                 chunks: list[bytes] = []
@@ -124,7 +123,7 @@ class HTTPFetcher:
                     size += len(chunk)
                     if size > self.max_content_size:
                         raise TransportFailure(
-                            FetchErrorInfo("content_too_large", "response exceeds maximum content size", True),
+                            FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
                             status_code=response.status_code,
                         )
                     chunks.append(chunk)

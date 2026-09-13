@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
 
 from ..models import FetchResult
+
+# Bump whenever the ``fetch_cache`` table layout changes. ``start()`` uses
+# SQLite's ``PRAGMA user_version`` so existing on-disk databases are migrated
+# to the latest layout exactly once instead of silently inheriting a stale
+# schema via ``CREATE TABLE IF NOT EXISTS``.
+SCHEMA_VERSION = 1
 
 
 class SQLiteCache:
@@ -18,7 +23,7 @@ class SQLiteCache:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._db: aiosqlite.Connection | None = None
-        self._batch_depth: int = 0
+        self._cleanup_counter: int = 0
 
     async def start(self) -> None:
         if self._db is not None:
@@ -27,17 +32,67 @@ class SQLiteCache:
         self._db = await aiosqlite.connect(self.path)
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._migrate_if_needed()
         await self._db.execute(
             """
             CREATE TABLE IF NOT EXISTS fetch_cache (
                 cache_key TEXT PRIMARY KEY,
                 payload TEXT NOT NULL,
-                created_at REAL NOT NULL,
                 expires_at REAL NOT NULL
             )
             """
         )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fetch_cache_expires_at ON fetch_cache(expires_at)"
+        )
+        await self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         await self._db.commit()
+
+    async def _migrate_if_needed(self) -> None:
+        """Reconcile older ``fetch_cache`` schemas with the current layout.
+
+        Older releases added a ``created_at REAL NOT NULL`` column that newer
+        INSERTs no longer write. ``CREATE TABLE IF NOT EXISTS`` would happily
+        keep the stale column, which made every cache write fail with
+        ``IntegrityError: NOT NULL constraint failed: fetch_cache.created_at``.
+
+        We use SQLite's ``PRAGMA user_version`` as a one-shot marker and
+        drop the legacy column in-place (requires SQLite ≥ 3.35). No-op for
+        fresh databases and databases that have already been migrated.
+        """
+        if self._db is None:
+            raise RuntimeError("cache has not been started")
+        db = self._db
+        ver_cursor = await db.execute("PRAGMA user_version")
+        ver_row = await ver_cursor.fetchone()
+        await ver_cursor.close()
+        if ver_row and ver_row[0] >= SCHEMA_VERSION:
+            return  # already on the current schema
+
+        # Detect an existing fetch_cache table that still carries the legacy
+        # ``created_at`` column. ``PRAGMA table_info`` returns one row per
+        # column with (cid, name, type, notnull, dflt_value, pk).
+        exists_cursor = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fetch_cache'"
+        )
+        table_exists = await exists_cursor.fetchone() is not None
+        await exists_cursor.close()
+        if not table_exists:
+            # Fresh install; CREATE TABLE in start() will lay out the schema.
+            return
+
+        info_cursor = await db.execute("PRAGMA table_info(fetch_cache)")
+        columns = await info_cursor.fetchall()
+        await info_cursor.close()
+        has_legacy = any(col[1] == "created_at" for col in columns)
+        if not has_legacy:
+            # Table layout already matches the current schema; nothing to do.
+            return
+
+        # SQLite ≥ 3.35 supports ALTER TABLE … DROP COLUMN. The bundled
+        # sqlite3 in our minimum supported Python (3.11+) ships 3.37+, so
+        # this is always available.
+        await db.execute("ALTER TABLE fetch_cache DROP COLUMN created_at")
 
     async def get(self, key: str, *, requested_screenshot: bool = False) -> FetchResult | None:
         """Return the cached result for *key*, or ``None`` when the key is missing
@@ -62,15 +117,13 @@ class SQLiteCache:
             return None
         if row[1] <= time.time():
             await self._db.execute("DELETE FROM fetch_cache WHERE cache_key = ?", (key,))
-            if not self._batch_depth:
-                await self._db.commit()
+            await self._db.commit()
             return None
         try:
             result = FetchResult.from_dict(json.loads(row[0]))
         except (TypeError, ValueError, json.JSONDecodeError):
             await self._db.execute("DELETE FROM fetch_cache WHERE cache_key = ?", (key,))
-            if not self._batch_depth:
-                await self._db.commit()
+            await self._db.commit()
             return None
         result.from_cache = True
         result.fetch_method = "cache"
@@ -105,39 +158,25 @@ class SQLiteCache:
             ) from exc
         await self._db.execute(
             """
-            INSERT INTO fetch_cache(cache_key, payload, created_at, expires_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO fetch_cache(cache_key, payload, expires_at)
+            VALUES (?, ?, ?)
             ON CONFLICT(cache_key) DO UPDATE SET
                 payload=excluded.payload,
-                created_at=excluded.created_at,
                 expires_at=excluded.expires_at
             """,
-            (key, payload, now, now + ttl),
+            (key, payload, now + ttl),
         )
-        if not self._batch_depth:
-            await self._db.commit()
-
-    @asynccontextmanager
-    async def batch(self):
-        """Context manager that wraps multiple cache operations in a single transaction.
-
-        When inside a batch context, individual ``set`` and ``get`` calls
-        defer commits until the batch completes.  If an exception occurs the
-        transaction is rolled back.
-        """
-        if self._db is None:
-            raise RuntimeError("cache has not been started")
-        self._batch_depth += 1
-        try:
-            yield
-            self._batch_depth -= 1
-            if not self._batch_depth:
-                await self._db.commit()
-        except BaseException:
-            self._batch_depth -= 1
-            if not self._batch_depth:
-                await self._db.rollback()
-            raise
+        # Probabilistic opportunistic cleanup: avoid running the DELETE on
+        # every write (the per-row INSERT is on the hot path). The cleanup
+        # itself is bounded to a small batch so it cannot stall callers.
+        if not self._cleanup_counter & 0x1F:
+            await self._db.execute(
+                "DELETE FROM fetch_cache WHERE cache_key IN ("
+                "SELECT cache_key FROM fetch_cache WHERE expires_at <= ? LIMIT 100)",
+                (now,),
+            )
+        self._cleanup_counter += 1
+        await self._db.commit()
 
     async def close(self) -> None:
         if self._db is not None:

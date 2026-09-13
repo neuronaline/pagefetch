@@ -8,6 +8,8 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+from .images import image_candidate
+
 _BLOCK_TAGS = {
     "address", "article", "aside", "blockquote", "details", "div", "figure", "figcaption",
     "footer", "header", "main", "nav", "p", "section", "summary",
@@ -61,7 +63,8 @@ class MarkdownConverter:
             return f"~~{value}~~" if value else ""
         if name == "code" and node.parent and node.parent.name != "pre":
             value = node.get_text()
-            fence = "``" if "`" in value else "`"
+            longest = max((len(run) for run in re.findall(r"`+", value)), default=0)
+            fence = "`" * max(1, longest + 1)
             return f"{fence}{value}{fence}"
         if name == "pre":
             code = node.find("code")
@@ -77,12 +80,7 @@ class MarkdownConverter:
             target = urljoin(self.base_url, str(href))
             return f"[{label or target}]({target})"
         if name == "img":
-            source = next(
-                (node.get(attr) for attr in ("src", "data-src", "data-lazy-src", "data-original") if node.get(attr)),
-                None,
-            )
-            if not source and node.get("srcset"):
-                source = str(node["srcset"]).split(",")[0].strip().split()[0]
+            source = image_candidate(node)
             if not source:
                 return node.get("alt", "")
             alt = str(node.get("alt") or node.get("title") or "").replace("]", "\\]")

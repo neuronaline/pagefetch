@@ -14,6 +14,7 @@ stops it from :meth:`~pagefetch.fetching.browser.BrowserFetcher.close`.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import signal
 import subprocess
@@ -45,8 +46,6 @@ class XvfbDisplay:
     cleanly.
     """
 
-    _MIN_DISPLAY = 99
-    _MAX_DISPLAY = 199
     _STARTUP_TIMEOUT = 5.0
     _STARTUP_POLL = 0.02
     _SHUTDOWN_TIMEOUT = 3.0
@@ -90,23 +89,8 @@ class XvfbDisplay:
         return path
 
     @staticmethod
-    def _is_display_free(num: int) -> bool:
-        """Return True when no X server is bound to ``num``.
-
-        Relies on the lock file Xorg writes when a server claims a display.
-        We launch Xvfb with ``-nolisten tcp``, so a TCP probe would always
-        be refused and could not distinguish "no server" from "our server".
-        """
-        return not Path(f"/tmp/.X{num}-lock").exists()
-
-    @classmethod
-    def _find_free_display(cls) -> int:
-        for num in range(cls._MIN_DISPLAY, cls._MAX_DISPLAY + 1):
-            if cls._is_display_free(num):
-                return num
-        raise XvfbLaunchError(
-            f"no free X display in range :{cls._MIN_DISPLAY}-{cls._MAX_DISPLAY}"
-        )
+    def _socket_path(num: int) -> Path:
+        return Path(f"/tmp/.X11-unix/X{num}")
 
     def start(self) -> str:
         """Start the Xvfb server and return the ``DISPLAY`` string."""
@@ -114,8 +98,6 @@ class XvfbDisplay:
             return self._display
 
         binary = self._binary_path()
-        self._display_num = self._find_free_display()
-        self._display = f":{self._display_num}"
 
         # ``-nolisten tcp`` closes the TCP listener so other processes
         # cannot attach over the network; Camoufox uses the local Unix
@@ -123,7 +105,10 @@ class XvfbDisplay:
         # query screen sizes normally; without it, some screen APIs misbehave.
         args = [
             binary,
-            self._display,
+            # Let Xvfb atomically reserve a server number and report it over
+            # stdout. Checking lock files before spawning is a TOCTOU race.
+            "-displayfd",
+            "1",
             "-screen",
             "0",
             f"{self.width}x{self.height}x{self.depth}",
@@ -137,7 +122,7 @@ class XvfbDisplay:
         try:
             self._process = subprocess.Popen(
                 args,
-                stdout=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 # New session group keeps cleanup safe even if the parent
                 # is signalled.
@@ -148,27 +133,46 @@ class XvfbDisplay:
             self._display_num = None
             raise XvfbLaunchError(f"failed to spawn Xvfb: {exc}") from exc
 
+        assert self._process.stdout is not None
+        display_fd = self._process.stdout.fileno()
+        os.set_blocking(display_fd, False)
+        display_data = b""
         deadline = time.monotonic() + self._STARTUP_TIMEOUT
         while time.monotonic() < deadline:
-            if not self._is_display_free(self._display_num):
+            if self._process.poll() is not None:
+                self.stop()
+                raise XvfbLaunchError("Xvfb exited before allocating a display")
+            try:
+                display_data += os.read(display_fd, 32)
+            except BlockingIOError:
+                pass
+            if b"\n" in display_data:
+                raw_display = display_data.split(b"\n", 1)[0]
+                try:
+                    display_num = int(raw_display)
+                except ValueError:
+                    self.stop()
+                    raise XvfbLaunchError("Xvfb returned an invalid display number") from None
+                if display_num < 0:
+                    self.stop()
+                    raise XvfbLaunchError("Xvfb returned an invalid display number")
+                self._display_num = display_num
+                self._display = f":{display_num}"
+            if self._display_num is not None and self._socket_path(self._display_num).exists():
                 logger.debug(
                     "Xvfb ready on display %s (pid=%d)",
                     self._display,
                     self._process.pid,
                 )
                 return self._display
-            if self._process.poll() is not None:
-                self._display = None
-                self._display_num = None
-                self._process = None
-                raise XvfbLaunchError(
-                    f"Xvfb exited before opening display {self._display}"
-                )
             time.sleep(self._STARTUP_POLL)
 
+        display = self._display or (
+            f"display number {self._display_num}" if self._display_num is not None else "an allocated display"
+        )
         self.stop()
         raise XvfbLaunchError(
-            f"Xvfb did not open display {self._display} within "
+            f"Xvfb did not open {display} within "
             f"{self._STARTUP_TIMEOUT:.1f}s"
         )
 

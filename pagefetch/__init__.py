@@ -53,7 +53,10 @@ logging.getLogger("pagefetch").addHandler(logging.NullHandler())
 try:
     __version__ = _pkg_version("pagefetch")
 except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
-    __version__ = "0.8.5"
+    # Mirrors the version declared in ``pyproject.toml`` so that
+    # ``pagefetch.__version__`` is usable before the distribution metadata
+    # is installed (editable checkouts, sdists).
+    __version__ = "0.8.6"
 
 __all__ = [
     "FetchErrorInfo",

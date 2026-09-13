@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
 import random
+import sys
 import time
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from hashlib import md5
 from pathlib import Path
@@ -50,6 +50,12 @@ from .utils.durations import parse_duration
 from .utils.urls import normalize_url, registrable_host, validate_url
 
 logger = logging.getLogger("pagefetch")
+
+# Per-resource close timeout. Hung teardowns (a browser process wedged on a
+# subprocess, an HTTP connection that refuses to drain) must not stall
+# ``close()`` indefinitely; the timeout is intentionally short so the
+# outer drain event keeps moving and the next caller can still abort.
+_RESOURCE_CLOSE_TIMEOUT = 0.5
 
 # Detect the host platform once at import time so HTTP requests and the
 # browser fallback share the same OS signature (mixed-OS fingerprints
@@ -98,6 +104,7 @@ class PageFetch:
         proxy_geo: str | None = None,
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
+        browser_pre_check_byte_margin: float = 1.5,
     ) -> None:
         self.config = PageFetchConfig.build(
             mode=mode,
@@ -125,6 +132,7 @@ class PageFetch:
             proxy_geo=proxy_geo,
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
+            browser_pre_check_byte_margin=browser_pre_check_byte_margin,
         )
         self._http_semaphore = asyncio.Semaphore(self.config.http_concurrency)
         self._browser_semaphore = asyncio.Semaphore(self.config.browser_concurrency)
@@ -143,10 +151,16 @@ class PageFetch:
         self._closed = False
         self._closing = False
         self._lifecycle_lock = asyncio.Lock()
-        self._close_complete = asyncio.Event()
+        self._close_task: asyncio.Task[None] | None = None
         self._startup_warnings: list[str] = []
         self._active_fetches = 0
         self._active_fetches_lock = asyncio.Lock()
+        # Set whenever ``_active_fetches`` is zero. ``close()`` waits on this
+        # event (with a hard 5 s deadline) instead of busy-polling the
+        # counter. Initialising it ``set`` lets the first ``close()`` skip the
+        # wait when no fetches are in flight.
+        self._drain_event = asyncio.Event()
+        self._drain_event.set()
 
     async def __aenter__(self) -> PageFetch:
         await self.start()
@@ -193,63 +207,80 @@ class PageFetch:
     async def close(self) -> None:
         """Release all HTTP clients, browser processes, and the cache database.
 
-        Safe to call repeatedly — subsequent calls are no-ops.
+        Safe to call repeatedly and while another caller is closing the client.
+
+        The teardown belongs to a task owned by the client rather than to its
+        first caller. This prevents cancellation of a caller (for example by a
+        request timeout) from leaving the client half-closed.
         """
-        wait_for_close = False
         async with self._lifecycle_lock:
             if self._closed:
                 return
-            if self._closing:
-                wait_for_close = True
-            else:
+            if self._close_task is None:
                 self._closing = True
-        if wait_for_close:
-            await self._close_complete.wait()
-            return
+                self._close_task = asyncio.create_task(self._teardown())
+            close_task = self._close_task
 
-        # No-holds-barred teardown. The try/finally guarantees that
-        # ``_close_complete`` is set even if any of the awaitables below raise
-        # or the closing task itself is cancelled; otherwise concurrent
-        # ``close()`` callers waiting on ``_close_complete.wait()`` would hang
-        # indefinitely.
+        await asyncio.shield(close_task)
+
+    async def _teardown(self) -> None:
+        """Run the client-owned resource teardown to completion."""
         try:
             # Do not hold the lifecycle lock while active operations finish.
-            for _ in range(50):  # up to ~5 seconds
+            # A single ``asyncio.wait_for`` replaces a 50-step busy-wait: the
+            # event is cleared in ``_begin_operation`` and set in
+            # ``_finish_operation`` once the counter drops back to zero.
+            try:
+                await asyncio.wait_for(self._drain_event.wait(), timeout=5.0)
+            except TimeoutError:
                 async with self._active_fetches_lock:
-                    if self._active_fetches == 0:
-                        break
-                await asyncio.sleep(0.1)
-            async with self._active_fetches_lock:
-                remaining = self._active_fetches
-            if remaining > 0:
-                logger.warning(
-                    "close timed out waiting for %d in-flight fetch(es); tearing down resources anyway",
-                    remaining,
-                )
+                    remaining = self._active_fetches
+                if remaining > 0:
+                    logger.warning(
+                        "close timed out waiting for %d in-flight fetch(es); tearing down resources anyway",
+                        remaining,
+                    )
             async with self._lifecycle_lock:
                 browser_results = await asyncio.gather(
-                    *(browser.close() for browser in self._browser_fetchers.values()),
+                    *(
+                        self._close_resource(browser.close)
+                        for browser in self._browser_fetchers.values()
+                    ),
                     return_exceptions=True,
                 )
                 client_results = await asyncio.gather(
-                    *(client.aclose() for client in self._http_clients.values()),
+                    *(self._close_resource(client.aclose) for client in self._http_clients.values()),
                     return_exceptions=True,
                 )
                 for failure in (*browser_results, *client_results):
                     if isinstance(failure, Exception):
                         logger.warning("resource cleanup failed: %s", type(failure).__name__)
                 if self._cache:
-                    try:
-                        await self._cache.close()
-                    except Exception as exc:
-                        logger.warning("cache cleanup failed: %s", type(exc).__name__)
+                    await self._close_resource(self._cache.close)
                 self._browser_fetchers.clear()
                 self._browser_fetcher_users.clear()
                 self._http_fetchers.clear()
                 self._http_clients.clear()
                 self._closed = True
-        finally:
-            self._close_complete.set()
+                self._closing = False
+        except asyncio.CancelledError:
+            # A direct cancellation of the owned task is exceptional, but it
+            # must leave the client retryable. Normal caller cancellation is
+            # shielded in ``close()`` and never reaches this branch.
+            async with self._lifecycle_lock:
+                self._closing = False
+                self._close_task = None
+            raise
+
+    @staticmethod
+    async def _close_resource(close: Callable[[], Awaitable[Any]]) -> None:
+        """Close one transport without allowing a hung child to stall teardown."""
+        try:
+            await asyncio.wait_for(close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
+        except TimeoutError:
+            logger.warning("resource cleanup timed out after %.1f seconds", _RESOURCE_CLOSE_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            logger.warning("resource cleanup failed: %s", type(exc).__name__)
 
     async def _begin_operation(self) -> bool:
         """Start resources and register work before touching shared state."""
@@ -262,11 +293,15 @@ class PageFetch:
                 return False
             async with self._active_fetches_lock:
                 self._active_fetches += 1
+                self._drain_event.clear()
         return True
 
     async def _finish_operation(self) -> None:
         async with self._active_fetches_lock:
             self._active_fetches -= 1
+            if self._active_fetches <= 0:
+                self._active_fetches = 0
+                self._drain_event.set()
 
     async def fetch(
         self,
@@ -302,130 +337,25 @@ class PageFetch:
         FetchResult
             Structured result with success status, content, and metadata.
         """
-        started_at = time.perf_counter()
         selected_mode = mode or self.config.mode
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
-        try:
-            self._validate_fetch_options(selected_mode, selected_proxy)
-            validate_url(url)
-            normalized_url = normalize_url(url)
-        except (TypeError, ValueError) as exc:
-            code = "unsupported_scheme" if "scheme" in str(exc) else "invalid_url"
-            result = self._finish_error(
-                url=str(url),
-                proxy=selected_proxy,
-                error=FetchErrorInfo(code, str(exc), False, type(exc).__name__),
-                started_at=started_at,
-                should_raise=should_raise,
-            )
-            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            return result
+        async def transport(normalized_url: str) -> FetchResult:
+            if selected_mode == "browser":
+                return await self._fetch_browser(normalized_url, selected_proxy, status_code=None)
+            return await self._fetch_http_or_auto(normalized_url, selected_mode, selected_proxy)
 
-        if not await self._begin_operation():
-            result = self._finish_error(
-                url=normalized_url,
-                proxy=selected_proxy,
-                error=FetchErrorInfo("client_closed", "PageFetch client has been closed", False),
-                started_at=started_at,
-                should_raise=should_raise,
-            )
-            result.warnings[:0] = self._startup_warnings
-            return result
-        try:
-            try:
-                ttl = self.config.cache_ttl if cache_ttl is None else parse_duration(cache_ttl)
-            except (TypeError, ValueError) as exc:
-                result = self._finish_error(
-                    url=normalized_url,
-                    proxy=selected_proxy,
-                    error=FetchErrorInfo("invalid_cache_ttl", f"Invalid cache_ttl: {exc}", False, type(exc).__name__),
-                    started_at=started_at,
-                    should_raise=should_raise,
-                )
-                result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-                return result
-            cache_key = build_cache_key(
-                normalized_url,
-                mode=selected_mode,
-                proxy=selected_proxy,
-                settings={
-                    "accept_language": (
-                        GEO_MAP[self.config.proxy_geo]["accept_language"]
-                        if self.config.proxy_geo
-                        else self.config.accept_language
-                    ),
-                    "block_images": self.config.block_images,
-                    "block_level": self.config.block_level,
-                    "cleaning_level": self.config.cleaning_level,
-                    "confidence_threshold": self.config.confidence_threshold,
-                    "humanize": self.config.humanize,
-                    "max_redirects": self.config.max_redirects,
-                    "proxy_geo": self.config.proxy_geo,
-                    "session_rotation": self.config.session_rotation,
-                },
-            )
-            fetch_warnings = list(self._startup_warnings)
-            if self._cache and use_cache:
-                try:
-                    cached = await self._cache.get(cache_key)
-                    if cached:
-                        cached.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-                        logger.debug("cache hit for %s", normalized_url)
-                        return cached
-                except Exception as exc:
-                    fetch_warnings.append("Cache read failed; content was fetched normally.")
-                    logger.warning("cache read failed: %s", type(exc).__name__)
-
-            try:
-                if selected_mode == "browser":
-                    result = await self._fetch_browser(
-                        normalized_url,
-                        selected_proxy,
-                        status_code=None,
-                    )
-                else:
-                    result = await self._fetch_http_or_auto(
-                        normalized_url,
-                        selected_mode,
-                        selected_proxy,
-                    )
-            except (TransportFailure, ProxyConfigurationError) as exc:
-                error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
-                    "connection_error", str(exc), False, type(exc).__name__
-                )
-                result = self._finish_error(
-                    url=normalized_url,
-                    proxy=selected_proxy,
-                    error=error,
-                    status_code=getattr(exc, "status_code", None),
-                    started_at=started_at,
-                    should_raise=should_raise,
-                )
-            except Exception as exc:
-                result = self._finish_error(
-                    url=normalized_url,
-                    proxy=selected_proxy,
-                    error=FetchErrorInfo("unknown_error", "An unexpected error occurred while fetching the page.", False, type(exc).__name__),
-                    started_at=started_at,
-                    should_raise=should_raise,
-                )
-            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            result.warnings[:0] = fetch_warnings
-            if not result.success and should_raise and result.error:
-                raise PageFetchError(result.error, url=result.url)
-            if self._cache and use_cache and result.success and not self._uncacheable(result):
-                try:
-                    await self._cache.set(cache_key, result, ttl)
-                except Exception as exc:
-                    result.warnings.append("Result could not be written to cache.")
-                    logger.warning("cache write failed: %s", type(exc).__name__)
-            return result
-        finally:
-            # Guarantee the active-fetches counter is decremented on every exit
-            # path, including when ``_finish_error`` re-raises PageFetchError
-            # under ``raise_on_error=True``.
-            await self._finish_operation()
+        return await self._run_operation(
+            url=url,
+            mode=selected_mode,
+            proxy=selected_proxy,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            should_raise=should_raise,
+            cache_settings=self._cache_settings(),
+            error_context="fetching the page",
+            transport=transport,
+        )
 
     async def fetch_many(
         self,
@@ -459,53 +389,35 @@ class PageFetch:
         list[FetchResult]
             One result per input URL in the original order, preserving
             duplicates and failures.
+
+        Each per-URL call returns a structured ``FetchResult`` even when
+        ``raise_on_error=True`` (``fetch()`` raises :class:`PageFetchError`,
+        not ``ValueError``); only :class:`PageFetchError` is captured here
+        because every other failure mode is already converted to an
+        ``error`` field before the coroutine returns.
         """
         ordered = list(urls)
         unique = list(dict.fromkeys(ordered))
 
-        async def one(
-            item: str,
-            _mode: str | None = mode,
-            _proxy: str | None = proxy,
-            _use_cache: bool = use_cache,
-            _cache_ttl: str | int | None = cache_ttl,
-            _raise_on_error: bool | None = raise_on_error,
-        ) -> FetchResult:
-            item_start = time.perf_counter()
+        async def one(item: str) -> FetchResult:
             try:
                 return await self.fetch(
                     item,
-                    mode=_mode,
-                    proxy=_proxy,
-                    use_cache=_use_cache,
-                    cache_ttl=_cache_ttl,
-                    raise_on_error=_raise_on_error,
+                    mode=mode,
+                    proxy=proxy,
+                    use_cache=use_cache,
+                    cache_ttl=cache_ttl,
+                    raise_on_error=raise_on_error,
                 )
             except PageFetchError as exc:
-                # Use the raw item string — normalize_url would re-raise
-                # ValueError for the same invalid URL that caused the error.
-                try:
-                    result_url = normalize_url(item)
-                except ValueError:
-                    result_url = str(item)
-                return FetchResult(
-                    url=result_url,
-                    success=False,
-                    proxy_provider=proxy or self.config.proxy,
-                    error=exc.error,
-                    duration_ms=round((time.perf_counter() - item_start) * 1000, 2),
-                    fetched_at=datetime.now(UTC),
-                )
-            except ValueError as exc:
-                # ``fetch`` raises ValueError for argument-validation failures.
-                # Surface them as per-URL failures so one bad URL does not
-                # abort the rest of the batch.
+                # Use the raw item string — normalize_url may itself raise for
+                # the same invalid URL that produced the error; ``str(item)``
+                # preserves the original input verbatim.
                 return FetchResult(
                     url=str(item),
                     success=False,
                     proxy_provider=proxy or self.config.proxy,
-                    error=FetchErrorInfo("invalid_argument", str(exc), False, type(exc).__name__),
-                    duration_ms=round((time.perf_counter() - item_start) * 1000, 2),
+                    error=exc.error,
                     fetched_at=datetime.now(UTC),
                 )
 
@@ -555,32 +467,89 @@ class PageFetch:
         article-shaped extraction. The :meth:`fetch` coroutine remains the
         right tool for the information layer (markdown, metadata, links).
         """
-        started_at = time.perf_counter()
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
+        async def transport(normalized_url: str) -> FetchResult:
+            return await self._fetch_browser(
+                normalized_url,
+                selected_proxy,
+                status_code=None,
+                structure=structure,
+                compact_structure=compact_structure,
+                screenshot=screenshot,
+                screenshot_format=screenshot_format,
+            )
+
+        return await self._run_operation(
+            url=url,
+            mode="browser",
+            proxy=selected_proxy,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            should_raise=should_raise,
+            cache_settings=self._cache_settings(
+                compact_structure=compact_structure,
+                screenshot=screenshot,
+                screenshot_format=screenshot_format,
+                structure=structure,
+            ),
+            requested_screenshot=screenshot != "none",
+            error_context="extracting the page",
+            transport=transport,
+        )
+
+    def _cache_settings(self, **operation_settings: Any) -> dict[str, Any]:
+        """Return cache-key settings shared by fetch and extraction operations."""
+        settings = {
+            "accept_language": (
+                GEO_MAP[self.config.proxy_geo]["accept_language"]
+                if self.config.proxy_geo
+                else self.config.accept_language
+            ),
+            "block_images": self.config.block_images,
+            "block_level": self.config.block_level,
+            "cleaning_level": self.config.cleaning_level,
+            "confidence_threshold": self.config.confidence_threshold,
+            "humanize": self.config.humanize,
+            "max_redirects": self.config.max_redirects,
+            "proxy_geo": self.config.proxy_geo,
+            "session_rotation": self.config.session_rotation,
+        }
+        settings.update(operation_settings)
+        return settings
+
+    async def _run_operation(
+        self,
+        *,
+        url: str,
+        mode: str,
+        proxy: str,
+        use_cache: bool,
+        cache_ttl: str | int | None,
+        should_raise: bool,
+        cache_settings: dict[str, Any],
+        error_context: str,
+        transport: Callable[[str], Awaitable[FetchResult]],
+        requested_screenshot: bool = False,
+    ) -> FetchResult:
+        """Run the validation, lifecycle, cache, and result pipeline for one operation."""
+        started_at = time.perf_counter()
         try:
-            self._validate_fetch_options("browser", selected_proxy)
+            self._validate_fetch_options(mode, proxy)
             validate_url(url)
             normalized_url = normalize_url(url)
         except (TypeError, ValueError) as exc:
             code = "unsupported_scheme" if "scheme" in str(exc) else "invalid_url"
-            result = self._finish_error(
-                url=str(url),
-                proxy=selected_proxy,
+            return self._finish_error(
+                url=str(url), proxy=proxy,
                 error=FetchErrorInfo(code, str(exc), False, type(exc).__name__),
-                started_at=started_at,
-                should_raise=should_raise,
+                started_at=started_at, should_raise=should_raise,
             )
-            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            return result
-
         if not await self._begin_operation():
             result = self._finish_error(
-                url=normalized_url,
-                proxy=selected_proxy,
+                url=normalized_url, proxy=proxy,
                 error=FetchErrorInfo("client_closed", "PageFetch client has been closed", False),
-                started_at=started_at,
-                should_raise=should_raise,
+                started_at=started_at, should_raise=should_raise,
             )
             result.warnings[:0] = self._startup_warnings
             return result
@@ -588,86 +557,41 @@ class PageFetch:
             try:
                 ttl = self.config.cache_ttl if cache_ttl is None else parse_duration(cache_ttl)
             except (TypeError, ValueError) as exc:
-                result = self._finish_error(
-                    url=normalized_url,
-                    proxy=selected_proxy,
+                return self._finish_error(
+                    url=normalized_url, proxy=proxy,
                     error=FetchErrorInfo("invalid_cache_ttl", f"Invalid cache_ttl: {exc}", False, type(exc).__name__),
-                    started_at=started_at,
-                    should_raise=should_raise,
+                    started_at=started_at, should_raise=should_raise,
                 )
-                result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-                return result
-
-            requested_screenshot = screenshot != "none"
-            cache_key = build_cache_key(
-                normalized_url,
-                mode="browser",
-                proxy=selected_proxy,
-                settings={
-                    "accept_language": (
-                        GEO_MAP[self.config.proxy_geo]["accept_language"]
-                        if self.config.proxy_geo
-                        else self.config.accept_language
-                    ),
-                    "block_images": self.config.block_images,
-                    "block_level": self.config.block_level,
-                    "cleaning_level": self.config.cleaning_level,
-                    "compact_structure": compact_structure,
-                    "confidence_threshold": self.config.confidence_threshold,
-                    "humanize": self.config.humanize,
-                    "max_redirects": self.config.max_redirects,
-                    "proxy_geo": self.config.proxy_geo,
-                    "screenshot": screenshot,
-                    "screenshot_format": screenshot_format,
-                    "session_rotation": self.config.session_rotation,
-                    "structure": structure,
-                },
-            )
-            fetch_warnings = list(self._startup_warnings)
+            cache_key = build_cache_key(normalized_url, mode=mode, proxy=proxy, settings=cache_settings)
+            warnings = list(self._startup_warnings)
             if self._cache and use_cache:
                 try:
-                    cached = await self._cache.get(
-                        cache_key, requested_screenshot=requested_screenshot
-                    )
+                    cached = await self._cache.get(cache_key, requested_screenshot=requested_screenshot)
                     if cached:
                         cached.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
                         logger.debug("cache hit for %s", normalized_url)
                         return cached
                 except Exception as exc:
-                    fetch_warnings.append("Cache read failed; content was fetched normally.")
+                    warnings.append("Cache read failed; content was fetched normally.")
                     logger.warning("cache read failed: %s", type(exc).__name__)
-
             try:
-                result = await self._fetch_browser_extract(
-                    normalized_url,
-                    selected_proxy,
-                    structure=structure,
-                    compact_structure=compact_structure,
-                    screenshot=screenshot,
-                    screenshot_format=screenshot_format,
-                )
+                result = await transport(normalized_url)
             except (TransportFailure, ProxyConfigurationError) as exc:
                 error = exc.error if isinstance(exc, TransportFailure) else FetchErrorInfo(
                     "connection_error", str(exc), False, type(exc).__name__
                 )
                 result = self._finish_error(
-                    url=normalized_url,
-                    proxy=selected_proxy,
-                    error=error,
+                    url=normalized_url, proxy=proxy, error=error,
                     status_code=getattr(exc, "status_code", None),
-                    started_at=started_at,
-                    should_raise=should_raise,
+                    started_at=started_at, should_raise=should_raise,
                 )
             except Exception as exc:
                 result = self._finish_error(
-                    url=normalized_url,
-                    proxy=selected_proxy,
-                    error=FetchErrorInfo("unknown_error", "An unexpected error occurred while extracting the page.", False, type(exc).__name__),
-                    started_at=started_at,
-                    should_raise=should_raise,
+                    url=normalized_url, proxy=proxy,
+                    error=FetchErrorInfo("unknown_error", f"An unexpected error occurred while {error_context}.", False, type(exc).__name__),
+                    started_at=started_at, should_raise=should_raise,
                 )
-            result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            result.warnings[:0] = fetch_warnings
+            result.warnings[:0] = warnings
             if not result.success and should_raise and result.error:
                 raise PageFetchError(result.error, url=result.url)
             if self._cache and use_cache and result.success and not self._uncacheable(result):
@@ -678,9 +602,6 @@ class PageFetch:
                     logger.warning("cache write failed: %s", type(exc).__name__)
             return result
         finally:
-            # Guarantee the active-fetches counter is decremented on every exit
-            # path, including when ``_finish_error`` re-raises PageFetchError
-            # under ``raise_on_error=True``.
             await self._finish_operation()
 
     async def _fetch_http_or_auto(
@@ -690,7 +611,7 @@ class PageFetch:
         proxy: str,
     ) -> FetchResult:
         try:
-            fetcher = await self._http_fetcher(proxy, url)
+            fetcher = await self._http_fetcher(proxy)
             per_request_proxy: str | None = None
             if proxy != "none":
                 settings = resolve_proxy(proxy)
@@ -842,72 +763,24 @@ class PageFetch:
         url: str,
         proxy: str,
         status_code: int | None,
-    ) -> FetchResult:
-        if self.config.session_rotation == "rotate" and proxy != "none":
-            settings = resolve_proxy(proxy)
-            proxy_url = (
-                _inject_session_id(settings.url, make_random_session())
-                if settings.url
-                else None
-            )
-            fetcher = self._new_browser_fetcher(
-                ProxySettings(provider=settings.provider, url=proxy_url)
-            )
-            try:
-                response = await fetcher.fetch(url)
-            finally:
-                await self._close_browser_quietly(fetcher)
-        else:
-            cache_key, fetcher = await self._acquire_browser_fetcher(proxy, url)
-            try:
-                response = await fetcher.fetch(url)
-            finally:
-                await self._release_browser_fetcher(cache_key)
-        raw_soup = BeautifulSoup(response.html, "lxml")
-        result = self._result_from_html(
-            original_url=url,
-            final_url=response.url,
-            status_code=response.status_code if response.status_code is not None else status_code,
-            html=response.html,
-            content_type="text/html",
-            encoding="utf-8",
-            proxy=proxy,
-            method="browser",
-            soup=raw_soup,
-            confidence=response.confidence,
-        )
-        result.warnings.extend(response.warnings)
-        report = response.confidence
-        if response.status_code is not None and response.status_code >= 400:
-            result.success = False
-            code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
-            result.error = FetchErrorInfo(
-                code,
-                f"browser navigation returned status {response.status_code}",
-                response.status_code in RETRYABLE_STATUS_CODES,
-            )
-        elif report.challenge:
-            result.success = False
-            result.error = FetchErrorInfo("captcha_detected", "challenge page remained after browser retries", False)
-        elif report.score < self.config.confidence_threshold:
-            result.warnings.append("Rendered content may still be incomplete.")
-        return result
-
-    async def _fetch_browser_extract(
-        self,
-        url: str,
-        proxy: str,
         *,
-        structure: bool,
-        compact_structure: bool,
-        screenshot: str,
-        screenshot_format: str,
+        structure: bool = False,
+        compact_structure: bool = False,
+        screenshot: str = "none",
+        screenshot_format: str = "png",
     ) -> FetchResult:
-        """Browser-backed extraction flow used by :meth:`extract`.
+        """Unified browser-backed fetch path.
 
-        Unlike :meth:`_fetch_browser` this captures a screenshot (when
-        requested) and always runs the structural extractor so the result
-        is the rendered DOM plus the structural summary on demand.
+        Used by ``auto``-mode HTTP→browser fallback and by :meth:`extract`. The
+        optional kwargs select the extraction flow:
+
+        * ``structure`` / ``compact_structure`` populate the ``structure`` field.
+        * ``screenshot`` / ``screenshot_format`` capture and attach a screenshot.
+
+        Centralising the two legacy methods (``_fetch_browser`` and
+        ``_fetch_browser_extract``) keeps the proxy rotation, fetcher
+        acquisition/release, and error-handling branches in a single place so
+        they cannot drift apart.
         """
         if self.config.session_rotation == "rotate" and proxy != "none":
             settings = resolve_proxy(proxy)
@@ -943,7 +816,7 @@ class PageFetch:
         result = self._result_from_html(
             original_url=url,
             final_url=response.url,
-            status_code=response.status_code,
+            status_code=response.status_code if response.status_code is not None else status_code,
             html=response.html,
             content_type="text/html",
             encoding="utf-8",
@@ -973,7 +846,7 @@ class PageFetch:
             result.warnings.append("Rendered content may still be incomplete.")
         return result
 
-    async def _http_fetcher(self, provider: str, url: str = "") -> HTTPFetcher:
+    async def _http_fetcher(self, provider: str) -> HTTPFetcher:
         cache_key = provider
         if cache_key not in self._http_fetchers:
             async with self._http_init_lock:
@@ -1290,4 +1163,5 @@ class PageFetch:
             proxy_provider=proxy,
             fetched_at=datetime.now(UTC),
             error=error,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
         )

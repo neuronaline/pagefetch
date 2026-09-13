@@ -7,15 +7,16 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urldefrag, urljoin
 
 from bs4 import BeautifulSoup
 
-logger = logging.getLogger("pagefetch.fetching.browser")
-
+from ..config import VALID_SCREENSHOT_FORMATS, VALID_SCREENSHOT_MODES
 from ..models import FetchErrorInfo
 from ..processing.detector import ConfidenceReport, analyze_html
 from ..proxy.providers import ProxySettings
@@ -23,6 +24,28 @@ from ..utils.urls import registrable_host
 from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
+
+logger = logging.getLogger("pagefetch.fetching.browser")
+
+# ``DISPLAY`` is process-global, while fetchers may run from different event
+# loops in different threads.  A thread lock is therefore required here;
+# asyncio.Lock is loop-affine.  Acquisition is polled asynchronously below so
+# a launch in another thread never blocks an event loop.
+_DISPLAY_LAUNCH_LOCK = threading.Lock()
+
+
+@asynccontextmanager
+async def _display_launch_lock():
+    """Hold the process-wide launch lock without blocking an event loop."""
+    acquired = False
+    try:
+        while not _DISPLAY_LAUNCH_LOCK.acquire(blocking=False):  # noqa: ASYNC110
+            await asyncio.sleep(0.01)
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            _DISPLAY_LAUNCH_LOCK.release()
 
 # Resource-type blocking sets per stealth level.
 #   minimal:   only pure overhead (media, beacon) + websocket
@@ -56,10 +79,6 @@ class BrowserResponse:
     confidence: ConfidenceReport
     screenshot: bytes | None = None
     screenshot_format: str | None = None
-
-
-_VALID_SCREENSHOT_MODES = frozenset({"none", "viewport", "full"})
-_VALID_SCREENSHOT_FORMATS = frozenset({"png", "jpeg"})
 
 
 class BrowserFetcher:
@@ -150,9 +169,22 @@ class BrowserFetcher:
                 use_xvfb = host_os == "linux"
                 if use_xvfb:
                     if self._xvfb is None or not self._xvfb.is_running:
+                        xvfb = XvfbDisplay()
+                        start_task = asyncio.create_task(asyncio.to_thread(xvfb.start))
                         try:
-                            xvfb = XvfbDisplay()
-                            xvfb.start()
+                            await asyncio.shield(start_task)
+                        except asyncio.CancelledError:
+                            # The shielded task is still running; wait for
+                            # it to settle so ``xvfb.stop`` sees a consistent
+                            # process state. The cancellation supersedes any
+                            # start failure, so we discard the inner result.
+                            try:
+                                await asyncio.shield(start_task)
+                            except Exception:  # noqa: BLE001 — tear-down supersedes
+                                pass
+                            finally:
+                                await asyncio.shield(asyncio.to_thread(xvfb.stop))
+                            raise
                         except XvfbNotFound as exc:
                             raise TransportFailure(
                                 FetchErrorInfo(
@@ -172,10 +204,6 @@ class BrowserFetcher:
                                 )
                             ) from exc
                         self._xvfb = xvfb
-                    # AsyncCamoufox spawns Firefox as a child process and
-                    # inherits ``os.environ`` at fork time; setting DISPLAY
-                    # right before launch is the standard X11 wiring.
-                    os.environ["DISPLAY"] = self._xvfb.display
 
                 options: dict[str, Any] = {
                     "headless": not use_xvfb,
@@ -206,8 +234,24 @@ class BrowserFetcher:
                     "browser.cache.memory.enable": True,
                     "toolkit.cosmeticAnimations.enabled": False,
                 }
-                self._manager = AsyncCamoufox(**options)
-                self._browser = await self._manager.__aenter__()
+                # AsyncCamoufox starts Firefox during ``__aenter__()`` and
+                # the child inherits os.environ.  Keep the temporary DISPLAY
+                # mutation confined to that spawn and always restore the
+                # caller's process environment, including on cancellation.
+                async with _display_launch_lock():
+                    previous_display = os.environ.get("DISPLAY")
+                    try:
+                        if use_xvfb:
+                            os.environ["DISPLAY"] = self._xvfb.display
+                        self._manager = AsyncCamoufox(**options)
+                        self._browser = await self._manager.__aenter__()
+                    finally:
+                        if previous_display is None:
+                            os.environ.pop("DISPLAY", None)
+                        else:
+                            os.environ["DISPLAY"] = previous_display
+            except TransportFailure:
+                raise
             except Exception as exc:
                 if self._manager is not None:
                     try:
@@ -227,11 +271,25 @@ class BrowserFetcher:
                 ) from exc
             self._needs_reset = False
 
+    @staticmethod
+    def _timeout_failure() -> TransportFailure:
+        return TransportFailure(
+            FetchErrorInfo("browser_timeout", "browser navigation timed out", False)
+        )
+
+    async def _backoff_before_deadline(self, attempt: int, deadline: float) -> bool:
+        """Sleep for retry jitter without exceeding the operation deadline."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        delay = 0.5 * (2**attempt) + random.uniform(0, 0.50)
+        await asyncio.sleep(min(delay, remaining))
+        return time.monotonic() < deadline
+
     async def fetch(
         self,
         url: str,
         *,
-        proxy: ProxySettings | None = None,
         screenshot: str = "none",
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
@@ -242,9 +300,9 @@ class BrowserFetcher:
         analysis or inter-retry backoff, so other tasks can use the browser
         during those windows.
 
-        A browser process has one immutable proxy configuration. Callers that
-        need a different proxy must create a separate fetcher; changing it
-        while pages are active would close contexts belonging to other tasks.
+        A browser process has one immutable proxy configuration set at
+        construction; this coroutine cannot change it. Callers that need a
+        different proxy must create a separate :class:`BrowserFetcher`.
 
         ``screenshot`` selects capture mode: ``"none"`` (default) skips the
         capture, ``"viewport"`` captures the initial visible area,
@@ -252,23 +310,13 @@ class BrowserFetcher:
         is ``"png"`` (default) or ``"jpeg"``. Captures exceeding
         ``screenshot_max_bytes`` are discarded with a warning.
         """
-        if screenshot not in _VALID_SCREENSHOT_MODES:
-            raise ValueError(f"screenshot must be one of {sorted(_VALID_SCREENSHOT_MODES)}")
-        if screenshot_format not in _VALID_SCREENSHOT_FORMATS:
-            raise ValueError(f"screenshot_format must be one of {sorted(_VALID_SCREENSHOT_FORMATS)}")
+        if screenshot not in VALID_SCREENSHOT_MODES:
+            raise ValueError(f"screenshot must be one of {sorted(VALID_SCREENSHOT_MODES)}")
+        if screenshot_format not in VALID_SCREENSHOT_FORMATS:
+            raise ValueError(f"screenshot_format must be one of {sorted(VALID_SCREENSHOT_FORMATS)}")
         if not isinstance(screenshot_max_bytes, int) or isinstance(screenshot_max_bytes, bool) or screenshot_max_bytes <= 0:
             raise ValueError("screenshot_max_bytes must be a positive integer")
 
-        if proxy is not None and proxy != self.proxy:
-            raise TransportFailure(
-                FetchErrorInfo(
-                    "browser_proxy_mismatch",
-                    "browser proxy cannot be changed after fetcher creation",
-                    False,
-                )
-            )
-
-        last_failure: TransportFailure | None = None
         total_deadline = time.monotonic() + self.timeout
         # Start with a balanced scroll profile; escalate on retry.
         max_scrolls = 6
@@ -280,10 +328,15 @@ class BrowserFetcher:
         try:
             for attempt in range(self.retries + 1):
                 try:
+                    remaining = total_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise self._timeout_failure()
                     # ── browser I/O inside semaphore ──
                     async with self.semaphore:
-                        await self.start()
-                        remaining = max(5.0, total_deadline - time.monotonic())
+                        await asyncio.wait_for(self.start(), timeout=remaining)
+                        remaining = total_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise self._timeout_failure()
                         result = await self._fetch_page_once(
                             url,
                             max_scrolls=max_scrolls,
@@ -310,10 +363,13 @@ class BrowserFetcher:
                         max_scrolls = min(12, max_scrolls + 3)
                         scroll_sleep_early = min(0.20, scroll_sleep_early + 0.03)
                         scroll_sleep_late = min(0.28, scroll_sleep_late + 0.05)
-                        await asyncio.sleep(0.5 * (2**attempt) + random.uniform(0, 0.50))
+                        if not await self._backoff_before_deadline(attempt, total_deadline):
+                            raise self._timeout_failure()
                         continue
 
                     return result
+                except TimeoutError as exc:
+                    raise self._timeout_failure() from exc
                 except TransportFailure as exc:
                     last_failure = exc
                     if not exc.error.retryable or attempt >= self.retries:
@@ -321,9 +377,14 @@ class BrowserFetcher:
                     if exc.error.code in {"browser_launch_error", "browser_navigation_error"}:
                         self._browser = None
                         self._needs_reset = True
-                    await asyncio.sleep(0.5 * (2**attempt) + random.uniform(0, 0.50))
-            assert last_failure is not None
-            raise last_failure
+                    if not await self._backoff_before_deadline(attempt, total_deadline):
+                        raise self._timeout_failure() from exc
+            # Unreachable: every iteration ``continue``-s, ``return``-s, or
+            # ``raise``-s. ``last_failure`` is recorded for forensics but the
+            # exhaustive loop terminates before this line runs.
+            raise AssertionError(
+                f"browser retry loop exited without terminating: last_failure={last_failure!r}"
+            )
         finally:
             async with self._active_lock:
                 self._active_count -= 1
@@ -468,17 +529,16 @@ class BrowserFetcher:
                 # configured margin over max_content_size. The default
                 # browser_pre_check_byte_margin is 1.5 (multi-byte UTF-8
                 # safety margin); lower values reject pages earlier and
-                # higher values are more permissive. The error is marked
-                # retryable=True because callers can legitimately retry
-                # with a larger max_content_size or more aggressive
-                # cleaning_level.
+                # higher values are more permissive. Retrying this immutable
+                # fetcher cannot change its size limit, so this failure is
+                # terminal for the current operation.
                 margin = self.browser_pre_check_byte_margin
                 if pre_size > self.max_content_size * margin:
                     raise TransportFailure(
                         FetchErrorInfo(
                             "content_too_large",
                             "rendered content exceeds maximum size",
-                            True,
+                            False,
                         )
                     )
                 html = await page.content()
@@ -495,7 +555,7 @@ class BrowserFetcher:
                         FetchErrorInfo(
                             "content_too_large",
                             "rendered content exceeds maximum size",
-                            True,
+                            False,
                         )
                     )
 
@@ -535,6 +595,15 @@ class BrowserFetcher:
                 )
         except TransportFailure:
             raise
+        except TimeoutError as exc:
+            raise TransportFailure(
+                FetchErrorInfo(
+                    "browser_timeout",
+                    "browser navigation timed out",
+                    True,
+                    type(exc).__name__,
+                )
+            ) from exc
         except Exception as exc:
             message = str(exc).lower()
             timeout = "timeout" in message
@@ -629,6 +698,7 @@ class BrowserFetcher:
             finally:
                 self._manager = None
                 self._browser = None
-        if self._xvfb is not None:
-            self._xvfb.stop()
-            self._xvfb = None
+        xvfb = self._xvfb
+        self._xvfb = None
+        if xvfb is not None:
+            await asyncio.to_thread(xvfb.stop)

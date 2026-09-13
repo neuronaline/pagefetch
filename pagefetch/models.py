@@ -9,12 +9,12 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from typing import Any
 
-
 _LOGGER = logging.getLogger("pagefetch.models")
 
 # Compact serialization bounds. Kept conservative so the LLM-facing JSON
 # payload never balloons even for pages with megabyte-sized inline scripts.
 _COMPACT_INLINE_PREVIEW = 160
+_COMPACT_STRUCTURE_SCHEMA = "pagefetch.structure.compact.v1"
 
 
 @dataclass(slots=True)
@@ -180,7 +180,9 @@ class FetchResult:
         consumers and developer inspection: empty fields are dropped,
         stylesheet/script entries shrink to ``{"url": ...}``, and inline
         ``<style>``/``<script>`` previews are returned as ``{length, preview}``
-        instead of the full content.
+        instead of the full content. Compact structures are inspection-only and
+        cannot be reconstructed with :meth:`from_dict`, because their inline
+        source content is deliberately lossy.
 
         ``include_screenshot=True`` opt-in emits the screenshot bytes as a
         base64-encoded ``screenshot`` field alongside ``screenshot_format``.
@@ -324,6 +326,7 @@ def _structure_to_dict(value: PageStructure, *, compact: bool = False) -> dict[s
         inline_scripts = [asdict(item) for item in value.inline_scripts]
 
     return {
+        "schema": _COMPACT_STRUCTURE_SCHEMA if compact else "pagefetch.structure.v1",
         "root": node_to_dict(value.root) if value.root is not None else None,
         "stylesheets": stylesheets,
         "inline_styles": inline_styles,
@@ -351,12 +354,22 @@ def _compact_inline(item: InlineStylesheet | InlineScript) -> dict[str, Any]:
 
 
 def _structure_from_dict(data: dict[str, Any]) -> PageStructure:
-    """Inverse of :func:`_structure_to_dict`."""
+    """Inverse of the lossless structure representation.
+
+    Compact structures carry the ``pagefetch.structure.compact.v1`` schema
+    marker and contain previews instead of inline source content; reconstructing
+    them would silently manufacture incomplete source. They are intentionally
+    inspection-only and must not enter cache deserialization.
+    """
+    if data.get("schema") == _COMPACT_STRUCTURE_SCHEMA:
+        raise ValueError(
+            "compact structure payloads are inspection-only and cannot be reconstructed"
+        )
 
     def node_from_dict(item: dict[str, Any]) -> StructureNode:
         return StructureNode(
             tag=item["tag"],
-            selector=item["selector"],
+            selector=item.get("selector", item.get("path", "")),
             attrs=dict(item.get("attrs", {})),
             text=item.get("text", ""),
             children=[node_from_dict(child) for child in item.get("children", [])],
@@ -384,4 +397,3 @@ def _structure_from_dict(data: dict[str, Any]) -> PageStructure:
         node_count=int(data.get("node_count", 0)),
         max_depth=int(data.get("max_depth", 0)),
     )
-

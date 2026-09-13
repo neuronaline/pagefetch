@@ -10,7 +10,18 @@ import sys
 from pathlib import Path
 
 from .client import PageFetch
-from .config import PageFetchConfig
+from .config import (
+    VALID_BLOCK_LEVELS,
+    VALID_CLEANING_LEVELS,
+    VALID_MODES,
+    VALID_OUTPUT_FORMATS,
+    VALID_PROXIES,
+    VALID_SCREENSHOT_FORMATS,
+    VALID_SCREENSHOT_MODES,
+    VALID_SESSION_ROTATION,
+    VALID_STEALTH_LEVELS,
+    PageFetchConfig,
+)
 from .models import FetchResult
 from .utils.rendering import render_results
 from .utils.urls import read_urls_from_file
@@ -30,21 +41,21 @@ def _configure_unicode_streams() -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pagefetch", description="Fetch complete web page content")
     parser.add_argument("input", metavar="URL_OR_FILE")
-    parser.add_argument("--format", choices=("markdown", "json", "html", "structure", "raw"), default="markdown")
+    parser.add_argument("--format", choices=sorted(VALID_OUTPUT_FORMATS), default="markdown")
     parser.add_argument("-c", "--config", type=Path, metavar="PATH", help="Path to config.yaml")
-    parser.add_argument("--mode", choices=("auto", "http", "browser"), default=argparse.SUPPRESS)
-    parser.add_argument("--proxy", choices=("none", "decodo", "dataimpulse"), default=argparse.SUPPRESS)
+    parser.add_argument("--mode", choices=sorted(VALID_MODES), default=argparse.SUPPRESS)
+    parser.add_argument("--proxy", choices=sorted(VALID_PROXIES), default=argparse.SUPPRESS)
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("--include-html", action="store_true")
     parser.add_argument(
         "--screenshot",
-        choices=("none", "viewport", "full"),
+        choices=sorted(VALID_SCREENSHOT_MODES),
         default=argparse.SUPPRESS,
         help="Capture a screenshot (forces mode=browser). 'viewport' = visible area, 'full' = entire scrollable page.",
     )
     parser.add_argument(
         "--screenshot-format",
-        choices=("png", "jpeg"),
+        choices=sorted(VALID_SCREENSHOT_FORMATS),
         default=argparse.SUPPRESS,
         help="Screenshot encoding (default: png).",
     )
@@ -65,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Stealth / fingerprint configuration
     parser.add_argument(
         "--block-level",
-        choices=("minimal", "balanced", "aggressive"),
+        choices=sorted(VALID_BLOCK_LEVELS),
         default=argparse.SUPPRESS,
         help="Resource blocking aggressiveness (default: aggressive)",
     )
@@ -79,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-humanize", action="store_false", default=argparse.SUPPRESS, dest="humanize")
     parser.add_argument(
         "--session-rotation",
-        choices=("sticky", "rotate"),
+        choices=sorted(VALID_SESSION_ROTATION),
         default=argparse.SUPPRESS,
         help="Proxy session rotation strategy (default: sticky)",
     )
@@ -92,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stealth-level",
-        choices=("off", "balanced", "max"),
+        choices=sorted(VALID_STEALTH_LEVELS),
         default=argparse.SUPPRESS,
         help="Anti-detection profile preset (default: off)",
     )
@@ -104,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--cleaning-level",
-        choices=("minimal", "standard", "maximum"),
+        choices=sorted(VALID_CLEANING_LEVELS),
         default=argparse.SUPPRESS,
         help="How aggressively to strip non-content DOM (default: standard)",
     )
@@ -229,6 +240,8 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         proxy_geo=overrides.get("proxy_geo", config.proxy_geo),
         cleaning_level=overrides.get("cleaning_level", config.cleaning_level),
         raise_on_error=config.raise_on_error,
+        screenshot_max_bytes=config.screenshot_max_bytes,
+        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
     )
 
 
@@ -282,6 +295,7 @@ async def _run(args: argparse.Namespace) -> int:
         cleaning_level=config.cleaning_level,
         raise_on_error=config.raise_on_error,
         screenshot_max_bytes=config.screenshot_max_bytes,
+        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
     ) as client:
         if use_extract:
             results = []
@@ -316,11 +330,11 @@ async def _run(args: argparse.Namespace) -> int:
         except UnicodeEncodeError:
             sys.stdout.buffer.write((rendered + "\n").encode("utf-8"))
     total = len(results)
+    if total == 0:
+        return 0
     success_count = sum(1 for r in results if r.success)
     cache_count = sum(1 for r in results if r.from_cache)
     print(f"pagefetch: {total} URL(s) — {success_count} succeeded ({cache_count} from cache), {total - success_count} failed", file=sys.stderr)
-    if not results:
-        return 0
     if success_count == 0:
         return 1
     if success_count < total:

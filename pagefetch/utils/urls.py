@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
-from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import tldextract
 
@@ -53,9 +53,9 @@ def normalize_url(url: str) -> str:
     default_port = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
     userinfo = ""
     if parsed.username:
-        userinfo = quote(parsed.username, safe="")
+        userinfo = quote(unquote(parsed.username), safe="")
         if parsed.password:
-            userinfo += f":{quote(parsed.password, safe='')}"
+            userinfo += f":{quote(unquote(parsed.password), safe='')}"
         userinfo += "@"
     netloc = f"{userinfo}{hostname}"
     if port and not default_port:

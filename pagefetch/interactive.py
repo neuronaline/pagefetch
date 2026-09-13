@@ -5,11 +5,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 
 from .client import PageFetch
-from .config import VALID_CLEANING_LEVELS, VALID_MODES, VALID_PROXIES, PageFetchConfig
+from .config import (
+    VALID_CLEANING_LEVELS,
+    VALID_MODES,
+    VALID_PROXIES,
+    PageFetchConfig,
+)
 from .models import FetchResult
 from .utils.rendering import render_results
 from .utils.urls import read_urls_from_file
@@ -100,6 +106,8 @@ def _apply_debug(settings: dict) -> None:
 
 async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
     """Fetch a single URL."""
+    if _requires_extract(settings):
+        return await _extract_url(client, url, settings)
     result = await client.fetch(
         url,
         mode=settings.get("mode"),
@@ -136,6 +144,17 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
         print("\n  Error: the file does not contain any URLs.")
         return []
     print(f"\n  Fetching {len(urls)} URL(s)...\n")
+    if _requires_extract(settings):
+        # Honor ``request_pacing`` here the same way ``fetch_many`` does for
+        # non-extraction paths; without it a list of N URLs would all arrive
+        # at the target in a synchronized burst — a strong bot signal.
+        groups: list[list[FetchResult]] = []
+        pacing = client.config.request_pacing or 0.0
+        for i, url in enumerate(urls):
+            if i > 0 and pacing > 0:
+                await asyncio.sleep(random.uniform(0, pacing))
+            groups.append(await _extract_url(client, url, settings))
+        return [result for group in groups for result in group]
     return await client.fetch_many(
         urls,
         mode=settings.get("mode"),
@@ -143,6 +162,11 @@ async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[
         use_cache=settings.get("use_cache", True),
         cache_ttl=settings.get("cache_ttl"),
     )
+
+
+def _requires_extract(settings: dict) -> bool:
+    """Return whether the selected output needs browser extraction data."""
+    return settings.get("format") in {"raw", "structure"} or settings.get("screenshot") != "none"
 
 
 def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEventLoop) -> None:
@@ -289,6 +313,7 @@ def _handle_extract(client: PageFetch, settings: dict, loop: asyncio.AbstractEve
         output_format,
         include_html=False,
         include_structure=has_structure,
+        compact_structure=settings.get("compact_structure", False),
         include_screenshot=has_screenshot,
     )
     output_file = settings.get("output")
@@ -437,15 +462,18 @@ def _view_config(settings: dict) -> None:
     if config_file:
         print(f"  Config file  : {config_file}")
         config = PageFetchConfig.from_yaml(config_file)
-        print(f"  Mode         : {config.mode}")
-        print(f"  Proxy        : {config.proxy}")
-        print(f"  Cleaning     : {config.cleaning_level}")
     else:
         print("  Config file  : (defaults)")
+        config = PageFetchConfig()
 
-    mode = settings.get("mode") or "auto"
-    proxy = settings.get("proxy") or "none"
-    cleaning_level = settings.get("cleaning_level") or config.cleaning_level if config_file else "standard"
+    # Use explicit None checks (matching ``_init_client``) so a settings key
+    # that is set to a falsy value (e.g. ``""`` or ``False``) is honored
+    # rather than silently falling back to the config-file default.
+    mode = settings.get("mode") if settings.get("mode") is not None else config.mode
+    proxy = settings.get("proxy") if settings.get("proxy") is not None else config.proxy
+    cleaning_level = (
+        settings.get("cleaning_level") if settings.get("cleaning_level") is not None else config.cleaning_level
+    )
 
     print(f"  Mode             : {mode}")
     print(f"  Proxy            : {proxy}")
@@ -507,6 +535,7 @@ def _init_client(settings: dict) -> PageFetch:
         proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
         screenshot_max_bytes=config.screenshot_max_bytes,
+        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
     )
 
 
@@ -586,44 +615,25 @@ def interactive_main() -> int:
             try:
                 if choice == "1":
                     _handle_fetch(client, settings, loop)
-                    # Re-create the client only when settings that
-                    # actually shape it have changed — otherwise the
-                    # browser pool would be torn down needlessly.
-                    current_fingerprint = _client_fingerprint(settings)
-                    if current_fingerprint != last_client_fingerprint:
-                        try:
-                            loop.run_until_complete(client.close())
-                        except Exception:
-                            pass
-                        client = _init_client(settings)
-                        last_client_fingerprint = current_fingerprint
                 elif choice == "2":
                     _handle_extract(client, settings, loop)
-                    current_fingerprint = _client_fingerprint(settings)
-                    if current_fingerprint != last_client_fingerprint:
-                        try:
-                            loop.run_until_complete(client.close())
-                        except Exception:
-                            pass
-                        client = _init_client(settings)
-                        last_client_fingerprint = current_fingerprint
                 elif choice == "3":
                     _settings_menu(settings)
-                    # Settings may have changed — refresh the client
-                    # only if the change actually affects it.
-                    current_fingerprint = _client_fingerprint(settings)
-                    if current_fingerprint != last_client_fingerprint:
-                        try:
-                            loop.run_until_complete(client.close())
-                        except Exception:
-                            pass
-                        client = _init_client(settings)
-                        last_client_fingerprint = current_fingerprint
                 elif choice == "4":
                     _view_config(settings)
                 elif choice == "5":
                     print("\n  Goodbye!")
                     break
+
+                if choice in {"1", "2", "3"}:
+                    current_fingerprint = _client_fingerprint(settings)
+                    if current_fingerprint != last_client_fingerprint:
+                        try:
+                            loop.run_until_complete(client.close())
+                        except Exception:
+                            pass
+                        client = _init_client(settings)
+                        last_client_fingerprint = current_fingerprint
             except KeyboardInterrupt:
                 print("\n\n  Interrupted. Goodbye!")
                 break
