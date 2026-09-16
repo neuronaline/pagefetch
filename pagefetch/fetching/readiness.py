@@ -32,9 +32,11 @@ async def in_page_metrics(page: Any) -> PageMetrics:
                 mainText += (el.innerText?.length || 0);
             }
             const lowered = (body?.innerText || '').toLowerCase();
-            const challenge = lowered.includes('checking your browser') ||
+            const challenge = (
+                lowered.includes('checking your browser') ||
                 lowered.includes('verify you are human') ||
-                (document.title || '').toLowerCase().includes('challenge');
+                (document.title || '').toLowerCase().includes('challenge')
+            ) && bodyText < 400;
             return {text: bodyText, mainText, challenge};
         }"""
     )

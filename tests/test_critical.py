@@ -489,3 +489,60 @@ async def test_close_finishes_after_the_initial_caller_is_cancelled(tmp_path):
     assert client._closed is True
     assert client._closing is False
     assert not client._browser_fetchers
+
+
+# ---------------------------------------------------------------------------
+# Detector & Browser: false-positive retries and Linux Wayland isolation
+# ---------------------------------------------------------------------------
+
+
+def test_detector_does_not_leak_noscript_or_false_flag_recaptcha():
+    from pagefetch.processing.detector import analyze_html
+
+    # Case 1: Page with noscript tag containing nested tags must not trigger explicit_js
+    html_noscript = (
+        "<html><head><title>Articles Hub</title></head><body>"
+        "<noscript><div>You must enable JavaScript to use this site.</div></noscript>"
+        "<main><h1>Breaking News</h1>"
+        "<p>This is a complete and substantive article with lots of detailed information.</p>"
+        "<p>Economic data indicates strong growth across multiple key sectors this quarter.</p>"
+        "</main></body></html>"
+    )
+    report_ns = analyze_html(html_noscript)
+    assert "document asks for JavaScript" not in report_ns.reasons
+    assert report_ns.score >= 0.40
+
+    # Case 2: Content-rich page with a recaptcha or turnstile widget in footer/form must not be flagged as challenge
+    html_captcha = (
+        "<html><head><title>Company Portal</title></head><body>"
+        "<main><h1>Quarterly Earnings Report</h1>"
+        "<p>Revenue increased by 15% year-over-year driven by cloud service demand.</p>"
+        "<p>Operating margins improved substantially while overhead expenses remained flat.</p>"
+        "<div class='g-recaptcha'></div>"
+        "<div class='cf-turnstile'></div>"
+        "</main></body></html>"
+    )
+    report_captcha = analyze_html(html_captcha)
+    assert report_captcha.challenge is False
+    assert report_captcha.score >= 0.40
+
+    # Case 3: Genuine challenge page (minimal text, only challenge) must still be detected
+    html_real_challenge = (
+        "<html><head><title>Just a moment...</title></head><body>"
+        "<h1>Checking your browser</h1>"
+        "<p>Please verify you are human to continue.</p>"
+        "<div class='cf-turnstile'></div>"
+        "</body></html>"
+    )
+    report_real = analyze_html(html_real_challenge)
+    assert report_real.challenge is True
+    assert report_real.score <= 0.10
+
+
+def test_xvfb_display_initial_state():
+    from pagefetch.fetching.virtual_display import XvfbDisplay
+
+    display = XvfbDisplay()
+    assert display.is_running is False
+    assert display.width == 1920
+

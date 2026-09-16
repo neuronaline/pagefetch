@@ -234,22 +234,47 @@ class BrowserFetcher:
                     "browser.cache.memory.enable": True,
                     "toolkit.cosmeticAnimations.enabled": False,
                 }
+                browser_env = dict(os.environ)
+                if use_xvfb:
+                    browser_env["DISPLAY"] = self._xvfb.display
+                    browser_env.pop("WAYLAND_DISPLAY", None)
+                    browser_env.pop("X_PRIVILEGED_WAYLAND_SOCKET", None)
+                    browser_env["GDK_BACKEND"] = "x11"
+                    browser_env["MOZ_ENABLE_WAYLAND"] = "0"
+                    options["virtual_display"] = self._xvfb.display
+                options["env"] = browser_env
+
                 # AsyncCamoufox starts Firefox during ``__aenter__()`` and
                 # the child inherits os.environ.  Keep the temporary DISPLAY
-                # mutation confined to that spawn and always restore the
+                # and Wayland mutation confined to that spawn and always restore the
                 # caller's process environment, including on cancellation.
                 async with _display_launch_lock():
                     previous_display = os.environ.get("DISPLAY")
+                    previous_wayland = os.environ.get("WAYLAND_DISPLAY")
+                    previous_privileged_wayland = os.environ.get("X_PRIVILEGED_WAYLAND_SOCKET")
+                    previous_gdk_backend = os.environ.get("GDK_BACKEND")
+                    previous_moz_wayland = os.environ.get("MOZ_ENABLE_WAYLAND")
                     try:
                         if use_xvfb:
                             os.environ["DISPLAY"] = self._xvfb.display
+                            os.environ.pop("WAYLAND_DISPLAY", None)
+                            os.environ.pop("X_PRIVILEGED_WAYLAND_SOCKET", None)
+                            os.environ["GDK_BACKEND"] = "x11"
+                            os.environ["MOZ_ENABLE_WAYLAND"] = "0"
                         self._manager = AsyncCamoufox(**options)
                         self._browser = await self._manager.__aenter__()
                     finally:
-                        if previous_display is None:
-                            os.environ.pop("DISPLAY", None)
-                        else:
-                            os.environ["DISPLAY"] = previous_display
+                        def _restore(key: str, val: str | None) -> None:
+                            if val is None:
+                                os.environ.pop(key, None)
+                            else:
+                                os.environ[key] = val
+
+                        _restore("DISPLAY", previous_display)
+                        _restore("WAYLAND_DISPLAY", previous_wayland)
+                        _restore("X_PRIVILEGED_WAYLAND_SOCKET", previous_privileged_wayland)
+                        _restore("GDK_BACKEND", previous_gdk_backend)
+                        _restore("MOZ_ENABLE_WAYLAND", previous_moz_wayland)
             except TransportFailure:
                 raise
             except Exception as exc:
@@ -351,12 +376,18 @@ class BrowserFetcher:
                     report = analyze_html(result.html)
                     result.confidence = report
 
-                    # Retry only for genuine failures: empty, challenge, or
-                    # *very* low confidence. Slightly-below-threshold pages
-                    # are returned with a warning instead of burning a retry.
+                    # Retry only for genuine failures: empty DOM, an active anti-bot challenge,
+                    # an unmounted JavaScript shell, or very low confidence without meaningful content.
                     empty = not result.html.strip()
                     very_low_threshold = min(0.40, self.confidence_threshold)
-                    should_retry = empty or report.challenge or report.score < very_low_threshold
+                    has_substantive_content = (
+                        not report.challenge
+                        and not report.javascript_shell
+                        and "very little visible text" not in report.reasons
+                    )
+                    should_retry = empty or report.challenge or report.javascript_shell or (
+                        report.score < very_low_threshold and not has_substantive_content
+                    )
 
                     if should_retry and attempt < self.retries:
                         # Escalate: more scrolls and longer waits on next attempt.

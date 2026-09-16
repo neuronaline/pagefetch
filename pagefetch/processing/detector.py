@@ -71,7 +71,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         value
         for node in text_root.find_all(string=True)
         if node.parent is not None
-        and node.parent.name not in {"script", "style", "template", "noscript"}
+        and not node.find_parent({"script", "style", "template", "noscript"})
         and (value := str(node).strip())
     )
     lowered_text = text.lower()
@@ -128,8 +128,22 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     if soup.find("meta", attrs={"name": re.compile(r"description", re.I)}):
         score += 0.02
 
-    strong_challenge = any(pattern in lowered_text for pattern in STRONG_CHALLENGE_PATTERNS)
-    dom_challenge = any(pattern in lowered_html for pattern in CHALLENGE_DOM_PATTERNS)
+    main_text = " ".join(main_texts)
+    has_substantive_content = (
+        text_len >= 250
+        or (len(paragraphs) >= 2 and text_len >= 100)
+        or len(main_text) >= 80
+        or (bool(headings) and len(paragraphs) >= 2)
+        or word_count >= 40
+    )
+    strong_challenge = (
+        any(pattern in lowered_text for pattern in STRONG_CHALLENGE_PATTERNS)
+        and (text_len < 400 or not (bool(paragraphs) or bool(semantic)))
+    )
+    dom_challenge = (
+        any(pattern in lowered_html for pattern in CHALLENGE_DOM_PATTERNS)
+        and not has_substantive_content
+    )
     weak_hits = sum(pattern in lowered_text for pattern in WEAK_CHALLENGE_PATTERNS)
     normalized_title = re.sub(r"\s+", " ", title.strip().lower())
     weak_title = any(
@@ -142,7 +156,9 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and (weak_title or (not semantic and not paragraphs))
     )
     challenge = strong_challenge or dom_challenge or weak_challenge
-    explicit_js = any(pattern in lowered_text for pattern in JS_PATTERNS)
+    explicit_js = any(pattern in lowered_text for pattern in JS_PATTERNS) and (
+        text_len < 400 or not (bool(paragraphs) or bool(semantic))
+    )
     framework = any(pattern in lowered_html for pattern in FRAMEWORK_PATTERNS)
     mounts = soup.select("#app:empty, #root:empty, #__next:empty, [data-reactroot]:empty")
     shell = explicit_js or bool(mounts) or (framework and text_len < 250) or (
@@ -152,7 +168,6 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     wall = any(pattern in lowered_text for pattern in WALL_PATTERNS)
     refresh = bool(soup.find("meta", attrs={"http-equiv": re.compile(r"^refresh$", re.I)}))
     navigation_text = " ".join(nav_texts)
-    main_text = " ".join(main_texts)
 
     # Reward coherent server-rendered documents continuously. Limiting this
     # bonus to <400 characters created a cliff where adding content lowered
@@ -165,7 +180,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and not refresh
         and not mounts
         and not explicit_js
-        and script_size < 2_000
+        and (script_size < 25_000 or script_size < max(5_000, text_len * 10))
         and text_len >= 80
         and word_count >= 12
         and (bool(paragraphs) or bool(headings))

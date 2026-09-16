@@ -114,6 +114,7 @@ class XvfbDisplay:
             f"{self.width}x{self.height}x{self.depth}",
             "-nolisten",
             "tcp",
+            "-ac",
             "-dpi",
             "96",
             "+extension",
