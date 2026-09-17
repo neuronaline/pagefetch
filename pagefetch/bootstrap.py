@@ -67,8 +67,8 @@ def _has_camoufox_binary() -> bool:
 
 def _auto_install_enabled() -> bool:
     """Return whether automatic browser installation is enabled."""
-    return os.getenv("PAGEFETCH_AUTO_INSTALL", "1").strip().lower() not in {
-        "0", "false", "no", "off",
+    return os.getenv("PAGEFETCH_AUTO_INSTALL", "0").strip().lower() in {
+        "1", "true", "yes", "on",
     }
 
 

@@ -8,11 +8,13 @@ import socket
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlsplit
 
 import httpx
 
 from ..constants import RETRYABLE_STATUS_CODES
 from ..models import FetchErrorInfo
+from ..utils.urls import is_safe_host
 
 
 @dataclass(slots=True)
@@ -53,6 +55,7 @@ class HTTPFetcher:
         *,
         proxy_url: str | None = None,
         headers: dict[str, str] | None = None,
+        retryable_status_codes: frozenset[int] | None = None,
     ) -> HTTPResponse:
         if proxy_url is not None:
             # Session-rotation mode: use a one-shot client with the
@@ -72,10 +75,14 @@ class HTTPFetcher:
                 ),
             )
             try:
-                return await self._fetch_with_retries(url, client=client)
+                return await self._fetch_with_retries(
+                    url, client=client, retryable_status_codes=retryable_status_codes
+                )
             finally:
                 await client.aclose()
-        return await self._fetch_with_retries(url, client=None, headers=headers)
+        return await self._fetch_with_retries(
+            url, client=None, headers=headers, retryable_status_codes=retryable_status_codes
+        )
 
     async def _fetch_with_retries(
         self,
@@ -83,12 +90,14 @@ class HTTPFetcher:
         *,
         client: httpx.AsyncClient | None = None,
         headers: dict[str, str] | None = None,
+        retryable_status_codes: frozenset[int] | None = None,
     ) -> HTTPResponse:
+        retry_codes = retryable_status_codes if retryable_status_codes is not None else RETRYABLE_STATUS_CODES
         for attempt in range(self.retries + 1):
             try:
                 async with self.semaphore:
                     response = await self._request(url, client=client, headers=headers)
-                if response.status_code in RETRYABLE_STATUS_CODES and attempt < self.retries:
+                if response.status_code in retry_codes and attempt < self.retries:
                     await self._backoff(attempt, response.headers.get("Retry-After"))
                     continue
                 return response
@@ -111,6 +120,12 @@ class HTTPFetcher:
         client = client or self.client
         try:
             async with client.stream("GET", url, headers=headers) as response:
+                target_host = (urlsplit(str(response.url)).hostname or "").lower()
+                if not is_safe_host(target_host):
+                    raise TransportFailure(
+                        FetchErrorInfo("ssrf_blocked", "HTTP request redirected to a restricted network address", False),
+                        status_code=response.status_code,
+                    )
                 declared = response.headers.get("Content-Length")
                 if declared and declared.isdigit() and int(declared) > self.max_content_size:
                     raise TransportFailure(

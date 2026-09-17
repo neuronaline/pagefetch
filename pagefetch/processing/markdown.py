@@ -184,7 +184,8 @@ class MarkdownConverter:
             for cell in cells:
                 while column in values_by_column:
                     column += 1
-                value = re.sub(r"\s+", " ", self._children(cell).strip()).replace("|", "\\|")
+                raw_cell = html_module.unescape(self._children(cell))
+                value = re.sub(r"\s+", " ", raw_cell.strip()).replace("|", "\\|")
                 colspan = self._span_value(cell.get("colspan"))
                 rowspan = self._span_value(cell.get("rowspan"))
                 for offset in range(colspan):

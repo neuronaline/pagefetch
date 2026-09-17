@@ -12,7 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urldefrag, urljoin
+from urllib.parse import urldefrag, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -20,7 +20,7 @@ from ..config import VALID_SCREENSHOT_FORMATS, VALID_SCREENSHOT_MODES
 from ..models import FetchErrorInfo
 from ..processing.detector import ConfidenceReport, analyze_html
 from ..proxy.providers import ProxySettings
-from ..utils.urls import registrable_host
+from ..utils.urls import is_safe_host, registrable_host
 from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
@@ -285,6 +285,13 @@ class BrowserFetcher:
                         pass
                 self._manager = None
                 self._browser = None
+                if self._xvfb is not None:
+                    xvfb = self._xvfb
+                    self._xvfb = None
+                    try:
+                        await asyncio.to_thread(xvfb.stop)
+                    except Exception:
+                        pass
                 raise TransportFailure(
                     FetchErrorInfo(
                         "browser_launch_error",
@@ -477,9 +484,14 @@ class BrowserFetcher:
 
                 async def route_handler(route: Any) -> None:
                     request = route.request
+                    request_url = request.url
+                    if request_url.startswith(("http://", "https://")):
+                        req_host = (urlsplit(request_url).hostname or "").lower()
+                        if not is_safe_host(req_host):
+                            await route.abort()
+                            return
                     external_frame = False
                     if request.resource_type == "document" and request.frame != page.main_frame:
-                        request_url = request.url
                         if request_url.startswith(("http://", "https://")):
                             external_frame = registrable_host(request_url) != _main_site
                     # Block non-essential resource types according to the

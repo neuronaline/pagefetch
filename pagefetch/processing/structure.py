@@ -183,7 +183,23 @@ def _walk(
     root_tag = _first_element(soup)
     if root_tag is None:
         return None, 0, False
-    node, truncated = _describe(root_tag, depth=depth, counters=counters, limits=limits)
+    # Single-pass pre-count of IDs and tag names avoids O(N^2) select queries per node
+    id_counts: dict[str, int] = {}
+    tag_counts: dict[str, int] = {}
+    for el in soup.find_all(True):
+        if isinstance(el, Tag):
+            tag_counts[el.name] = tag_counts.get(el.name, 0) + 1
+            ident = el.get("id")
+            if ident and isinstance(ident, str):
+                id_counts[ident] = id_counts.get(ident, 0) + 1
+    node, truncated = _describe(
+        root_tag,
+        depth=depth,
+        counters=counters,
+        limits=limits,
+        id_counts=id_counts,
+        tag_counts=tag_counts,
+    )
     return node, counters[0], truncated
 
 
@@ -209,6 +225,8 @@ def _describe(
     counters: list[int],
     limits: StructureLimits,
     parent_path: str = "",
+    id_counts: dict[str, int] | None = None,
+    tag_counts: dict[str, int] | None = None,
 ) -> tuple[StructureNode, bool]:
     """Recursively describe *tag* within the configured depth/node budget."""
     counters[0] += 1
@@ -218,13 +236,18 @@ def _describe(
     selector = _build_selector(tag, attrs)
     segment = _path_segment(tag, attrs)
     path = f"{parent_path} > {segment}" if parent_path else segment
-    # ``unique_selector`` requires running a CSS query to validate uniqueness.
-    # In compact mode we skip it: the ``path`` already uniquely addresses the
-    # node, and removing this saves one ``select`` per node on large pages.
+    # In compact mode unique_selector is skipped. In normal mode, derive it in O(1)
+    # using precomputed single-pass counts instead of O(N^2) full-document CSS queries.
     if limits.compact:
         unique_selector = ""
     else:
-        unique_selector = _unique_selector(tag, selector, path)
+        ident = attrs.get("id")
+        if ident and id_counts and id_counts.get(ident, 0) == 1:
+            unique_selector = f"#{_css_escape(ident)}"
+        elif tag_counts and tag_counts.get(tag.name, 0) == 1:
+            unique_selector = tag.name
+        else:
+            unique_selector = path
     children: list[StructureNode] = []
     has_element_children = any(isinstance(child, Tag) for child in tag.children)
     if depth + 1 < limits.max_depth and counters[0] < limits.max_nodes:
@@ -237,6 +260,8 @@ def _describe(
                 counters=counters,
                 limits=limits,
                 parent_path=path,
+                id_counts=id_counts,
+                tag_counts=tag_counts,
             )
             children.append(child_node)
             if child_truncated:

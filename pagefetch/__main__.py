@@ -6,8 +6,9 @@ Use ``python -m pagefetch --cli [args...]`` for the argparse-based command-line 
 
 import sys
 
-if "--cli" in sys.argv:
-    sys.argv.remove("--cli")
+if "--cli" in sys.argv or len(sys.argv) > 1:
+    if "--cli" in sys.argv:
+        sys.argv.remove("--cli")
     from .cli import main
     raise SystemExit(main())
 else:

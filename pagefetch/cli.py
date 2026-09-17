@@ -126,14 +126,20 @@ def _inputs(value: str) -> list[str]:
     if value.startswith(("http://", "https://")):
         return [value]
     path = Path(value)
-    if not path.is_file():
-        # If it looks like a file path (has an extension or a directory separator)
-        # but doesn't exist, give a clear error instead of treating it as a URL.
-        if path.suffix or "/" in value or "\\" in value:
-            raise ValueError(f"file not found: {value!r}")
-        # Otherwise assume it's a URL (downstream validation will catch bad ones).
-        return [value]
-    return read_urls_from_file(value)
+    if path.is_file():
+        return read_urls_from_file(value)
+    # Check if it looks explicitly like a local file path
+    file_exts = {".txt", ".csv", ".json", ".yaml", ".yml", ".urls", ".list", ".tsv", ".log", ".in"}
+    is_explicit_path = value.startswith(("./", "../", "/", "~", ".\\", "..\\")) or "\\" in value
+    if is_explicit_path or (path.suffix and path.suffix.lower() in file_exts):
+        raise ValueError(f"file not found: {value!r}")
+    # Bare domain or domain with path: auto-prefix with https://
+    host_part = value.split("/", 1)[0]
+    if "." in host_part and not host_part.startswith(".") and not host_part.endswith("."):
+        return [f"https://{value}"]
+    if "/" in value or path.suffix:
+        raise ValueError(f"file not found: {value!r}")
+    return [value]
 
 
 def _render(
@@ -254,7 +260,7 @@ async def _run(args: argparse.Namespace) -> int:
     extract_structure = output_format in {"structure", "raw"}
     screenshot = getattr(args, "screenshot", "none") or "none"
     screenshot_format = getattr(args, "screenshot_format", "png") or "png"
-    include_screenshot = screenshot != "none" and output_format == "raw"
+    include_screenshot = screenshot != "none" and output_format in {"raw", "json"}
     # Screenshot capture (and structure/raw output) requires the rendered DOM;
     # auto-promote to browser mode so the call doesn't surface a
     # ``ValueError`` from PageFetch.extract. When the user explicitly

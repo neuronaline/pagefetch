@@ -104,7 +104,19 @@ def clean_html(
 
 def _inside_content(tag: Tag) -> bool:
     """Return whether a tag is inside an article's main content region."""
-    return any(parent.name in {"main", "article"} for parent in tag.parents)
+    for parent in tag.parents:
+        if not isinstance(parent, Tag):
+            continue
+        if parent.name in {"main", "article"}:
+            return True
+        if str(parent.get("role", "")).lower() == "main":
+            return True
+        parent_id = str(parent.get("id", "")).lower()
+        parent_classes = " ".join(parent.get("class", [])).lower()
+        parent_ident = f"{parent_id} {parent_classes}"
+        if any(marker in parent_ident for marker in ("content", "post", "article", "entry-content", "post-content")):
+            return True
+    return False
 
 
 def _remove_maximum_blocks(soup: BeautifulSoup) -> None:
@@ -122,10 +134,12 @@ def _remove_maximum_blocks(soup: BeautifulSoup) -> None:
             or (_SITE_CHROME_RE.search(identity) is not None and not _inside_content(tag))
         )
         # Semantic headers/footers are site chrome only outside main/article;
-        # article title/author header/footer elements must remain intact.
+        # preserve headers containing main heading tags (h1/h2) unless marked as site banner.
+        has_primary_heading = tag.name == "header" and tag.find(["h1", "h2"]) is not None
         is_outside_content_header_or_footer = (
             tag.name in {"header", "footer"}
             and not _inside_content(tag)
+            and not has_primary_heading
         )
         is_auxiliary_block = _MAX_BLOCK_RE.search(identity) is not None
         if (

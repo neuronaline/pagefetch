@@ -18,6 +18,29 @@ def _get_tld_extract() -> tldextract.TLDExtract:
     return _TLD_EXTRACT
 
 
+def is_safe_host(hostname: str) -> bool:
+    """Return False if hostname is a private, loopback, link-local, or cloud-metadata address."""
+    host = hostname.strip().lower().rstrip(".")
+    if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            return False
+        if host == "169.254.169.254" or host.startswith("fd00:"):
+            return False
+    except ValueError:
+        pass
+    return True
+
+
 def validate_url(url: str) -> SplitResult:
     """Validate that *url* is an absolute HTTP(S) URL.
 
@@ -31,6 +54,8 @@ def validate_url(url: str) -> SplitResult:
         raise ValueError("only http and https URL schemes are supported")
     if not parsed.hostname:
         raise ValueError("URL must include a hostname")
+    if not is_safe_host(parsed.hostname):
+        raise ValueError("URL points to a restricted local or private network address (SSRF protection)")
     try:
         _ = parsed.port
     except ValueError as exc:

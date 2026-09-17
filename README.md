@@ -1,7 +1,7 @@
 # PageFetch
 
 **Async-first web scraping and content extraction library for Python 3.11+ — with
-intelligent browser fallback, built-in caching, and structured Markdown output.**
+intelligent browser fallback, built-in caching, SSRF protection, and structured Markdown output.**
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
@@ -19,7 +19,7 @@ metadata, and more — regardless of which method succeeded.
 
 Perfect for **web scraping**, **content aggregation**, **LLM data pipelines**,
 **SEO analysis**, **archiving**, and any workflow that needs reliable page
-content without fighting bot detection.
+content without fighting bot detection or leaking internal infrastructure.
 
 Supported environments: Windows 10/11 x64 and Ubuntu 22.04/24.04 x64 on
 Python 3.11–3.13. Browser mode relies on the corresponding upstream Camoufox
@@ -31,6 +31,7 @@ artifact.
 
 - [Quick Start](#quick-start)
 - [Why PageFetch](#why-pagefetch)
+- [Security & SSRF Protection](#security--ssrf-protection)
 - [Stealth & Anti-Detection](#stealth--anti-detection)
 - [How It Works](#how-it-works)
 - [Installation](#installation)
@@ -91,13 +92,26 @@ async with PageFetch(mode="auto") as client:
 |---|---|
 | **Bot detection & blocking** | Camoufox stealth browser with automatic fallback when HTTP returns empty, blocked (403/429), or JavaScript-dependent pages |
 | **Over-fetching with heavy browsers** | HTTP-first strategy — only ~5–15% of pages need the browser in auto mode |
+| **Internal network vulnerabilities** | Built-in SSRF protection blocking private IPs, loopback, link-local, and cloud metadata endpoints across both HTTP and browser layers |
 | **Inconsistent output formats** | Single `FetchResult` model: always get `.markdown`, `.html`, `.text`, `.links`, `.images`, `.metadata` |
-| **Managing concurrency** | Built-in semaphores for HTTP (default 10) and browser (default 4) — safe for hundreds of URLs |
+| **Managing concurrency** | Built-in semaphores for HTTP (default 10) and browser (default 4) with bounded browser session rotation |
 | **Repeated requests waste bandwidth** | SQLite disk cache with configurable TTL, shared across runs |
-| **Proxy rotation complexity** | Native Decodo and DataImpulse integration — configure via env vars |
+| **Proxy rotation complexity** | Native Decodo and DataImpulse integration — configure via env vars or code |
 | **Content that isn't HTML** | PDFs auto-detected and extracted; XML documents parsed; plain text preserved |
+| **Fast DOM inspection** | $O(N)$ single-pass structural summary generating verified unique CSS selectors |
 | **Dependency management friction** | Core HTTP support stays lightweight; browser and PDF features use explicit extras |
 | **Hard-to-match fingerprints** | `stealth_level` presets + `humanize`, `block_level`, `request_pacing`, `session_rotation`, and `proxy_geo` for locale-aligned Accept-Language |
+
+---
+
+## Security & SSRF Protection
+
+PageFetch incorporates strict Server-Side Request Forgery (SSRF) defense at both the HTTP and browser layers:
+
+- **Restricted Targets**: Any attempt to fetch private networks (e.g. `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback addresses (`127.0.0.0/8`, `localhost`), link-local IPs, multicast ranges, or cloud provider metadata endpoints (`169.254.169.254`) is rejected immediately with an `invalid_url` error.
+- **Redirect Validation**: HTTP redirect chains validate each hop against SSRF rules, preventing open redirect bypasses.
+- **Browser Route Interception**: Camoufox browser instances intercept page-level and subresource network routes to block access to restricted hosts and internal IP ranges.
+- **Opt-in Runtime Installs**: Dynamic package installation at runtime is disabled by default (`PAGEFETCH_AUTO_INSTALL=0`) to prevent unexpected execution of external install scripts.
 
 ---
 
@@ -112,11 +126,11 @@ country:
 | `stealth_level` | One-shot preset: `"off"` (default), `"balanced"`, or `"max"`. Sets `humanize`, `block_level`, `request_pacing`, and `session_rotation` together; explicit values still win. |
 | `humanize` | Add small randomized delays to mimic human interaction. |
 | `block_level` | `"minimal"`, `"balanced"`, or `"aggressive"` resource blocking (third-party trackers, fonts, media). |
-| `session_rotation` | `"sticky"` reuses one proxy session per domain; `"rotate"` forces a fresh session per request. |
+| `session_rotation` | `"sticky"` reuses one proxy session per domain; `"rotate"` manages fresh sessions within a bounded browser pool. |
 | `request_pacing` | Fixed seconds of delay between browser requests (`0.0` = none). |
 | `accept_language` | Value sent as the `Accept-Language` header. |
 | `proxy_geo` | ISO 3166-1 alpha-2 country code (e.g. `"US"`, `"DE"`, `"TR"`); aligns locale, timezone, and `Accept-Language` with the exit country. |
-| `cleaning_level` | How aggressively non-content DOM is stripped before extraction: `"minimal"` (display:none / hidden / 1×1 pixels only), `"standard"` (default — also drops cookie banners, ad slots, tracking pixels), `"maximum"` (additionally removes nav, asides, site chrome, and explicit comments/share/related blocks). Article title, tables, code blocks, and images are preserved at every level. |
+| `cleaning_level` | How aggressively non-content DOM is stripped before extraction: `"minimal"` (display:none / hidden / 1×1 pixels only), `"standard"` (default — also drops cookie banners, ad slots, tracking pixels), `"maximum"` (removes layout chrome, nav, and sidebars while preserving article headers, `h1`/`h2`, tables, code blocks, and primary content). |
 
 ```python
 # Quiet, fast default for open sites
@@ -144,7 +158,8 @@ realistic on every host:
 
 - **Linux** — `headless=False` against an in-process `Xvfb`. The browser
   renders a real window into the virtual display, avoiding the
-  fingerprinting tells that come with Firefox's `--headless` flag.
+  fingerprinting tells that come with Firefox's `--headless` flag. Display
+  lifecycles are strictly managed to avoid orphan processes.
 - **Windows / macOS** — Firefox's native `headless=True`. No display server
   is required.
 
@@ -156,21 +171,13 @@ missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
 
 ## How It Works
 
-1. **Normalize** the URL (scheme, encoding, fragments).
-2. **Check cache** — if a valid SQLite entry exists, return instantly.
-3. **HTTP fetch** using `httpx` with HTTP/2, connection pooling, and configurable retries.  
-   Non-HTML responses (PDF, XML, plain text) are handled directly without browser overhead.
-4. **Content analysis** — the `confidence` score evaluates HTML completeness using  
-   text density, structural markup, heading presence, link counts, and common blocking signals  
-   (captcha walls, empty bodies, access-denied patterns).
-5. **Browser fallback** (auto mode only) — Camoufox takes over only when HTTP content  
-   confidence is below the threshold (default 0.80), or when the server returns a blocked  
-   status (403/429). Timeouts, connection failures, 404s, and 5xx responses fail fast at  
-   the HTTP layer instead of waiting on a browser navigation.
-6. **Processing pipeline** — cleaned HTML → extracted links, images, metadata →  
-   converted to Markdown via a custom converter that preserves tables, code blocks,  
-   and nested lists.
-7. **Cache & return** — the structured `FetchResult` is persisted to SQLite and returned.
+1. **Normalize & Validate** — URL syntax, encoding, scheme, and host safety (SSRF checks) are validated before any network call.
+2. **Check cache** — If a valid SQLite entry exists, return instantly.
+3. **HTTP fetch** — Performed via `httpx` with HTTP/2, connection pooling, and bounded retries. Non-HTML responses (PDF, XML, plain text) are processed directly without browser overhead.
+4. **Content analysis** — The `confidence` score evaluates HTML completeness using text density, structural markup, heading presence, link counts, and common blocking signals (captcha walls, empty bodies, access-denied patterns).
+5. **Browser fallback** (auto mode) — Camoufox takes over when HTTP content confidence is below the threshold (default 0.80), or when the server returns a blocked status (`403` or `429`). Blocked responses bypass unnecessary HTTP retries and switch directly to browser rendering. Timeouts, connection failures, 404s, and 5xx responses fail fast at the HTTP layer.
+6. **Processing pipeline** — Cleaned HTML → extracted links, images, metadata → converted to Markdown via an engine preserving tables (with proper escaping of table pipes), code blocks, and nested lists.
+7. **Cache & return** — The structured `FetchResult` is persisted to SQLite and returned.
 
 ---
 
@@ -179,11 +186,12 @@ missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
 ### Prerequisites
 
 - **Python** ≥ 3.11
+- **Xvfb** (Linux only, for stealth browser mode: `sudo apt install xvfb`)
 
 ### Install
 
 ```bash
-# Core HTTP/HTML support
+# Core HTTP/HTML support (lightweight)
 pip install .
 
 # Add browser fallback
@@ -195,12 +203,12 @@ pip install ".[pdf]"
 
 # Or install every optional feature
 pip install ".[all]"
+python -m camoufox fetch
 ```
 
-HTTP mode works without Camoufox. On the first use of browser fallback or
-`browser` mode, PageFetch installs the optional browser package and runtime
-automatically (unless `PAGEFETCH_AUTO_INSTALL=0` is set). The commands above
-remain available when you want to provision the browser feature explicitly.
+HTTP mode works without Camoufox. For browser fallback or `browser` mode, install
+`pagefetch[browser]` and fetch the browser artifact via `python -m camoufox fetch`.
+Automatic package and binary installation on first use is disabled by default for safety, but can be explicitly enabled with `PAGEFETCH_AUTO_INSTALL=1`.
 
 ---
 
@@ -216,7 +224,7 @@ from pagefetch import PageFetch
 client = PageFetch(
     mode="auto",              # "auto" | "http" | "browser"
     proxy="none",             # "none" | "decodo" | "dataimpulse"
-    cleaning_level="standard", # "minimal" | "standard" | "maximum" — how aggressively to strip non-content DOM
+    cleaning_level="standard", # "minimal" | "standard" | "maximum"
     http_concurrency=10,      # Max parallel HTTP requests
     browser_concurrency=4,    # Max parallel browser instances
     cache_enabled=True,       # Enable SQLite disk cache
@@ -224,21 +232,21 @@ client = PageFetch(
     cache_path=None,          # Custom SQLite cache path (None = platform default)
     http_timeout=20.0,        # Per-request HTTP timeout (seconds)
     browser_timeout=45.0,     # Per-page browser timeout (seconds)
-    retries_http=3,           # Retry on 429/5xx for HTTP
+    retries_http=3,           # Retry on 5xx (and HTTP-only 429) errors
     retries_browser=2,        # Retry on browser failure
     max_redirects=10,         # Maximum redirect chain
     max_content_size=25 * 1024 * 1024,  # Max response body bytes (25 MiB)
     confidence_threshold=0.80,    # Min confidence before browser fallback
     block_images=True,        # Block image loading in browser mode to save bandwidth
-    block_level="aggressive", # "minimal" | "balanced" | "aggressive" (ignored when stealth_level != "off")
+    block_level="aggressive", # "minimal" | "balanced" | "aggressive"
     accept_language="en-US,en;q=0.5",  # Accept-Language header
     humanize=False,          # Add small randomized delays to mimic a human
     session_rotation="sticky",# "sticky" | "rotate" proxy session strategy
     request_pacing=0.0,       # Seconds of delay between requests
-    stealth_level="off",      # "off" | "balanced" | "max" preset (sets humanize, block_level, pacing, session_rotation)
-    proxy_geo=None,           # ISO 3166-1 alpha-2 (e.g. "US", "DE") to align locale + Accept-Language
+    stealth_level="off",      # "off" | "balanced" | "max" preset
+    proxy_geo=None,           # ISO 3166-1 alpha-2 (e.g. "US", "DE")
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
-    screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…); oversized captures are dropped
+    screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…)
 )
 ```
 
@@ -246,7 +254,7 @@ client = PageFetch(
 
 | Mode | Behavior |
 |---|---|
-| `"auto"` | HTTP first; falls back to Camoufox if confidence < threshold (default) |
+| `"auto"` | HTTP first; falls back to Camoufox if confidence < threshold or 403/429 received (default) |
 | `"http"` | Pure HTTP/2 fetching — no browser, no confidence scoring |
 | `"browser"` | Camoufox stealth browser for every request |
 
@@ -254,58 +262,33 @@ client = PageFetch(
 
 **`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
-Fetch a single URL. All keyword arguments override the client-level defaults
-for this individual request only. For structural / RAW HTML / screenshot
-capture use `extract()` instead — it always runs in browser mode and
-returns the rendered page shell.
+Fetch a single URL. All keyword arguments override client-level defaults for this request. Bare domains (e.g. `example.com`) are automatically normalized to `https://`.
 
 **`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
 
-Fetch multiple URLs concurrently. Deduplicates identical inputs internally,
-preserves the original input order, and isolates individual failures — one
-bad URL never affects the others.
+Fetch multiple URLs concurrently. Deduplicates identical inputs, preserves original ordering, and isolates failures across URLs.
 
 **`extract(url, *, structure=True, compact_structure=False, screenshot="none", screenshot_format="png", proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
-Fetch a page and return the rendered DOM plus, on demand, a structural
-summary and/or a screenshot. `extract()` always uses `mode="browser"` —
-there is no HTTP→browser pipeline because the goal is the full page shell,
-not the article-shaped extraction. Returns a `FetchResult` populated with:
+Fetch a page in browser mode and return the rendered DOM, an optional structural summary, and/or a screenshot:
 
-- `result.html` — the browser-rendered HTML.
-- `result.structure` — `PageStructure` summary (when `structure=True`).
-- `result.screenshot` / `result.screenshot_format` — captured screenshot
-  bytes (when `screenshot != "none"`); `screenshot="viewport"` captures
-  the visible area, `screenshot="full"` captures the entire scrollable
-  page, encoded as `screenshot_format` (`png` or `jpeg`).
+- `result.html` — Fully rendered HTML.
+- `result.structure` — `PageStructure` summary ($O(N)$ extraction with verified `unique_selector`).
+- `result.screenshot` / `result.screenshot_format` — Captured screenshot bytes (`screenshot="viewport"` or `screenshot="full"`).
 
-Screenshots are bounded by `PageFetchConfig.screenshot_max_bytes` (default
-50 MiB) — oversized captures are discarded with a warning. Screenshots are
-**not** persisted in the SQLite cache; when a cached result is returned
-and a screenshot was requested, `result.warnings` carries a hint to
-re-fetch with `use_cache=False`.
+Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not cached in SQLite.
 
 ### Public API Exports
-
-Everything PageFetch ships in its top-level `pagefetch` namespace:
 
 | Symbol | Purpose |
 |---|---|
 | `PageFetch`, `PageFetchConfig` | Client + validated configuration |
 | `FetchResult`, `LinkInfo`, `ImageInfo`, `FetchErrorInfo` | Result dataclasses |
 | `PageStructure`, `StructureNode`, `StylesheetInfo`, `InlineStylesheet`, `ScriptInfo`, `InlineScript` | Page-structure summary types |
-| `StructureLimits`, `extract_structure` | Lower-level structure extraction |
+| `StructureLimits`, `extract_structure` | Lower-level structure extraction engine |
 | `PageFetchError`, `RuntimeBootstrapError` | Exception hierarchy |
-| `ensure_runtime_requirements`, `auto_bootstrap_browser` | Pre-flight / force-install Camoufox |
-| `VALID_MODES`, `VALID_PROXIES` | Allowed-value constants |
-
-Browser dependencies are auto-installed on first browser use. Call
-`ensure_runtime_requirements()` for an up-front check without installing,
-or `auto_bootstrap_browser()` to force installation at any point.
-
-Set `PAGEFETCH_AUTO_INSTALL=0` (also accepts `false`, `no`, or `off`) to
-disable automatic browser installation. In that case, install
-`pagefetch[browser]` and run `python -m camoufox fetch` before browser use.
+| `ensure_runtime_requirements`, `auto_bootstrap_browser` | Runtime dependency validation & installation |
+| `VALID_MODES`, `VALID_PROXIES` | Configuration constants |
 
 ---
 
@@ -315,6 +298,7 @@ Every fetch returns a `FetchResult` dataclass:
 
 ```python
 from dataclasses import dataclass
+from datetime import datetime
 
 @dataclass
 class FetchResult:
@@ -331,8 +315,8 @@ class FetchResult:
     metadata: dict              # OpenGraph, Twitter Cards, meta tags
     links: list[LinkInfo]       # All <a> tags with text, URL, rel
     images: list[ImageInfo]     # All <img> tags with url, alt, title
-    structure: PageStructure | None  # Bounded DOM/stylesheet/script summary (only when requested)
-    screenshot: bytes | None         # PNG/JPEG screenshot bytes (only when requested)
+    structure: PageStructure | None  # DOM/stylesheet/script summary (when requested)
+    screenshot: bytes | None         # PNG/JPEG screenshot bytes (when requested)
     screenshot_format: str | None    # "png" or "jpeg"
     fetch_method: str | None    # "http" or "browser"
     proxy_provider: str         # "none", "decodo", or "dataimpulse"
@@ -347,140 +331,67 @@ class FetchResult:
 ### Serialization
 
 ```python
-# JSON output (HTML, structure, and screenshot excluded by default for compactness)
+# JSON output (HTML, structure, and screenshot excluded by default)
 print(result.json(indent=2))
 print(result.json(include_html=True))                    # Include raw HTML
 print(result.json(include_structure=True))               # Include PageStructure summary
-print(result.json(include_structure=True,                # Trimmed structure payload for LLM consumers
-                  compact_structure=True))
+print(result.json(include_structure=True, compact_structure=True)) # Compact summary for LLMs
 print(result.json(include_screenshot=True))              # Include base64-encoded screenshot
 
 # Python dict
 data = result.to_dict()
-data = result.to_dict(include_html=True)
-data = result.to_dict(include_structure=True)
-data = result.to_dict(include_structure=True, compact_structure=True)
 data = result.to_dict(include_screenshot=True)
 
-# Reconstruct from cached JSON
+# Reconstruct from dictionary
 reconstructed = FetchResult.from_dict(data)
 ```
-
-> **Note:** `compact_structure=True` is inspection-only — inline `<style>` / `<script>`
-> previews are returned as `{length, preview}` and the lossy payload cannot be
-> reconstructed with `FetchResult.from_dict`.
-
-### Extraction (RAW HTML, Structure, Screenshot)
-
-When you want the full rendered page shell — RAW HTML plus the optional
-structural summary and/or screenshot — call `extract()` instead of
-`fetch()`. `extract()` always uses browser mode (no auto fallback) and
-returns a `FetchResult` with the rendered DOM:
-
-```python
-async with PageFetch() as client:
-    # RAW HTML + structural summary (no screenshot)
-    result = await client.extract("https://example.com")
-    print(result.html)
-    print(result.structure.root.selector)
-
-    # Capture a full-page PNG screenshot too
-    captured = await client.extract(
-        "https://example.com",
-        screenshot="full",
-        screenshot_format="png",
-    )
-    with open("page.png", "wb") as fh:
-        fh.write(captured.screenshot)
-```
-
-`extract()` runs the same readiness / scroll pipeline as a browser-mode
-`fetch()`, so the captured HTML matches what a visitor sees. Screenshots
-follow Playwright's `page.screenshot()` semantics — `screenshot="viewport"`
-captures the initial visible area, `screenshot="full"` captures the
-entire scrollable page. Use `--screenshot-format=jpeg` (or
-`screenshot_format="jpeg"` in Python) to compress full-page captures.
-
-The structural summary produced by `extract()` includes:
-
-- A nested DOM tree with filtered attributes, short direct-text previews, a
-  compact selector, a deterministic CSS path, and a verified
-  `unique_selector` suitable for starting scraper rules. It remains bounded by
-  `max_depth` and `max_nodes` so the payload stays predictable even on enormous
-  pages.
-- External stylesheet URLs (`<link rel="stylesheet">`) with `media`,
-  `integrity`, and `crossorigin` hints.
-- Inline `<style>` blocks with a per-block preview and a `truncated` flag.
-- External script URLs (`<script src="…">`) with `type`, `async`, `defer`,
-  `integrity`, and `crossorigin`.
-- Inline `<script>` blocks with a per-block preview, `type`, and a `truncated`
-  flag.
-
-Use the lower-level helper directly when you already have parsed HTML:
-
-```python
-from pagefetch import StructureLimits, extract_structure
-
-structure = extract_structure(html, base_url="https://example.com/")
-```
-
-`StructureLimits` exposes `max_depth`, `max_nodes`, `text_preview`, and
-`inline_source_limit` for callers that need different safety bounds.
 
 ---
 
 ## CLI Usage
 
-PageFetch ships with a command-line interface accessible via `pagefetch`:
+PageFetch provides a powerful command-line interface accessible via `pagefetch` or `python -m pagefetch`:
 
 ```bash
-# Fetch and print Markdown
-pagefetch https://example.com --format markdown
+# Fetch and print Markdown (bare domains like example.com are supported)
+pagefetch example.com --format markdown
 
-# Fetch and print raw HTML
+# Fetch raw HTML
 pagefetch https://example.com --format html
 
-# Fetch from a list and output JSON
-pagefetch urls.txt --format json --mode auto
+# Output structured JSON
+pagefetch https://example.com --format json
+
+# Take a full-page screenshot and get JSON with base64 screenshot data
+pagefetch https://example.com --format json --screenshot viewport
+
+# Inspect page structure as Markdown
+pagefetch https://example.com --format structure
+
+# Raw page shell (HTML + structure + screenshot)
+pagefetch https://example.com --format raw --screenshot full --screenshot-format png
 
 # Save output to a file
 pagefetch https://example.com --mode browser -o output.md
 
-# Structured JSON with raw HTML included
-pagefetch https://example.com --format json --include-html
-
-# Inspect the page structure as Markdown
-pagefetch https://example.com --format structure
-
-# Raw page shell: HTML + structure + (optionally) screenshot, single JSON doc
-pagefetch https://example.com --format raw --screenshot full --screenshot-format png
-
-# Include a PageStructure summary inside the regular JSON output
-pagefetch https://example.com --format json --include-html
-
-# Multiple URLs from a file (one URL per line)
+# Process multiple URLs from a file
 pagefetch urls.txt --format json --mode auto
 
-# Load configuration from a YAML file with CLI overrides
-pagefetch --config config.yaml --mode browser https://example.com
-
-# Override cache TTL and disable image loading
-pagefetch https://example.com --cache-ttl 1h --no-block-images
-
-# Use the Decodo proxy with a German exit and locale alignment
+# Use residential proxy with German exit node
 pagefetch https://example.com --proxy decodo --proxy-geo DE
 
-# Apply a balanced stealth preset with a rotated proxy session
+# Apply stealth preset with session rotation
 pagefetch https://example.com --mode browser --stealth-level balanced --session-rotation rotate
 
-# Verbose logging for debugging
+# Debug mode for troubleshooting
 pagefetch https://example.com --debug
 ```
 
-CLI arguments map directly to the Python API:
+### CLI Options
 
 | Flag | Maps to |
 |---|---|
+| `inputs` (positional) | One or more URLs or text files containing URLs |
 | `--mode {auto,http,browser}` | `mode` |
 | `--proxy {none,decodo,dataimpulse}` | `proxy` |
 | `--http-concurrency N` / `--browser-concurrency N` | `http_concurrency` / `browser_concurrency` |
@@ -498,46 +409,35 @@ CLI arguments map directly to the Python API:
 | `--include-html` | `FetchResult.json(include_html=…)` |
 | `--screenshot {none,viewport,full}` | `PageFetch.extract(screenshot=…)` |
 | `--screenshot-format {png,jpeg}` | `PageFetch.extract(screenshot_format=…)` |
-| `--format {markdown,json,html,structure,raw}` | output renderer |
-| `-o PATH` / `--output PATH` | write rendered output to a file |
-| `-c PATH` / `--config PATH` | `PageFetchConfig.from_yaml` |
-| `--debug` | enable DEBUG logging on the `pagefetch` logger |
+| `--format {markdown,json,html,structure,raw}` | Output format renderer |
+| `-o PATH` / `--output PATH` | Write output to a file |
+| `-c PATH` / `--config PATH` | Load configuration from YAML file |
+| `--debug` | Enable verbose DEBUG logging |
 
-The `--screenshot` flag (and `--format raw`) auto-promote the request to
-`browser` mode and route through `PageFetch.extract()`.
-
-Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error,
-`3` partial failure.
+Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error, `3` partial failure.
 
 ### Interactive Menu
 
-Running `python -m pagefetch` with **no arguments** opens a guided
-interactive menu (mode, proxy, stealth, format, URL/file input, …) — useful
-when you don't want to memorise the flags. Pass `python -m pagefetch --cli`
-(or invoke the `pagefetch` console script) to use the argparse CLI
-documented above.
+Running `python -m pagefetch` with **no arguments** launches a guided interactive terminal menu (mode, proxy, stealth, format, URL entry). Supplying any argument (e.g. `python -m pagefetch example.com`) directly runs the CLI.
 
 ---
 
 ## Caching
 
-PageFetch uses a **SQLite-backed disk cache** (`platformdirs` user cache directory
-by default). Cache entries are keyed by normalized URL + mode + proxy + relevant
-fetch settings, so switching from `"auto"` to `"browser"` mode produces a
-different cache key.
+PageFetch uses a **SQLite-backed disk cache** stored in the platform's user cache directory (`platformdirs`). Cache keys incorporate the normalized URL, fetch mode, proxy configuration, and relevant stealth settings.
 
-- **Default TTL**: 24 hours (configurable: `"30m"`, `"2h"`, `"7d"`, or integer seconds)
-- **Automatic**: cache hits skip all network and browser work
-- **Graceful degradation**: cache read/write failures never crash a fetch — they produce warnings
+- **Default TTL**: 24 hours (configurable: `"30m"`, `"2h"`, `"7d"`, or integer seconds).
+- **Network bypass**: Cache hits return instantly without network or browser overhead.
+- **Graceful degradation**: Cache read/write issues produce warnings without interrupting fetches.
 
 ```python
-# Disable caching for a single request
+# Bypass cache for a single request
 result = await client.fetch("https://example.com", use_cache=False)
 
-# Override TTL per-request
+# Custom TTL per request
 result = await client.fetch("https://example.com", cache_ttl="1h")
 
-# Use a custom cache location
+# Custom SQLite database location
 client = PageFetch(cache_path="/path/to/custom_cache.sqlite3")
 ```
 
@@ -545,7 +445,7 @@ client = PageFetch(cache_path="/path/to/custom_cache.sqlite3")
 
 ## Proxy Support
 
-PageFetch natively supports **rotating residential proxy** providers:
+PageFetch provides built-in integration with residential proxy providers:
 
 | Provider | Env Var (Full URL) | Env Vars (Components) |
 |---|---|---|
@@ -553,38 +453,28 @@ PageFetch natively supports **rotating residential proxy** providers:
 | **DataImpulse** | `DATAIMPULSE_PROXY_URL` | `DATAIMPULSE_HOST`, `DATAIMPULSE_PORT`, `DATAIMPULSE_USERNAME`, `DATAIMPULSE_PASSWORD` |
 
 ```python
-# Use a proxy provider
-async with PageFetch(proxy="decodo") as client:
-    result = await client.fetch("https://example.com")
-
-# Align locale + Accept-Language with the proxy exit country
+# Use Decodo proxy with German exit node and aligned locale
 async with PageFetch(proxy="decodo", proxy_geo="DE") as client:
     result = await client.fetch("https://example.de")
 
-# Force a fresh proxy session per request
+# Rotate proxy sessions across requests
 async with PageFetch(proxy="dataimpulse", session_rotation="rotate") as client:
     results = await client.fetch_many([...])
 ```
 
-Credentials are **never** included in results, logs, or cache keys. Configure
-either a full proxy URL or the individual components — PageFetch validates
-both forms automatically. `proxy_geo` requires one of the countries defined in
-PageFetch's `GEO_MAP` (case-insensitive ISO 3166-1 alpha-2).
+Credentials are never exposed in result objects, logs, or cache keys.
 
 ---
 
 ## Non-HTML Content
 
-PageFetch handles content types beyond HTML natively:
-
 | Content Type | Detection | Extraction |
 |---|---|---|
-| **PDF** | Magic bytes + `Content-Type` | Text via optional `pagefetch[pdf]` support |
-| **XML** | `Content-Type` matching `+xml` or `application/xml` | Strictly parsed with `lxml`; visible text surfaces as `.text` and the original tree is preserved as `.markdown` inside a fenced XML block |
-| **Plain text** | Fallback when no structured type matches | Served as `.text` and `.markdown` directly |
+| **PDF** | Magic bytes + `Content-Type` | Clean text extraction via optional `pagefetch[pdf]` extra |
+| **XML** | `+xml` or `application/xml` | Strictly parsed with `lxml`; text in `.text` and XML tree in fenced `.markdown` |
+| **Plain text** | `text/plain` or fallback | Preserved as `.text` and `.markdown` |
 
-No browser overhead is incurred for non-HTML content — detection happens
-at the HTTP response level before any processing pipeline runs.
+Non-HTML content is handled immediately at the HTTP layer, bypassing all browser dependencies.
 
 ---
 
@@ -594,7 +484,7 @@ at the HTTP response level before any processing pipeline runs.
 |---|---|---|---|
 | `mode` | `str` | `"auto"` | Fetch strategy: `"auto"`, `"http"`, or `"browser"` |
 | `proxy` | `str` | `"none"` | Proxy provider: `"none"`, `"decodo"`, or `"dataimpulse"` |
-| `cleaning_level` | `str` | `"standard"` | How aggressively to strip non-content DOM before extraction: `"minimal"`, `"standard"`, or `"maximum"` |
+| `cleaning_level` | `str` | `"standard"` | DOM cleaning level: `"minimal"`, `"standard"`, or `"maximum"` |
 | `http_concurrency` | `int` | `10` | Maximum concurrent HTTP connections |
 | `browser_concurrency` | `int` | `4` | Maximum concurrent browser instances |
 | `cache_enabled` | `bool` | `True` | Enable SQLite disk cache |
@@ -602,22 +492,22 @@ at the HTTP response level before any processing pipeline runs.
 | `cache_path` | `str \| Path` | *platform default* | Custom SQLite cache file path |
 | `http_timeout` | `float` | `20.0` | HTTP request timeout in seconds |
 | `browser_timeout` | `float` | `45.0` | Browser page load timeout in seconds |
-| `retries_http` | `int` | `3` | Automatic retries on retryable HTTP errors |
+| `retries_http` | `int` | `3` | Automatic retries on retryable HTTP errors (5xx, HTTP-only 429) |
 | `retries_browser` | `int` | `2` | Automatic retries on browser failures |
-| `max_redirects` | `int` | `10` | Maximum redirect chain to follow |
+| `max_redirects` | `int` | `10` | Maximum redirect chain |
 | `max_content_size` | `int` | `25 MiB` | Maximum response body in bytes |
-| `confidence_threshold` | `float` | `0.80` | Threshold for browser fallback in auto mode |
-| `block_images` | `bool` | `True` | Block image loading in browser mode to save bandwidth |
-| `block_level` | `str` | `"aggressive"` | Resource blocking: `"minimal"`, `"balanced"`, or `"aggressive"` (overridden by `stealth_level`) |
-| `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in the `Accept-Language` header |
-| `humanize` | `bool` | `False` | Add small randomized delays to mimic a human (overridden by `stealth_level`) |
-| `session_rotation` | `str` | `"sticky"` | `"sticky"` reuses a proxy session per domain; `"rotate"` forces a new session per request (overridden by `stealth_level`) |
-| `request_pacing` | `float` | `0.0` | Fixed seconds of delay between browser requests (overridden by `stealth_level`) |
+| `confidence_threshold` | `float` | `0.80` | Minimum confidence score before browser fallback in auto mode |
+| `block_images` | `bool` | `True` | Block image loading in browser mode |
+| `block_level` | `str` | `"aggressive"` | Resource blocking: `"minimal"`, `"balanced"`, or `"aggressive"` |
+| `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in `Accept-Language` header |
+| `humanize` | `bool` | `False` | Add randomized delays mimicking human interactions |
+| `session_rotation` | `str` | `"sticky"` | `"sticky"` or `"rotate"` proxy session rotation |
+| `request_pacing` | `float` | `0.0` | Seconds of delay between browser requests |
 | `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
-| `proxy_geo` | `str \| None` | `None` | ISO 3166-1 alpha-2 (e.g. `"US"`, `"DE"`) to align locale/timezone/Accept-Language with proxy exit country |
+| `proxy_geo` | `str \| None` | `None` | ISO 3166-1 alpha-2 code to align locale and Accept-Language |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
-| `screenshot_max_bytes` | `int` | `50 MiB` | Maximum bytes for an `extract(screenshot=…)` capture; oversized screenshots are discarded with a warning |
-| `browser_pre_check_byte_margin` | `float` | `1.5` | Multiplicative byte margin applied to `max_content_size` for the browser pre-render size check; must be ≥ 1.0 — lower values reject pages earlier (saving render time) but raise more `content_too_large` errors on legitimate pages |
+| `screenshot_max_bytes` | `int` | `50 MiB` | Maximum allowed screenshot byte size |
+| `browser_pre_check_byte_margin` | `float` | `1.5` | Multiplicative margin for browser pre-render size checks |
 
 ---
 
@@ -625,21 +515,17 @@ at the HTTP response level before any processing pipeline runs.
 
 ```bash
 # Clone and set up
-git clone <repo-url> && cd pagefetch
+git clone https://github.com/neuronaline/pagefetch.git && cd pagefetch
 
 # Install with test dependencies
 pip install -e ".[test]"
 
-# Run the test suite (browser integration tests are opt-in)
+# Run test suite
 pytest
 
-# Lint
+# Code formatting & linting
 ruff check .
 ```
-
-Browser integration requires the separately downloaded Camoufox binary and is
-therefore kept optional in deterministic test environments. The test suite is
-designed to run fully offline — URLs are served via local fixtures.
 
 ---
 
@@ -647,11 +533,8 @@ designed to run fully offline — URLs are served via local fixtures.
 
 PageFetch is released under the [MIT License](LICENSE).
 
----
-
 <p align="center">
   <sub>
-    Built with ❤️ for developers who need reliable, structured web content
-    without fighting bot detection.
+    Built with ❤️ for developers who need reliable, structured web content without fighting bot detection.
   </sub>
 </p>

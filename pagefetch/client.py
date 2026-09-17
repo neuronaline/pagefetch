@@ -622,10 +622,16 @@ class PageFetch:
                         domain = registrable_host(url) or url
                         session_id = make_domain_session(domain)
                     per_request_proxy = _inject_session_id(settings.url, session_id)
+            retry_codes = (
+                RETRYABLE_STATUS_CODES - {429}
+                if mode == "auto"
+                else RETRYABLE_STATUS_CODES
+            )
             response = await fetcher.fetch(
                 url,
                 proxy_url=per_request_proxy,
                 headers=self._headers_for_url(url),
+                retryable_status_codes=retry_codes,
             )
         except TransportFailure:
             # Timeouts, DNS failures, disconnects, and other transport errors are not
@@ -782,36 +788,16 @@ class PageFetch:
         acquisition/release, and error-handling branches in a single place so
         they cannot drift apart.
         """
-        if self.config.session_rotation == "rotate" and proxy != "none":
-            settings = resolve_proxy(proxy)
-            proxy_url = (
-                _inject_session_id(settings.url, make_random_session())
-                if settings.url
-                else None
+        cache_key, fetcher = await self._acquire_browser_fetcher(proxy, url)
+        try:
+            response = await fetcher.fetch(
+                url,
+                screenshot=screenshot,
+                screenshot_format=screenshot_format,
+                screenshot_max_bytes=self.config.screenshot_max_bytes,
             )
-            fetcher = self._new_browser_fetcher(
-                ProxySettings(provider=settings.provider, url=proxy_url)
-            )
-            try:
-                response = await fetcher.fetch(
-                    url,
-                    screenshot=screenshot,
-                    screenshot_format=screenshot_format,
-                    screenshot_max_bytes=self.config.screenshot_max_bytes,
-                )
-            finally:
-                await self._close_browser_quietly(fetcher)
-        else:
-            cache_key, fetcher = await self._acquire_browser_fetcher(proxy, url)
-            try:
-                response = await fetcher.fetch(
-                    url,
-                    screenshot=screenshot,
-                    screenshot_format=screenshot_format,
-                    screenshot_max_bytes=self.config.screenshot_max_bytes,
-                )
-            finally:
-                await self._release_browser_fetcher(cache_key)
+        finally:
+            await self._release_browser_fetcher(cache_key)
         raw_soup = BeautifulSoup(response.html, "lxml")
         result = self._result_from_html(
             original_url=url,
@@ -890,9 +876,13 @@ class PageFetch:
 
     def _browser_pool_target(self, provider: str, url: str) -> tuple[str, ProxySettings]:
         session_id = ""
-        if self.config.session_rotation == "sticky" and provider != "none":
-            domain = registrable_host(url) or url
-            session_id = make_domain_session(domain)
+        if provider != "none":
+            if self.config.session_rotation == "sticky":
+                domain = registrable_host(url) or url
+                session_id = make_domain_session(domain)
+            elif self.config.session_rotation == "rotate":
+                slot = random.randint(1, max(1, self.config.browser_concurrency))
+                session_id = f"rot_{slot}"
         cache_key = f"{provider}_{session_id}" if session_id else provider
         settings = resolve_proxy(provider)
         if session_id and settings.url:

@@ -46,4 +46,5 @@ PUBLISH.md
 .forge/
 docs/
 plan.md
-tests/AGENTS.md
+tests/TEST_RULES.md
+AGENTS.md
