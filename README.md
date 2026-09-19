@@ -173,9 +173,9 @@ missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
 
 1. **Normalize & Validate** — URL syntax, encoding, scheme, and host safety (SSRF checks) are validated before any network call.
 2. **Check cache** — If a valid SQLite entry exists, return instantly.
-3. **HTTP fetch** — Performed via `httpx` with HTTP/2, connection pooling, and bounded retries. Non-HTML responses (PDF, XML, plain text) are processed directly without browser overhead.
-4. **Content analysis** — The `confidence` score evaluates HTML completeness using text density, structural markup, heading presence, link counts, and common blocking signals (captcha walls, empty bodies, access-denied patterns).
-5. **Browser fallback** (auto mode) — Camoufox takes over when HTTP content confidence is below the threshold (default 0.80), or when the server returns a blocked status (`403` or `429`). Blocked responses bypass unnecessary HTTP retries and switch directly to browser rendering. Timeouts, connection failures, 404s, and 5xx responses fail fast at the HTTP layer.
+3. **HTTP fetch** — Performed via `httpx` with HTTP/2, connection pooling, and bounded retries. Non-HTML responses (PDF, XML, JSON, plain text) are processed directly without browser overhead.
+4. **Content analysis** — The `confidence` score evaluates HTML completeness using text density, structural markup, heading presence, link counts, and common blocking signals (multilingual captcha walls, empty bodies, access-denied patterns).
+5. **Browser fallback** (auto mode) — Camoufox takes over when HTTP content confidence is below the threshold (default 0.80), when the server returns a blocked status (`403` or `429`), or on Cloudflare Under Attack (`503` with WAF challenge markers). Blocked responses bypass unnecessary HTTP retries and switch directly to browser rendering. Genuine timeouts, connection failures, 404s, and non-challenge 5xx responses fail fast at the HTTP layer.
 6. **Processing pipeline** — Cleaned HTML → extracted links, images, metadata → converted to Markdown via an engine preserving tables (with proper escaping of table pipes), code blocks, and nested lists.
 7. **Cache & return** — The structured `FetchResult` is persisted to SQLite and returned.
 
@@ -318,7 +318,7 @@ class FetchResult:
     structure: PageStructure | None  # DOM/stylesheet/script summary (when requested)
     screenshot: bytes | None         # PNG/JPEG screenshot bytes (when requested)
     screenshot_format: str | None    # "png" or "jpeg"
-    fetch_method: str | None    # "http" or "browser"
+    fetch_method: str | None    # "http", "browser", "text", "xml", or "pdf"
     proxy_provider: str         # "none", "decodo", or "dataimpulse"
     content_confidence: float | None  # 0–1 completeness score (None for browser mode)
     from_cache: bool            # Was this served from cache?
@@ -472,6 +472,7 @@ Credentials are never exposed in result objects, logs, or cache keys.
 |---|---|---|
 | **PDF** | Magic bytes + `Content-Type` | Clean text extraction via optional `pagefetch[pdf]` extra |
 | **XML** | `+xml` or `application/xml` | Strictly parsed with `lxml`; text in `.text` and XML tree in fenced `.markdown` |
+| **JSON** | `application/json` or `+json` | Raw payload preserved as `.text` and `.markdown` without browser overhead |
 | **Plain text** | `text/plain` or fallback | Preserved as `.text` and `.markdown` |
 
 Non-HTML content is handled immediately at the HTTP layer, bypassing all browser dependencies.
@@ -497,7 +498,7 @@ Non-HTML content is handled immediately at the HTTP layer, bypassing all browser
 | `max_redirects` | `int` | `10` | Maximum redirect chain |
 | `max_content_size` | `int` | `25 MiB` | Maximum response body in bytes |
 | `confidence_threshold` | `float` | `0.80` | Minimum confidence score before browser fallback in auto mode |
-| `block_images` | `bool` | `True` | Block image loading in browser mode |
+| `block_images` | `bool` | `True`* | Block image loading in browser mode (*defaults to `False` in `balanced`/`max` stealth for fingerprint coherence) |
 | `block_level` | `str` | `"aggressive"` | Resource blocking: `"minimal"`, `"balanced"`, or `"aggressive"` |
 | `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in `Accept-Language` header |
 | `humanize` | `bool` | `False` | Add randomized delays mimicking human interactions |

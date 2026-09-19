@@ -546,3 +546,63 @@ def test_xvfb_display_initial_state():
     assert display.is_running is False
     assert display.width == 1920
 
+
+def test_cmp_cleaning_and_inside_content_isolation():
+    from pagefetch.processing.cleaner import clean_html
+
+    # CMP tags and !important hidden styles must be removed under standard cleaning
+    html_cmp = (
+        "<html><body>"
+        "<div id='onetrust-consent-sdk'><p>We use cookies</p></div>"
+        "<div class='qc-cmp2-container'><p>Consent</p></div>"
+        "<div style='display: none !important;'><p>Hidden tracker</p></div>"
+        "<main><h1>Actual Article</h1><p>Real content of the article.</p></main>"
+        "</body></html>"
+    )
+    cleaned = clean_html(html_cmp, cleaning_level="standard")
+    text = cleaned.get_text()
+    assert "We use cookies" not in text
+    assert "Hidden tracker" not in text
+    assert "Real content of the article." in text
+
+    # <div id="content"> wrapper must not prevent removal of site chrome under maximum cleaning
+    html_chrome = (
+        "<html><body>"
+        "<div id='content'>"
+        "<header class='site-header'><h1>Site Brand</h1><nav><a href='/'>Home</a></nav></header>"
+        "<div class='entry-content'><p>The genuine story paragraph.</p></div>"
+        "<footer class='site-footer'><p>Copyright 2026</p></footer>"
+        "</div></body></html>"
+    )
+    cleaned_max = clean_html(html_chrome, cleaning_level="maximum")
+    max_text = cleaned_max.get_text()
+    assert "Site Brand" not in max_text
+    assert "Copyright 2026" not in max_text
+    assert "The genuine story paragraph." in max_text
+
+
+def test_markdown_bracket_escaping():
+    from bs4 import BeautifulSoup
+
+    from pagefetch.processing.markdown import html_to_markdown
+
+    soup = BeautifulSoup("<a href='https://example.com/doc.pdf'>[PDF] Annual Report [2026]</a>", "lxml")
+    md = html_to_markdown(soup, "https://example.com/")
+    assert md == r"[\[PDF\] Annual Report \[2026\]](https://example.com/doc.pdf)"
+
+
+def test_srcset_comma_url_candidate():
+    from bs4 import BeautifulSoup
+
+    from pagefetch.processing.images import image_candidate
+
+    soup = BeautifulSoup(
+        "<img srcset='https://res.cloudinary.com/demo/image/upload/w_300,h_200/sample.jpg 300w, next.jpg 600w'>",
+        "lxml",
+    )
+    assert (
+        image_candidate(soup.find("img"))
+        == "https://res.cloudinary.com/demo/image/upload/w_300,h_200/sample.jpg"
+    )
+
+

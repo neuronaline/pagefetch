@@ -12,4 +12,3 @@ class PageFetchError(Exception):
         self.error = error
         self.url = url
         super().__init__(error.message)
-

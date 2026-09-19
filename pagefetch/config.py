@@ -24,6 +24,13 @@ VALID_SCREENSHOT_MODES = frozenset({"none", "viewport", "full"})
 VALID_SCREENSHOT_FORMATS = frozenset({"png", "jpeg"})
 VALID_OUTPUT_FORMATS = frozenset({"markdown", "json", "html", "structure", "raw"})
 
+# Sentinel for ``build()`` parameters that should be resolved from the
+# stealth preset rather than falling back to a hard-coded default.  Using a
+# private sentinel (rather than ``None`` or a magic boolean) lets us tell
+# "the caller did not specify this value" apart from a legitimate
+# ``None`` / ``False`` they typed explicitly.
+_UNSET: Any = object()
+
 # Stealth presets override multiple individual options in one shot.
 # Individual fields given to `build()` take precedence over the preset
 # defaults so callers can still fine-tune after choosing a level.
@@ -262,7 +269,7 @@ class PageFetchConfig:
             max_redirects=flat.get("max_redirects", 10),
             max_content_size=flat.get("max_content_size", 25 * 1024 * 1024),
             confidence_threshold=flat.get("confidence_threshold", 0.80),
-            block_images=flat.get("block_images", True),
+            block_images=flat.get("block_images", _UNSET),
             block_level=flat.get("block_level"),
             accept_language=flat.get("accept_language", "en-US,en;q=0.5"),
             humanize=flat.get("humanize"),
@@ -294,7 +301,7 @@ class PageFetchConfig:
         max_redirects: int = 10,
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
-        block_images: bool = True,
+        block_images: Any = _UNSET,
         block_level: Literal["minimal", "balanced", "aggressive"] | None = None,
         accept_language: str = "en-US,en;q=0.5",
         humanize: bool | None = None,
@@ -315,6 +322,14 @@ class PageFetchConfig:
             preset["session_rotation"] if session_rotation is None else session_rotation
         )
         request_pacing = preset["request_pacing"] if request_pacing is None else request_pacing
+        # Resolve ``block_images`` *after* the preset: the legacy default
+        # was True, but image blocking inside Camoufox leaves CSS/Canvas
+        # fingerprints inconsistent (bot-detection leak).  For ``balanced``
+        # and ``max`` stealth levels we therefore default to ``False`` and
+        # let the caller opt back in explicitly.  An explicit ``True`` /
+        # ``False`` from the caller is honored regardless of stealth level.
+        if block_images is _UNSET:
+            block_images = stealth_level not in {"balanced", "max"}
 
         if not isinstance(mode, str) or mode not in VALID_MODES:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")

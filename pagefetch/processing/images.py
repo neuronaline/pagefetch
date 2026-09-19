@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
@@ -9,28 +10,57 @@ from bs4 import BeautifulSoup, Tag
 from ..models import ImageInfo
 
 # Attributes checked in priority order when ``src`` is missing or empty.
-_SOURCE_ATTRIBUTES = ("src", "data-src", "data-lazy-src", "data-original")
+_SOURCE_ATTRIBUTES = (
+    "src",
+    "data-src",
+    "data-lazy-src",
+    "data-original",
+    "data-high-res-src",
+    "data-actualsrc",
+)
+
+
+def _first_from_srcset(value: Any) -> str | None:
+    if not value:
+        return None
+    val = str(value).strip()
+    if not val:
+        return None
+    if val.startswith("data:"):
+        return val.split()[0].rstrip(",")
+    parts = val.split(maxsplit=1)
+    first_token = parts[0]
+    if first_token.endswith(","):
+        return first_token.rstrip(",")
+    if len(parts) == 1:
+        return first_token
+    import re
+
+    if re.match(r"^[\d.]+[wx](?:,|$|\s)", parts[1]):
+        return first_token
+    return first_token.rstrip(",")
 
 
 def image_candidate(node: Tag) -> str | None:
     """Return the best URL candidate for an ``<img>`` element.
 
-    Tries the standard ``src`` attribute first, then common lazy-loading
-    fallbacks (``data-src``, ``data-lazy-src``, ``data-original``). When
-    none are populated but ``srcset`` is present, the first URL listed
-    in ``srcset`` is used. Returns ``None`` when no candidate exists so
-    callers can decide whether to emit alt-only output or skip the node
-    entirely.
+    Tries standard and common lazy-loading attributes first, then inspects
+    ``srcset`` and ``data-srcset``. If enclosed in a ``<picture>`` tag,
+    preceding ``<source>`` candidates are also considered.
     """
     for attr in _SOURCE_ATTRIBUTES:
         value = node.get(attr)
         if value:
             return str(value)
-    srcset = node.get("srcset")
-    if srcset:
-        first = str(srcset).split(",", 1)[0].strip().split()
-        if first:
-            return first[0]
+    for attr in ("srcset", "data-srcset"):
+        candidate = _first_from_srcset(node.get(attr))
+        if candidate:
+            return candidate
+    if node.parent and getattr(node.parent, "name", None) == "picture":
+        for source in node.parent.find_all("source"):
+            candidate = _first_from_srcset(source.get("srcset") or source.get("data-srcset"))
+            if candidate:
+                return candidate
     return None
 
 

@@ -58,6 +58,22 @@ BLOCK_LEVEL_SETS: dict[str, set[str]] = {
     "aggressive": {"media", "beacon", "ping", "image", "font", "websocket"},
 }
 
+# Common challenge/WAF providers that run inside child frames or require
+# WebSockets and dynamic scripts to verify human behavior.
+_CHALLENGE_DOMAINS: frozenset[str] = frozenset(
+    {
+        "cloudflare.com",
+        "challenges.cloudflare.com",
+        "hcaptcha.com",
+        "recaptcha.net",
+        "gstatic.com",
+        "arkoselabs.com",
+        "datadome.co",
+        "perimeterx.net",
+        "kasada.io",
+    }
+)
+
 # Common desktop viewport pool — avoids a single fixed fingerprint
 # while staying within realistic bounds for content extraction.
 _VIEWPORT_POOL: list[tuple[int, int]] = [
@@ -215,17 +231,23 @@ class BrowserFetcher:
                 }
                 if self.block_images:
                     options["block_images"] = True
-                    # Suppress the camoufox LeakWarning that fires when
-                    # block_images is enabled; the operator has explicitly
-                    # opted into the speed/footprint trade-off.
+                    # Suppress the Camoufox LeakWarning that fires when
+                    # ``block_images`` is enabled.  The warning exists
+                    # because image blocking creates CSS/Canvas/WebGL
+                    # inconsistencies that bot-detection scripts look for;
+                    # in ``off`` stealth mode this is acceptable, and the
+                    # operator has explicitly opted in by setting
+                    # ``block_images=True``.  The ``balanced``/``max``
+                    # stealth presets default to ``False`` to keep
+                    # browser fingerprints coherent — see
+                    # ``config.build()``.
                     options["i_know_what_im_doing"] = True
                 if self.geo_timezone:
                     options["timezone_id"] = self.geo_timezone
                 if host_os is not None:
                     options["os"] = host_os
-                browser_proxy = self.proxy.browser_config()
-                if browser_proxy:
-                    options["proxy"] = browser_proxy
+                # Proxy is configured per-context in _fetch_page_once rather
+                # than browser-wide, ensuring clean per-request session isolation.
                 # Firefox user prefs for fetch-oriented performance.
                 # Disable cosmetic animations to reduce GPU/CPU overhead;
                 # keep disk and memory cache on for repeat visits.
@@ -322,6 +344,9 @@ class BrowserFetcher:
         self,
         url: str,
         *,
+        proxy: ProxySettings | None = None,
+        geo_locale: str | None = None,
+        geo_timezone: str | None = None,
         screenshot: str = "none",
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
@@ -332,9 +357,8 @@ class BrowserFetcher:
         analysis or inter-retry backoff, so other tasks can use the browser
         during those windows.
 
-        A browser process has one immutable proxy configuration set at
-        construction; this coroutine cannot change it. Callers that need a
-        different proxy must create a separate :class:`BrowserFetcher`.
+        When *proxy*, *geo_locale*, or *geo_timezone* are supplied, they are
+        applied to the isolated browser context created for this request.
 
         ``screenshot`` selects capture mode: ``"none"`` (default) skips the
         capture, ``"viewport"`` captures the initial visible area,
@@ -371,6 +395,9 @@ class BrowserFetcher:
                             raise self._timeout_failure()
                         result = await self._fetch_page_once(
                             url,
+                            proxy=proxy,
+                            geo_locale=geo_locale,
+                            geo_timezone=geo_timezone,
                             max_scrolls=max_scrolls,
                             scroll_sleep_early=scroll_sleep_early,
                             scroll_sleep_late=scroll_sleep_late,
@@ -439,6 +466,9 @@ class BrowserFetcher:
         self,
         url: str,
         *,
+        proxy: ProxySettings | None = None,
+        geo_locale: str | None = None,
+        geo_timezone: str | None = None,
         max_scrolls: int = 6,
         scroll_sleep_early: float = 0.10,
         scroll_sleep_late: float = 0.15,
@@ -462,7 +492,18 @@ class BrowserFetcher:
         warnings: list[str] = []
         try:
             async with asyncio.timeout(page_timeout):
-                context = await self._browser.new_context()
+                context_kwargs: dict[str, Any] = {}
+                effective_proxy = proxy if proxy is not None else self.proxy
+                browser_proxy = effective_proxy.browser_config() if effective_proxy else None
+                if browser_proxy:
+                    context_kwargs["proxy"] = browser_proxy
+                effective_locale = geo_locale or self.geo_locale
+                if effective_locale:
+                    context_kwargs["locale"] = effective_locale
+                effective_tz = geo_timezone or self.geo_timezone
+                if effective_tz:
+                    context_kwargs["timezone_id"] = effective_tz
+                context = await self._browser.new_context(**context_kwargs)
                 page = await context.new_page()
                 network = {"active": 0, "last_activity": time.monotonic()}
 
@@ -485,15 +526,23 @@ class BrowserFetcher:
                 async def route_handler(route: Any) -> None:
                     request = route.request
                     request_url = request.url
-                    if request_url.startswith(("http://", "https://")):
+                    req_host = ""
+                    if request_url.startswith(("http://", "https://", "ws://", "wss://")):
                         req_host = (urlsplit(request_url).hostname or "").lower()
                         if not is_safe_host(req_host):
                             await route.abort()
                             return
+
+                    is_challenge_host = any(
+                        req_host == d or req_host.endswith("." + d)
+                        for d in _CHALLENGE_DOMAINS
+                    )
+
                     external_frame = False
                     if request.resource_type == "document" and request.frame != page.main_frame:
-                        if request_url.startswith(("http://", "https://")):
+                        if request_url.startswith(("http://", "https://")) and not is_challenge_host:
                             external_frame = registrable_host(request_url) != _main_site
+
                     # Block non-essential resource types according to the
                     # configured block_level.  Image blocking via the route
                     # handler is defense-in-depth when Camoufox `block_images`
@@ -504,17 +553,23 @@ class BrowserFetcher:
                     )
                     if not self.block_images:
                         blocked = blocked - {"image"}
+
+                    # Never block WebSockets or scripts essential for challenge verification
+                    if is_challenge_host and request.resource_type in {"websocket", "script", "xhr", "fetch"}:
+                        is_blocked_type = False
+                    else:
+                        is_blocked_type = request.resource_type in blocked
+
                     # Also block cross-site scripts, XHR, and fetch requests
-                    # initiated inside child frames. Main-frame dependencies
-                    # are allowed because they may be required to render content.
+                    # initiated inside child frames (unless it's an anti-bot challenge host).
                     external_script = False
                     _main_frame = getattr(page, "main_frame", None)
                     if request.resource_type in {"script", "xhr", "fetch"} and _main_frame is not None:
-                        if getattr(request, "frame", None) != _main_frame:
-                            request_url = request.url
+                        if getattr(request, "frame", None) != _main_frame and not is_challenge_host:
                             if request_url.startswith(("http://", "https://")):
                                 external_script = registrable_host(request_url) != _main_site
-                    if request.resource_type in blocked or external_frame or external_script:
+
+                    if is_blocked_type or external_frame or external_script:
                         await route.abort()
                     else:
                         await route.continue_()

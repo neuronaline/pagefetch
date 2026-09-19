@@ -433,8 +433,13 @@ class PageFetch:
         else:
             fetched = await asyncio.gather(*(one(item) for item in unique))
         by_url = dict(zip(unique, fetched, strict=True))
-        # For duplicate URLs, return independent copies so callers
-        # do not accidentally alias mutable fields across entries.
+        # Duplicate URLs need independent copies: FetchResult holds mutable
+        # containers (``links``, ``images``, ``metadata``, ``warnings``) and
+        # callers must be able to mutate one entry without aliasing the rest.
+        # ``dataclasses.replace`` would only shallow-copy those references, so
+        # ``deepcopy`` is required — the cost is bounded by the number of
+        # mutable fields, not the size of immutable strings (HTML, screenshot
+        # bytes) which ``deepcopy`` references without copying.
         from copy import deepcopy
         results: list[FetchResult] = []
         emitted: set[int] = set()
@@ -642,7 +647,20 @@ class PageFetch:
             retryable = response.status_code in RETRYABLE_STATUS_CODES
             # Only anti-bot / rate-limit responses benefit from a stealth browser.
             # 4xx like 404 and 5xx server errors should fail fast at the HTTP layer.
-            if mode == "auto" and response.status_code in BLOCKED_STATUS_CODES:
+            escalate_to_browser = mode == "auto" and response.status_code in BLOCKED_STATUS_CODES
+            # Cloudflare "Under Attack Mode" returns HTTP 503 with a JavaScript
+            # challenge body — that 503 is *not* a transient outage, it is an
+            # anti-bot gate.  Detect it by sniffing the body for WAF markers and
+            # escalate only when those markers are present, so genuine 503
+            # outages still fail fast at the HTTP layer.
+            if (
+                not escalate_to_browser
+                and mode == "auto"
+                and response.status_code == 503
+                and self._body_looks_like_waf_challenge(response.content)
+            ):
+                escalate_to_browser = True
+            if escalate_to_browser:
                 logger.info("HTTP %s; using browser for %s", response.status_code, url)
                 # ── auto-mode double-hit softening ──
                 # Insert a short random delay before the browser fallback so
@@ -665,13 +683,23 @@ class PageFetch:
             return self._result_from_pdf(url, response, proxy)
         if self._is_xml(content_type):
             return self._result_from_xml(url, response, proxy)
-        if content_type.startswith("text/plain"):
+        if (
+            content_type.startswith("text/plain")
+            or content_type == "application/json"
+            or content_type.endswith("+json")
+        ):
+            # application/json and +json subtypes are treated like text/plain:
+            # they have no HTML structure to render in a browser, so spinning
+            # up Camoufox for a JSON payload would burn latency for zero extra
+            # content.  The caller's :class:`FetchResult` still surfaces the
+            # raw bytes via ``text`` / ``markdown``.
             return self._result_from_text(url, response, proxy)
         if not self._is_html_like(content_type) and not self._looks_like_html(response.content):
-            # Auto mode escalates non-HTML responses (JSON, binary blobs, etc.)
-            # to the browser so SPA fallbacks and JS-rendered JSON pages still
-            # get a chance to surface real content. The HTTP path stays
-            # fail-fast because the caller explicitly opted out of a browser.
+            # Auto mode escalates non-HTML responses (binary blobs, RSS-in-
+            # disguise, etc.) to the browser so SPA fallbacks and JS-
+            # rendered pages still get a chance to surface real content.
+            # The HTTP path stays fail-fast because the caller explicitly
+            # opted out of a browser.
             if mode == "auto":
                 logger.info(
                     "HTTP returned %s; using browser for %s", content_type, url
@@ -788,10 +816,11 @@ class PageFetch:
         acquisition/release, and error-handling branches in a single place so
         they cannot drift apart.
         """
-        cache_key, fetcher = await self._acquire_browser_fetcher(proxy, url)
+        cache_key, proxy_settings, fetcher = await self._acquire_browser_fetcher(proxy, url)
         try:
             response = await fetcher.fetch(
                 url,
+                proxy=proxy_settings,
                 screenshot=screenshot,
                 screenshot_format=screenshot_format,
                 screenshot_max_bytes=self.config.screenshot_max_bytes,
@@ -881,9 +910,8 @@ class PageFetch:
                 domain = registrable_host(url) or url
                 session_id = make_domain_session(domain)
             elif self.config.session_rotation == "rotate":
-                slot = random.randint(1, max(1, self.config.browser_concurrency))
-                session_id = f"rot_{slot}"
-        cache_key = f"{provider}_{session_id}" if session_id else provider
+                session_id = make_random_session()
+        cache_key = provider
         settings = resolve_proxy(provider)
         if session_id and settings.url:
             proxy_url = _inject_session_id(settings.url, session_id)
@@ -911,7 +939,7 @@ class PageFetch:
         self,
         provider: str,
         url: str,
-    ) -> tuple[str, BrowserFetcher]:
+    ) -> tuple[str, ProxySettings, BrowserFetcher]:
         cache_key, proxy = self._browser_pool_target(provider, url)
         evicted: BrowserFetcher | None = None
         async with self._browser_pool_condition:
@@ -939,7 +967,7 @@ class PageFetch:
             fetcher = self._browser_fetchers[cache_key]
         if evicted is not None:
             await self._close_browser_quietly(evicted)
-        return cache_key, fetcher
+        return cache_key, proxy, fetcher
 
     async def _release_browser_fetcher(self, cache_key: str) -> None:
         async with self._browser_pool_condition:
@@ -1120,6 +1148,39 @@ class PageFetch:
             marker in stripped[:512].lower()
             for marker in (b"<!doctype html", b"<html", b"<head", b"<body", b"<title", b"<meta", b"<div", b"<p", b"<a ")
         )
+
+    # Sniff markers for "Under Attack Mode" / interstitial WAF challenges
+    # that arrive with a 503 (or occasionally a 403) status.  Cheap substring
+    # checks against the first ~4 KiB — we never re-parse this body.
+    _WAF_CHALLENGE_MARKERS = (
+        b"cf-chl-bypass",
+        b"cf_chl_opt",
+        b"__cf_chl_jschl_tk__",
+        b"challenge-running",
+        b"checking your browser",
+        b"verify you are human",
+        b"just a moment",
+        b"attention required",
+        b"access denied",
+        b"akamai bot manager",
+        b"perimeterx",
+        b"datadome",
+        b"kasada",
+        b"px-captcha",
+    )
+
+    @classmethod
+    def _body_looks_like_waf_challenge(cls, content: bytes) -> bool:
+        """Return True when *content* carries WAF challenge markers.
+
+        Only the first 4 KiB are scanned — challenge pages embed the marker
+        near the top, and the head bytes are already in memory after the
+        content-type / status decision.
+        """
+        if not content:
+            return False
+        head = content[:4096].lower()
+        return any(marker in head for marker in cls._WAF_CHALLENGE_MARKERS)
 
     @staticmethod
     def _validate_fetch_options(mode: str, proxy: str) -> None:

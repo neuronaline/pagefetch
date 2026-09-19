@@ -78,7 +78,8 @@ class MarkdownConverter:
             if not href:
                 return label
             target = urljoin(self.base_url, str(href))
-            return f"[{label or target}]({target})"
+            safe_label = label.replace("[", r"\[").replace("]", r"\]")
+            return f"[{safe_label or target}]({target})"
         if name == "img":
             source = image_candidate(node)
             if not source:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 from collections.abc import Callable
 from typing import Any, TypedDict
@@ -32,11 +31,17 @@ async def in_page_metrics(page: Any) -> PageMetrics:
                 mainText += (el.innerText?.length || 0);
             }
             const lowered = (body?.innerText || '').toLowerCase();
-            const challenge = (
-                lowered.includes('checking your browser') ||
-                lowered.includes('verify you are human') ||
-                (document.title || '').toLowerCase().includes('challenge')
-            ) && bodyText < 400;
+            const title = (document.title || '').toLowerCase();
+            const patterns = [
+                'checking your browser', 'verify you are human', 'attention required',
+                'just a moment', 'security check', 'robot olmadığınızı', 'erişim engellendi',
+                'güvenlik kontrolü', 'проверка вашего браузера', 'подтвердите, что вы не робот',
+                'wir überprüfen ihren browser', 'bitte bestätigen sie', 'nous vérifions votre navigateur',
+                'vérifiez que vous êtes humain', 'verificando tu navegador', 'verifica que no eres un robot',
+                'cf-chl-', 'cf-turnstile', 'challenge-form'
+            ];
+            const hasChallengeText = patterns.some(p => lowered.includes(p) || title.includes(p));
+            const challenge = (hasChallengeText || title.includes('challenge')) && bodyText < 500;
             return {text: bodyText, mainText, challenge};
         }"""
     )
@@ -115,13 +120,14 @@ async def controlled_scroll(
         if height > max_height:
             await page.evaluate("() => window.scrollTo(0, 0)")
             return True
-        # Adaptive sleep with jitter — avoid perfectly regular intervals that
-        # make bot detection trivial.  ±25 % around the base value.
         if index < 3:
-            await asyncio.sleep(sleep_early * random.uniform(0.75, 1.25))
+            await asyncio.sleep(sleep_early)
         else:
-            await asyncio.sleep(sleep_late * random.uniform(0.75, 1.25))
-        if height <= previous_height and int(metrics.get("y", 0)) + int(metrics.get("viewport", 0)) >= height:
+            await asyncio.sleep(sleep_late)
+        if (
+            height <= previous_height
+            and int(metrics.get("y", 0)) + int(metrics.get("viewport", 0)) >= height
+        ):
             unchanged += 1
             if unchanged >= 2:
                 await page.evaluate("() => window.scrollTo(0, 0)")

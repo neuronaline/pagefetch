@@ -73,6 +73,7 @@ GEO_MAP: dict[str, dict[str, str]] = {
 
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 BLOCKED_STATUS_CODES = frozenset({403, 429})
+
 XML_TYPES = ("application/xml", "text/xml", "+xml")
 SAFE_RESPONSE_HEADERS = frozenset(
     {"cache-control", "content-language", "content-location", "date", "etag", "last-modified"}

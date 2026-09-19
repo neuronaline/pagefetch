@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import re
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -49,9 +50,11 @@ def _inject_session_id(proxy_url: str, session_id: str) -> str:
         return proxy_url
 
     raw_user = unquote(parsed.username)
-    # Strip a previously embedded session suffix.
-    base_user = raw_user.rsplit("_ses_", 1)[0]
-    new_user = quote(f"{base_user}_ses_{session_id}", safe="")
+    # Strip previously embedded session suffixes (_ses_, -session-, _session_).
+    match = re.search(r"(_ses_|-session-|_session_)", raw_user, re.IGNORECASE)
+    delimiter = match.group(1) if match else "_ses_"
+    base_user = raw_user[:match.start()] if match else raw_user
+    new_user = quote(f"{base_user}{delimiter}{session_id}", safe="")
 
     netloc = parsed.netloc
     user_host = netloc.split("@", 1)
