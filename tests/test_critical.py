@@ -52,10 +52,11 @@ def test_cache_keys_are_stable_and_provider_specific():
 
 
 def test_proxy_environment_resolves_and_redacts(monkeypatch):
-    monkeypatch.setenv("DECODO_HOST", "proxy.example")
-    monkeypatch.setenv("DECODO_PORT", "1234")
-    monkeypatch.setenv("DECODO_USERNAME", "user@zone")
-    monkeypatch.setenv("DECODO_PASSWORD", "secret:value")
+    """``decodo`` accepts a full URL with credentials and redacts them in logs."""
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user%40zone:secret%3Avalue@proxy.example:1234",
+    )
     settings = resolve_proxy("decodo")
     assert settings.url == "http://user%40zone:secret%3Avalue@proxy.example:1234"
     assert settings.browser_config() == {
@@ -66,11 +67,201 @@ def test_proxy_environment_resolves_and_redacts(monkeypatch):
     assert redact_proxy_url(settings.url) == "http://***:***@proxy.example:1234"
 
 
-def test_missing_proxy_environment_raises(monkeypatch):
-    for suffix in ("PROXY_URL", "HOST", "PORT", "USERNAME", "PASSWORD"):
-        monkeypatch.delenv(f"DATAIMPULSE_{suffix}", raising=False)
-    with pytest.raises(ProxyConfigurationError, match="DATAIMPULSE_HOST"):
-        resolve_proxy("dataimpulse")
+def test_custom_proxy_url_resolves_for_each_scheme(monkeypatch):
+    """``custom`` accepts http/https/socks5 with optional credentials."""
+    monkeypatch.delenv("CUSTOM_PROXY_URL", raising=False)
+    for scheme in ("http", "https", "socks5"):
+        monkeypatch.setenv("CUSTOM_PROXY_URL", f"{scheme}://1.2.3.4:1080")
+        settings = resolve_proxy("custom")
+        assert settings.provider == "custom"
+        assert settings.url == f"{scheme}://1.2.3.4:1080"
+        # browser_config strips credentials — there are none, so only ``server``.
+        assert settings.browser_config() == {"server": f"{scheme}://1.2.3.4:1080"}
+
+
+def test_custom_proxy_missing_env_raises(monkeypatch):
+    monkeypatch.delenv("CUSTOM_PROXY_URL", raising=False)
+    with pytest.raises(ProxyConfigurationError, match="CUSTOM_PROXY_URL"):
+        resolve_proxy("custom")
+
+
+def test_custom_proxy_invalid_scheme_raises(monkeypatch):
+    monkeypatch.setenv("CUSTOM_PROXY_URL", "ftp://proxy.example.com:21")
+    with pytest.raises(ProxyConfigurationError, match="http, https, socks5, or socks5h"):
+        resolve_proxy("custom")
+
+
+def test_custom_proxy_url_is_passed_verbatim(monkeypatch):
+    """``custom`` URLs must reach the transport verbatim — no session injection, no rewriting.
+
+    The previous implementation re-parsed the URL and re-issued a sticky token;
+    that broke self-hosted proxies that don't understand the residential
+    targeting grammar.  This test guards both transport paths (browser pool
+    and HTTP helper) against the same regression.
+    """
+    monkeypatch.setenv("CUSTOM_PROXY_URL", "socks5://user:pass@proxy.example.com:1080")
+    client = PageFetch(proxy="custom", cache_enabled=False)
+    try:
+        _, browser_proxy = client._browser_pool_target(
+            "custom", "https://example.com/path"
+        )
+        assert browser_proxy.url == "socks5://user:pass@proxy.example.com:1080"
+        # The HTTP path now goes through the same _resolve_proxy_url helper,
+        # so the same URL flows through unchanged there as well.
+        http_proxy = client._resolve_proxy_url("custom", "https://example.com/path")
+        assert http_proxy == "socks5://user:pass@proxy.example.com:1080"
+    finally:
+        client._closed = True
+
+
+def test_socks5h_scheme_is_accepted(monkeypatch):
+    """``socks5h`` is documented in the README and supported by httpx[http2,socks]."""
+    monkeypatch.setenv("CUSTOM_PROXY_URL", "socks5h://user:pass@proxy.example.com:1080")
+    settings = resolve_proxy("custom")
+    assert settings.url == "socks5h://user:pass@proxy.example.com:1080"
+
+
+def test_residential_proxy_url_requires_credentials(monkeypatch):
+    """The shared parser must reject credential-less URLs for residential providers."""
+    monkeypatch.setenv("DECODO_PROXY_URL", "http://proxy.example.com:8080")
+    with pytest.raises(ProxyConfigurationError, match="username and password"):
+        resolve_proxy("decodo")
+    monkeypatch.setenv("BYTEFUL_PROXY_URL", "http://proxy.example.com:8080")
+    with pytest.raises(ProxyConfigurationError, match="username and password"):
+        resolve_proxy("byteful")
+
+
+def test_byteful_provider_resolves_and_redacts(monkeypatch):
+    """``byteful`` reads ``BYTEFUL_PROXY_URL`` and redacts it like the others."""
+    monkeypatch.setenv(
+        "BYTEFUL_PROXY_URL",
+        "https://user:secret@residential.byteful.com:8000",
+    )
+    settings = resolve_proxy("byteful")
+    assert settings.provider == "byteful"
+    assert settings.url == "https://user:secret@residential.byteful.com:8000"
+    assert settings.browser_config() == {
+        "server": "https://residential.byteful.com:8000",
+        "username": "user",
+        "password": "secret",
+    }
+    assert redact_proxy_url(settings.url) == "https://***:***@residential.byteful.com:8000"
+
+
+def test_byteful_session_injection_uses_byteful_token():
+    """``byteful`` URLs embed the session ID with ``_s_`` (not Decodo's ``-session-``)."""
+    from pagefetch.proxy.providers import inject_session_id_for
+
+    base = "https://user:secret@residential.byteful.com:8000"
+    rewritten = inject_session_id_for("byteful", base, "abc123456789")
+    # Byteful's documented sticky-session suffix is ``_s_<id>``:
+    assert "_s_abc123456789" in rewritten
+    # And the helper must NOT silently emit the Decodo hyphen syntax.
+    assert "-session-" not in rewritten
+    # Decodo uses its own hyphen-delimited syntax; the dispatch picks the right one.
+    decodo = inject_session_id_for(
+        "decodo", "http://user:secret@residential.decodo.com:8000", "abc123456789"
+    )
+    assert "-session-abc123456789" in decodo
+    assert "_s_abc123456789" not in decodo
+
+
+def test_decodo_session_injection_uses_documented_hyphen_syntax():
+    """Decodo's documented grammar (DECODO_DOCS §3, §4) is hyphen-delimited
+    and requires the ``user-`` prefix on the username whenever any targeting
+    parameter is appended. The injector must auto-prepend the prefix when
+    missing and preserve it when the caller has already supplied it.
+    """
+    from pagefetch.proxy.providers import inject_session_id_for
+
+    # Username without the ``user-`` prefix gets one prepended.
+    unprefixed = inject_session_id_for(
+        "decodo", "http://prodUser:secret@gate.decodo.com:7000", "abc123456789"
+    )
+    assert unprefixed.startswith("http://user-prodUser-session-abc123456789:secret@")
+    # Username already prefixed is preserved (no double ``user-``).
+    prefixed = inject_session_id_for(
+        "decodo", "http://user-prodUser:secret@gate.decodo.com:7000", "abc123456789"
+    )
+    assert prefixed.startswith("http://user-prodUser-session-abc123456789:secret@")
+    # Pre-existing targeting parameters (e.g. ``country-us``) are kept intact
+    # and the new ``-session-<id>`` token is appended at the tail.
+    already_targeted = inject_session_id_for(
+        "decodo",
+        "http://user-prodUser-country-us:secret@gate.decodo.com:7000",
+        "abc123456789",
+    )
+    assert (
+        "user-prodUser-country-us-session-abc123456789"
+        in already_targeted
+    )
+
+
+def test_residential_rotate_mode_skips_session_injection(monkeypatch):
+    """Per DECODO_DOCS §2 and BYTEFUL_DOCS §3 / §4, both residential
+    networks rotate the egress IP on every request when NO session token
+    is appended. ``PageFetch.fetch`` must therefore pass the configured
+    proxy URL through verbatim under ``session_rotation=rotate`` — never
+    silently emit a sticky token.
+    """
+    from pagefetch.proxy.providers import inject_session_id_for
+
+    # Sanity: the helper itself does not emit anything for unknown providers.
+    assert (
+        inject_session_id_for("custom", "http://user:pass@host:1234", "abc123456789")
+        == "http://user:pass@host:1234"
+    )
+
+    client = PageFetch(
+        proxy="decodo",
+        session_rotation="rotate",
+        cache_enabled=False,
+    )
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL", "http://user-prodUser:secret@gate.decodo.com:7000"
+    )
+    try:
+        _, proxy = client._browser_pool_target(
+            "decodo", "https://example.com/path"
+        )
+        # Decodo's rotate-by-default behaviour: no ``-session-`` token appended.
+        assert proxy.url == "http://user-prodUser:secret@gate.decodo.com:7000"
+        assert "-session-" not in (proxy.url or "")
+    finally:
+        client._closed = True
+
+    monkeypatch.setenv(
+        "BYTEFUL_PROXY_URL",
+        "https://user:secret@residential.byteful.com:8000",
+    )
+    client2 = PageFetch(
+        proxy="byteful",
+        session_rotation="rotate",
+        cache_enabled=False,
+    )
+    try:
+        _, proxy = client2._browser_pool_target(
+            "byteful", "https://example.com/path"
+        )
+        # Byteful's Basic Random Residential Proxy form rotates per request.
+        assert proxy.url == "https://user:secret@residential.byteful.com:8000"
+        assert "_s_" not in (proxy.url or "")
+    finally:
+        client2._closed = True
+
+
+
+def test_unsupported_provider_lists_valid_options():
+    from pagefetch.proxy.providers import VALID_PROXY_PROVIDERS
+
+    with pytest.raises(ProxyConfigurationError) as exc:
+        resolve_proxy("tor")
+    # The error message must enumerate the valid providers so the user can
+    # fix the config without consulting the docs.
+    assert "custom" in str(exc.value)
+    assert "decodo" in str(exc.value)
+    assert "byteful" in str(exc.value)
+    assert set(VALID_PROXY_PROVIDERS) == {"none", "custom", "decodo", "byteful"}
 
 
 # ---------------------------------------------------------------------------

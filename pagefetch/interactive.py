@@ -379,10 +379,16 @@ def _settings_menu(settings: dict) -> None:
                 print(f"  Invalid mode: {val}")
                 input("  Press Enter...")
         elif choice == "2":
-            print(f"\n  Options: {', '.join(sorted(VALID_PROXIES))}")
+            print("\n  Options: " + ", ".join(sorted(VALID_PROXIES)))
+            print("  custom — any HTTP/HTTPS/SOCKS5 proxy via CUSTOM_PROXY_URL")
+            print("  decodo — Decodo residential (DECODO_PROXY_URL)")
+            print("  byteful — Byteful residential (BYTEFUL_PROXY_URL)")
             val = _prompt("  Proxy provider", proxy)
             if val in VALID_PROXIES:
                 settings["proxy"] = val
+                if val == "custom":
+                    print("  → set CUSTOM_PROXY_URL to your proxy URL")
+                    print("    e.g. CUSTOM_PROXY_URL=socks5://user:pass@host:1080")
             else:
                 print(f"  Invalid proxy: {val}")
                 input("  Press Enter...")
@@ -532,7 +538,6 @@ def _init_client(settings: dict) -> PageFetch:
         session_rotation=config.session_rotation,
         request_pacing=config.request_pacing,
         stealth_level=config.stealth_level,
-        proxy_geo=config.proxy_geo,
         raise_on_error=config.raise_on_error,
         screenshot_max_bytes=config.screenshot_max_bytes,
         browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,

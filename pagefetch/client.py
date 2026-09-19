@@ -24,7 +24,6 @@ from .constants import (
     _UA_POOL_BY_OS,
     BLOCKED_STATUS_CODES,
     BROWSER_HEADERS,
-    GEO_MAP,
     RETRYABLE_STATUS_CODES,
     SAFE_RESPONSE_HEADERS,
 )
@@ -42,9 +41,8 @@ from .processing.non_html import (
 from .processing.structure import StructureLimits, extract_structure
 from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
 from .proxy.providers import (
-    _inject_session_id,
+    inject_session_id_for,
     make_domain_session,
-    make_random_session,
 )
 from .utils.durations import parse_duration
 from .utils.urls import normalize_url, registrable_host, validate_url
@@ -80,7 +78,7 @@ class PageFetch:
         self,
         *,
         mode: Literal["auto", "http", "browser"] = "auto",
-        proxy: Literal["none", "decodo", "dataimpulse"] = "none",
+        proxy: Literal["none", "custom", "decodo", "byteful"] = "none",
         cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
         http_concurrency: int = 10,
         browser_concurrency: int = 4,
@@ -101,7 +99,6 @@ class PageFetch:
         session_rotation: Literal["sticky", "rotate"] | None = None,
         request_pacing: float | None = None,
         stealth_level: Literal["off", "balanced", "max"] = "off",
-        proxy_geo: str | None = None,
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
         browser_pre_check_byte_margin: float = 1.5,
@@ -129,7 +126,6 @@ class PageFetch:
             session_rotation=session_rotation,
             request_pacing=request_pacing,
             stealth_level=stealth_level,
-            proxy_geo=proxy_geo,
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
             browser_pre_check_byte_margin=browser_pre_check_byte_margin,
@@ -198,8 +194,6 @@ class PageFetch:
             parts.append(f"pacing={cfg.request_pacing:.1f}s")
         parts.append(f"session={cfg.session_rotation}")
         parts.append(f"lang={cfg.accept_language}")
-        if cfg.proxy_geo:
-            parts.append(f"geo={cfg.proxy_geo}")
         if cfg.mode == "auto":
             parts.append("mode=auto (HTTP→browser)")
         logger.info("fingerprint profile: %s", ", ".join(parts))
@@ -308,7 +302,8 @@ class PageFetch:
         url: str,
         *,
         mode: Literal["auto", "http", "browser"] | None = None,
-        proxy: Literal["none", "decodo", "dataimpulse"] | None = None,
+        proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
+
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -362,7 +357,8 @@ class PageFetch:
         urls: Iterable[str],
         *,
         mode: Literal["auto", "http", "browser"] | None = None,
-        proxy: Literal["none", "decodo", "dataimpulse"] | None = None,
+        proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
+
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -459,7 +455,8 @@ class PageFetch:
         compact_structure: bool = False,
         screenshot: Literal["none", "viewport", "full"] = "none",
         screenshot_format: Literal["png", "jpeg"] = "png",
-        proxy: Literal["none", "decodo", "dataimpulse"] | None = None,
+        proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
+
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -506,18 +503,13 @@ class PageFetch:
     def _cache_settings(self, **operation_settings: Any) -> dict[str, Any]:
         """Return cache-key settings shared by fetch and extraction operations."""
         settings = {
-            "accept_language": (
-                GEO_MAP[self.config.proxy_geo]["accept_language"]
-                if self.config.proxy_geo
-                else self.config.accept_language
-            ),
+            "accept_language": self.config.accept_language,
             "block_images": self.config.block_images,
             "block_level": self.config.block_level,
             "cleaning_level": self.config.cleaning_level,
             "confidence_threshold": self.config.confidence_threshold,
             "humanize": self.config.humanize,
             "max_redirects": self.config.max_redirects,
-            "proxy_geo": self.config.proxy_geo,
             "session_rotation": self.config.session_rotation,
         }
         settings.update(operation_settings)
@@ -617,16 +609,7 @@ class PageFetch:
     ) -> FetchResult:
         try:
             fetcher = await self._http_fetcher(proxy)
-            per_request_proxy: str | None = None
-            if proxy != "none":
-                settings = resolve_proxy(proxy)
-                if settings.url:
-                    if self.config.session_rotation == "rotate":
-                        session_id = make_random_session()
-                    else:
-                        domain = registrable_host(url) or url
-                        session_id = make_domain_session(domain)
-                    per_request_proxy = _inject_session_id(settings.url, session_id)
+            per_request_proxy = self._resolve_proxy_url(proxy, url)
             retry_codes = (
                 RETRYABLE_STATUS_CODES - {429}
                 if mode == "auto"
@@ -897,27 +880,39 @@ class PageFetch:
         pool = _UA_POOL_BY_OS[_HOST_OS]
         pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(pool)
         headers["User-Agent"] = pool[pool_idx]
-        if self.config.proxy_geo:
-            headers["Accept-Language"] = GEO_MAP[self.config.proxy_geo]["accept_language"]
-        else:
-            headers["Accept-Language"] = self.config.accept_language
+        headers["Accept-Language"] = self.config.accept_language
         return headers
 
-    def _browser_pool_target(self, provider: str, url: str) -> tuple[str, ProxySettings]:
-        session_id = ""
-        if provider != "none":
-            if self.config.session_rotation == "sticky":
-                domain = registrable_host(url) or url
-                session_id = make_domain_session(domain)
-            elif self.config.session_rotation == "rotate":
-                session_id = make_random_session()
-        cache_key = provider
+    def _resolve_proxy_url(self, provider: str, url: str) -> str | None:
+        """Return the per-request proxy URL for *provider* under the current rotation policy.
+
+        - ``none`` returns ``None`` (no proxy).
+        - ``custom`` and residential providers in ``rotate`` mode return the
+          configured URL verbatim — self-hosted proxies have no concept of
+          session affinity, and residential gateways rotate the egress IP on
+          every request when no session token is appended.
+        - Residential providers in ``sticky`` mode get a domain-stable
+          session ID embedded in the username so the same exit is reused
+          across requests for the same site.
+
+        Used by both the HTTP and browser transports so the two paths cannot
+        drift on rotation semantics.
+        """
+        if provider == "none":
+            return None
         settings = resolve_proxy(provider)
-        if session_id and settings.url:
-            proxy_url = _inject_session_id(settings.url, session_id)
-        else:
-            proxy_url = settings.url
-        return cache_key, ProxySettings(provider=settings.provider, url=proxy_url)
+        if not settings.url:
+            return None
+        if provider == "custom" or self.config.session_rotation == "rotate":
+            return settings.url
+        domain = registrable_host(url) or url
+        return inject_session_id_for(
+            provider, settings.url, make_domain_session(domain)
+        )
+
+    def _browser_pool_target(self, provider: str, url: str) -> tuple[str, ProxySettings]:
+        proxy_url = self._resolve_proxy_url(provider, url)
+        return provider, ProxySettings(provider=provider, url=proxy_url)
 
     def _new_browser_fetcher(self, proxy: ProxySettings) -> BrowserFetcher:
         return BrowserFetcher(
@@ -931,8 +926,6 @@ class PageFetch:
             block_images=self.config.block_images,
             block_level=self.config.block_level,
             humanize=self.config.humanize,
-            geo_locale=GEO_MAP[self.config.proxy_geo]["locale"] if self.config.proxy_geo else None,
-            geo_timezone=GEO_MAP[self.config.proxy_geo]["timezone"] if self.config.proxy_geo else None,
         )
 
     async def _acquire_browser_fetcher(

@@ -44,7 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", choices=sorted(VALID_OUTPUT_FORMATS), default="markdown")
     parser.add_argument("-c", "--config", type=Path, metavar="PATH", help="Path to config.yaml")
     parser.add_argument("--mode", choices=sorted(VALID_MODES), default=argparse.SUPPRESS)
-    parser.add_argument("--proxy", choices=sorted(VALID_PROXIES), default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--proxy",
+        choices=sorted(VALID_PROXIES),
+        default=argparse.SUPPRESS,
+        help="Proxy provider: none | custom (HTTP/HTTPS/SOCKS5 via CUSTOM_PROXY_URL) | decodo | byteful",
+    )
     parser.add_argument("-o", "--output", type=Path)
     parser.add_argument("--include-html", action="store_true")
     parser.add_argument(
@@ -106,12 +111,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(VALID_STEALTH_LEVELS),
         default=argparse.SUPPRESS,
         help="Anti-detection profile preset (default: off)",
-    )
-    parser.add_argument(
-        "--proxy-geo",
-        metavar="CC",
-        default=argparse.SUPPRESS,
-        help="Align locale/timezone/lang with proxy exit country (ISO 3166-1 alpha-2, e.g. US, DE, TR)",
     )
     parser.add_argument(
         "--cleaning-level",
@@ -198,8 +197,6 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         overrides["request_pacing"] = args.request_pacing
     if hasattr(args, "stealth_level"):
         overrides["stealth_level"] = args.stealth_level
-    if hasattr(args, "proxy_geo"):
-        overrides["proxy_geo"] = args.proxy_geo
     if hasattr(args, "cleaning_level"):
         overrides["cleaning_level"] = args.cleaning_level
 
@@ -243,7 +240,6 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
             None if preset_override else config.request_pacing,
         ),
         stealth_level=overrides.get("stealth_level", config.stealth_level),
-        proxy_geo=overrides.get("proxy_geo", config.proxy_geo),
         cleaning_level=overrides.get("cleaning_level", config.cleaning_level),
         raise_on_error=config.raise_on_error,
         screenshot_max_bytes=config.screenshot_max_bytes,
@@ -297,7 +293,6 @@ async def _run(args: argparse.Namespace) -> int:
         session_rotation=config.session_rotation,
         request_pacing=config.request_pacing,
         stealth_level=config.stealth_level,
-        proxy_geo=config.proxy_geo,
         cleaning_level=config.cleaning_level,
         raise_on_error=config.raise_on_error,
         screenshot_max_bytes=config.screenshot_max_bytes,

@@ -96,11 +96,11 @@ async with PageFetch(mode="auto") as client:
 | **Inconsistent output formats** | Single `FetchResult` model: always get `.markdown`, `.html`, `.text`, `.links`, `.images`, `.metadata` |
 | **Managing concurrency** | Built-in semaphores for HTTP (default 10) and browser (default 4) with bounded browser session rotation |
 | **Repeated requests waste bandwidth** | SQLite disk cache with configurable TTL, shared across runs |
-| **Proxy rotation complexity** | Native Decodo and DataImpulse integration — configure via env vars or code |
+| **Proxy rotation complexity** | Native Decodo and Byteful integration — configure via env vars or code |
 | **Content that isn't HTML** | PDFs auto-detected and extracted; XML documents parsed; plain text preserved |
 | **Fast DOM inspection** | $O(N)$ single-pass structural summary generating verified unique CSS selectors |
 | **Dependency management friction** | Core HTTP support stays lightweight; browser and PDF features use explicit extras |
-| **Hard-to-match fingerprints** | `stealth_level` presets + `humanize`, `block_level`, `request_pacing`, `session_rotation`, and `proxy_geo` for locale-aligned Accept-Language |
+| **Hard-to-match fingerprints** | `stealth_level` presets + `humanize`, `block_level`, `request_pacing`, and `session_rotation` |
 
 ---
 
@@ -129,7 +129,6 @@ country:
 | `session_rotation` | `"sticky"` reuses one proxy session per domain; `"rotate"` manages fresh sessions within a bounded browser pool. |
 | `request_pacing` | Fixed seconds of delay between browser requests (`0.0` = none). |
 | `accept_language` | Value sent as the `Accept-Language` header. |
-| `proxy_geo` | ISO 3166-1 alpha-2 country code (e.g. `"US"`, `"DE"`, `"TR"`); aligns locale, timezone, and `Accept-Language` with the exit country. |
 | `cleaning_level` | How aggressively non-content DOM is stripped before extraction: `"minimal"` (display:none / hidden / 1×1 pixels only), `"standard"` (default — also drops cookie banners, ad slots, tracking pixels), `"maximum"` (removes layout chrome, nav, and sidebars while preserving article headers, `h1`/`h2`, tables, code blocks, and primary content). |
 
 ```python
@@ -142,14 +141,13 @@ async with PageFetch(
     mode="browser",
     proxy="decodo",
     stealth_level="max",
-    proxy_geo="DE",
 ) as client:
     result = await client.fetch("https://example.com")
 ```
 
 The CLI exposes every knob via `--stealth-level`, `--block-level`,
 `--humanize` / `--no-humanize`, `--session-rotation`, `--request-pacing`,
-`--accept-language`, `--proxy-geo`, and `--cleaning-level`.
+`--accept-language`, and `--cleaning-level`.
 
 ### Platform-aware headless mode
 
@@ -223,7 +221,7 @@ from pagefetch import PageFetch
 
 client = PageFetch(
     mode="auto",              # "auto" | "http" | "browser"
-    proxy="none",             # "none" | "decodo" | "dataimpulse"
+    proxy="none",             # "none" | "custom" | "decodo" | "byteful"
     cleaning_level="standard", # "minimal" | "standard" | "maximum"
     http_concurrency=10,      # Max parallel HTTP requests
     browser_concurrency=4,    # Max parallel browser instances
@@ -244,7 +242,6 @@ client = PageFetch(
     session_rotation="sticky",# "sticky" | "rotate" proxy session strategy
     request_pacing=0.0,       # Seconds of delay between requests
     stealth_level="off",      # "off" | "balanced" | "max" preset
-    proxy_geo=None,           # ISO 3166-1 alpha-2 (e.g. "US", "DE")
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
     screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…)
 )
@@ -319,7 +316,7 @@ class FetchResult:
     screenshot: bytes | None         # PNG/JPEG screenshot bytes (when requested)
     screenshot_format: str | None    # "png" or "jpeg"
     fetch_method: str | None    # "http", "browser", "text", "xml", or "pdf"
-    proxy_provider: str         # "none", "decodo", or "dataimpulse"
+    proxy_provider: str         # "none", "custom", "decodo", or "byteful"
     content_confidence: float | None  # 0–1 completeness score (None for browser mode)
     from_cache: bool            # Was this served from cache?
     duration_ms: float | None   # Total fetch duration
@@ -393,7 +390,7 @@ pagefetch https://example.com --debug
 |---|---|
 | `inputs` (positional) | One or more URLs or text files containing URLs |
 | `--mode {auto,http,browser}` | `mode` |
-| `--proxy {none,decodo,dataimpulse}` | `proxy` |
+| `--proxy {none,custom,decodo,byteful}` | `proxy` |
 | `--http-concurrency N` / `--browser-concurrency N` | `http_concurrency` / `browser_concurrency` |
 | `--timeout SECONDS` / `--browser-timeout SECONDS` | `http_timeout` / `browser_timeout` |
 | `--cache-ttl DURATION` / `--no-cache` | `cache_ttl` / `cache_enabled=False` |
@@ -404,7 +401,6 @@ pagefetch https://example.com --debug
 | `--session-rotation {sticky,rotate}` | `session_rotation` |
 | `--request-pacing SECONDS` | `request_pacing` |
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
-| `--proxy-geo CC` | `proxy_geo` |
 | `--cleaning-level {minimal,standard,maximum}` | `cleaning_level` |
 | `--include-html` | `FetchResult.json(include_html=…)` |
 | `--screenshot {none,viewport,full}` | `PageFetch.extract(screenshot=…)` |
@@ -445,23 +441,32 @@ client = PageFetch(cache_path="/path/to/custom_cache.sqlite3")
 
 ## Proxy Support
 
-PageFetch provides built-in integration with residential proxy providers:
+PageFetch supports any standard HTTP/HTTPS/SOCKS5/SOCKS5H proxy out of
+the box, plus first-class integrations with two residential providers:
 
-| Provider | Env Var (Full URL) | Env Vars (Components) |
+| Provider | Env Var (Full URL) | Notes |
 |---|---|---|
-| **Decodo** | `DECODO_PROXY_URL` | `DECODO_HOST`, `DECODO_PORT`, `DECODO_USERNAME`, `DECODO_PASSWORD` |
-| **DataImpulse** | `DATAIMPULSE_PROXY_URL` | `DATAIMPULSE_HOST`, `DATAIMPULSE_PORT`, `DATAIMPULSE_USERNAME`, `DATAIMPULSE_PASSWORD` |
+| **`custom`** | `CUSTOM_PROXY_URL` (fallback `PROXY_URL`) | Any standard proxy — self-hosted, datacenter, corporate gateway, Tor. URL passed through verbatim, no username rewriting. |
+| **Decodo** | `DECODO_PROXY_URL` | Residential; embeds session ID in username as `user-<user>-session-<id>`. |
+| **Byteful** | `BYTEFUL_PROXY_URL` | Residential; embeds session ID in username as `<user>_s_<id>`. |
 
 ```python
-# Use Decodo proxy with German exit node and aligned locale
-async with PageFetch(proxy="decodo", proxy_geo="DE") as client:
+# Standard SOCKS5 proxy — credentials are optional
+import os
+os.environ["CUSTOM_PROXY_URL"] = "socks5://user:pass@proxy.example.com:1080"
+async with PageFetch(proxy="custom") as client:
+    result = await client.fetch("https://example.com")
+
+# Decodo proxy with German exit node
+async with PageFetch(proxy="decodo") as client:
     result = await client.fetch("https://example.de")
 
 # Rotate proxy sessions across requests
-async with PageFetch(proxy="dataimpulse", session_rotation="rotate") as client:
+async with PageFetch(proxy="byteful", session_rotation="rotate") as client:
     results = await client.fetch_many([...])
 ```
 
+Accepted schemes for `custom`: `http`, `https`, `socks5`, `socks5h`.
 Credentials are never exposed in result objects, logs, or cache keys.
 
 ---
@@ -484,7 +489,7 @@ Non-HTML content is handled immediately at the HTTP layer, bypassing all browser
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mode` | `str` | `"auto"` | Fetch strategy: `"auto"`, `"http"`, or `"browser"` |
-| `proxy` | `str` | `"none"` | Proxy provider: `"none"`, `"decodo"`, or `"dataimpulse"` |
+| `proxy` | `str` | `"none"` | Proxy provider: `"none"`, `"custom"` (any HTTP/HTTPS/SOCKS5/SOCKS5H), `"decodo"`, or `"byteful"` |
 | `cleaning_level` | `str` | `"standard"` | DOM cleaning level: `"minimal"`, `"standard"`, or `"maximum"` |
 | `http_concurrency` | `int` | `10` | Maximum concurrent HTTP connections |
 | `browser_concurrency` | `int` | `4` | Maximum concurrent browser instances |
@@ -505,7 +510,6 @@ Non-HTML content is handled immediately at the HTTP layer, bypassing all browser
 | `session_rotation` | `str` | `"sticky"` | `"sticky"` or `"rotate"` proxy session rotation |
 | `request_pacing` | `float` | `0.0` | Seconds of delay between browser requests |
 | `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
-| `proxy_geo` | `str \| None` | `None` | ISO 3166-1 alpha-2 code to align locale and Accept-Language |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
 | `screenshot_max_bytes` | `int` | `50 MiB` | Maximum allowed screenshot byte size |
 | `browser_pre_check_byte_margin` | `float` | `1.5` | Multiplicative margin for browser pre-render size checks |

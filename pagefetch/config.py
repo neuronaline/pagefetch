@@ -11,11 +11,10 @@ from typing import Any, Literal
 
 from platformdirs import user_cache_path
 
-from .constants import GEO_MAP
 from .utils.durations import parse_duration
 
 VALID_MODES = frozenset({"auto", "http", "browser"})
-VALID_PROXIES = frozenset({"none", "decodo", "dataimpulse"})
+VALID_PROXIES = frozenset({"none", "custom", "decodo", "byteful"})
 VALID_CLEANING_LEVELS = frozenset({"minimal", "standard", "maximum"})
 VALID_BLOCK_LEVELS = frozenset({"minimal", "balanced", "aggressive"})
 VALID_SESSION_ROTATION = frozenset({"sticky", "rotate"})
@@ -75,7 +74,7 @@ def _interpolate_env(value: Any) -> Any:
 @dataclass(slots=True, frozen=True)
 class PageFetchConfig:
     mode: Literal["auto", "http", "browser"] = "auto"
-    proxy: Literal["none", "decodo", "dataimpulse"] = "none"
+    proxy: Literal["none", "custom", "decodo", "byteful"] = "none"
     cleaning_level: Literal["minimal", "standard", "maximum"] = "standard"
     http_concurrency: int = 10
     browser_concurrency: int = 4
@@ -96,7 +95,6 @@ class PageFetchConfig:
     session_rotation: Literal["sticky", "rotate"] = "sticky"
     request_pacing: float = 0.0
     stealth_level: Literal["off", "balanced", "max"] = "off"
-    proxy_geo: str | None = None
     raise_on_error: bool = False
     screenshot_max_bytes: int = 50 * 1024 * 1024
     # Browser-mode renders the page first and then measures the resulting DOM.
@@ -190,9 +188,6 @@ class PageFetchConfig:
             or self.browser_pre_check_byte_margin < 1.0
         ):
             raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
-        if self.proxy_geo is not None:
-            if not isinstance(self.proxy_geo, str) or self.proxy_geo.strip() not in GEO_MAP:
-                raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")
         if not isinstance(self.cache_path, str | Path):
             raise ValueError("cache_path must be a string or Path")
 
@@ -202,11 +197,6 @@ class PageFetchConfig:
         object.__setattr__(self, "confidence_threshold", float(self.confidence_threshold))
         object.__setattr__(self, "accept_language", self.accept_language.strip())
         object.__setattr__(self, "request_pacing", float(self.request_pacing))
-        object.__setattr__(
-            self,
-            "proxy_geo",
-            self.proxy_geo.strip() if self.proxy_geo else None,
-        )
         object.__setattr__(
             self,
             "browser_pre_check_byte_margin",
@@ -233,16 +223,11 @@ class PageFetchConfig:
         if not isinstance(resolved, dict):
             raise ValueError("YAML configuration must contain a mapping")
 
-        # Accept top-level keys plus an optional nested "proxy" / "cache" sections
+        # Accept top-level keys plus an optional nested "cache" section.
         flat: dict[str, Any] = {}
-        for section in ("proxy", "cache"):
+        for section in ("cache",):
             if section in resolved and isinstance(resolved[section], dict):
-                section_data = resolved.pop(section)
-                # A nested proxy section may use "provider" to select the provider;
-                # map it to the top-level "proxy" key so it is not silently dropped.
-                if section == "proxy" and "provider" in section_data:
-                    flat["proxy"] = section_data.pop("provider")
-                flat.update(section_data)
+                flat.update(resolved.pop(section))
         flat.update(resolved)
         # YAML 1.1 parsers treat the plain scalar ``off`` as boolean false.
         # Preserve the documented stealth-level spelling.
@@ -276,7 +261,6 @@ class PageFetchConfig:
             session_rotation=flat.get("session_rotation"),
             request_pacing=flat.get("request_pacing"),
             stealth_level=flat.get("stealth_level", "off"),
-            proxy_geo=flat.get("proxy_geo"),
             raise_on_error=flat.get("raise_on_error", False),
             screenshot_max_bytes=flat.get("screenshot_max_bytes", 50 * 1024 * 1024),
             browser_pre_check_byte_margin=flat.get("browser_pre_check_byte_margin", 1.5),
@@ -287,7 +271,7 @@ class PageFetchConfig:
         cls,
         *,
         mode: Literal["auto", "http", "browser"] = "auto",
-        proxy: Literal["none", "decodo", "dataimpulse"] = "none",
+        proxy: Literal["none", "custom", "decodo", "byteful"] = "none",
         cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
         http_concurrency: int = 10,
         browser_concurrency: int = 4,
@@ -308,7 +292,6 @@ class PageFetchConfig:
         session_rotation: Literal["sticky", "rotate"] | None = None,
         request_pacing: float | None = None,
         stealth_level: Literal["off", "balanced", "max"] = "off",
-        proxy_geo: str | None = None,
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
         browser_pre_check_byte_margin: float = 1.5,
@@ -393,9 +376,6 @@ class PageFetchConfig:
             or browser_pre_check_byte_margin < 1.0
         ):
             raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
-        if proxy_geo is not None:
-            if not isinstance(proxy_geo, str) or proxy_geo not in GEO_MAP:
-                raise ValueError(f"proxy_geo must be one of {sorted(GEO_MAP)}")
         ttl = parse_duration(cache_ttl)
         path = Path(cache_path).expanduser() if cache_path is not None else user_cache_path("pagefetch") / "cache.sqlite3"
         return cls(
@@ -421,7 +401,6 @@ class PageFetchConfig:
             session_rotation=session_rotation,
             request_pacing=float(request_pacing),
             stealth_level=stealth_level,
-            proxy_geo=proxy_geo.strip() if proxy_geo else None,
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
             browser_pre_check_byte_margin=float(browser_pre_check_byte_margin),

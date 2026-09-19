@@ -113,8 +113,6 @@ class BrowserFetcher:
         block_images: bool = True,
         block_level: str = "aggressive",
         humanize: bool = False,
-        geo_locale: str | None = None,
-        geo_timezone: str | None = None,
     ) -> None:
         self.semaphore = semaphore
         self.timeout = timeout
@@ -126,8 +124,6 @@ class BrowserFetcher:
         self.block_images = block_images
         self.block_level = block_level
         self.humanize = humanize
-        self.geo_locale = geo_locale
-        self.geo_timezone = geo_timezone
         self._manager: Any = None
         self._browser: Any = None
         self._start_lock = asyncio.Lock()
@@ -226,7 +222,7 @@ class BrowserFetcher:
                     "humanize": self.humanize,
                     "enable_cache": True,
                     "block_webrtc": True,
-                    "locale": self.geo_locale or "en-US",
+                    "locale": "en-US",
                     "window": random.choice(_VIEWPORT_POOL),
                 }
                 if self.block_images:
@@ -242,8 +238,6 @@ class BrowserFetcher:
                     # browser fingerprints coherent — see
                     # ``config.build()``.
                     options["i_know_what_im_doing"] = True
-                if self.geo_timezone:
-                    options["timezone_id"] = self.geo_timezone
                 if host_os is not None:
                     options["os"] = host_os
                 # Proxy is configured per-context in _fetch_page_once rather
@@ -345,8 +339,6 @@ class BrowserFetcher:
         url: str,
         *,
         proxy: ProxySettings | None = None,
-        geo_locale: str | None = None,
-        geo_timezone: str | None = None,
         screenshot: str = "none",
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
@@ -357,8 +349,8 @@ class BrowserFetcher:
         analysis or inter-retry backoff, so other tasks can use the browser
         during those windows.
 
-        When *proxy*, *geo_locale*, or *geo_timezone* are supplied, they are
-        applied to the isolated browser context created for this request.
+        When *proxy* is supplied, it is applied to the isolated browser
+        context created for this request.
 
         ``screenshot`` selects capture mode: ``"none"`` (default) skips the
         capture, ``"viewport"`` captures the initial visible area,
@@ -396,8 +388,6 @@ class BrowserFetcher:
                         result = await self._fetch_page_once(
                             url,
                             proxy=proxy,
-                            geo_locale=geo_locale,
-                            geo_timezone=geo_timezone,
                             max_scrolls=max_scrolls,
                             scroll_sleep_early=scroll_sleep_early,
                             scroll_sleep_late=scroll_sleep_late,
@@ -467,8 +457,6 @@ class BrowserFetcher:
         url: str,
         *,
         proxy: ProxySettings | None = None,
-        geo_locale: str | None = None,
-        geo_timezone: str | None = None,
         max_scrolls: int = 6,
         scroll_sleep_early: float = 0.10,
         scroll_sleep_late: float = 0.15,
@@ -497,12 +485,6 @@ class BrowserFetcher:
                 browser_proxy = effective_proxy.browser_config() if effective_proxy else None
                 if browser_proxy:
                     context_kwargs["proxy"] = browser_proxy
-                effective_locale = geo_locale or self.geo_locale
-                if effective_locale:
-                    context_kwargs["locale"] = effective_locale
-                effective_tz = geo_timezone or self.geo_timezone
-                if effective_tz:
-                    context_kwargs["timezone_id"] = effective_tz
                 context = await self._browser.new_context(**context_kwargs)
                 page = await context.new_page()
                 network = {"active": 0, "last_activity": time.monotonic()}
