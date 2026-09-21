@@ -536,6 +536,7 @@ def _init_client(settings: dict) -> PageFetch:
         accept_language=config.accept_language,
         humanize=config.humanize,
         session_rotation=config.session_rotation,
+        session_duration=config.session_duration,
         request_pacing=config.request_pacing,
         stealth_level=config.stealth_level,
         raise_on_error=config.raise_on_error,

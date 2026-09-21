@@ -146,8 +146,8 @@ async with PageFetch(
 ```
 
 The CLI exposes every knob via `--stealth-level`, `--block-level`,
-`--humanize` / `--no-humanize`, `--session-rotation`, `--request-pacing`,
-`--accept-language`, and `--cleaning-level`.
+`--humanize` / `--no-humanize`, `--session-rotation`, `--session-duration`,
+`--request-pacing`, `--accept-language`, and `--cleaning-level`.
 
 ### Platform-aware headless mode
 
@@ -240,6 +240,11 @@ client = PageFetch(
     accept_language="en-US,en;q=0.5",  # Accept-Language header
     humanize=False,          # Add small randomized delays to mimic a human
     session_rotation="sticky",# "sticky" | "rotate" proxy session strategy
+    session_duration=None,    # Optional sticky-session TTL for residential providers
+                              # ("30m", "2h", "1d" or integer seconds). Appends
+                              # -sessionduration-<minutes> (Decodo) or
+                              # _ttl_<n><unit> (Byteful) — see DECODO_DOCS §4,
+                              # BYTEFUL_DOCS §4. Ignored under session_rotation="rotate".
     request_pacing=0.0,       # Seconds of delay between requests
     stealth_level="off",      # "off" | "balanced" | "max" preset
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
@@ -374,8 +379,8 @@ pagefetch https://example.com --mode browser -o output.md
 # Process multiple URLs from a file
 pagefetch urls.txt --format json --mode auto
 
-# Use residential proxy with German exit node
-pagefetch https://example.com --proxy decodo --proxy-geo DE
+# Use residential proxy with sticky session and explicit 2-hour TTL
+pagefetch https://example.com --proxy byteful --session-duration 2h
 
 # Apply stealth preset with session rotation
 pagefetch https://example.com --mode browser --stealth-level balanced --session-rotation rotate
@@ -399,6 +404,7 @@ pagefetch https://example.com --debug
 | `--accept-language HEADER` | `accept_language` |
 | `--humanize` / `--no-humanize` | `humanize` |
 | `--session-rotation {sticky,rotate}` | `session_rotation` |
+| `--session-duration DURATION` | `session_duration` |
 | `--request-pacing SECONDS` | `request_pacing` |
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
 | `--cleaning-level {minimal,standard,maximum}` | `cleaning_level` |
@@ -447,8 +453,8 @@ the box, plus first-class integrations with two residential providers:
 | Provider | Env Var (Full URL) | Notes |
 |---|---|---|
 | **`custom`** | `CUSTOM_PROXY_URL` (fallback `PROXY_URL`) | Any standard proxy — self-hosted, datacenter, corporate gateway, Tor. URL passed through verbatim, no username rewriting. |
-| **Decodo** | `DECODO_PROXY_URL` | Residential; embeds session ID in username as `user-<user>-session-<id>`. |
-| **Byteful** | `BYTEFUL_PROXY_URL` | Residential; embeds session ID in username as `<user>_s_<id>`. |
+| **Decodo** | `DECODO_PROXY_URL` | Residential; embeds session ID in username as `user-<user>-session-<id>`. Optional `session_duration` appends `-sessionduration-<minutes>` (DECODO_DOCS §4; 1–1440 minutes). |
+| **Byteful** | `BYTEFUL_PROXY_URL` | Residential; embeds session ID in username as `<user>_s_<id>`. Optional `session_duration` appends `_ttl_<n><unit>` (BYTEFUL_DOCS §4; 1 minute – 7 days). |
 
 ```python
 # Standard SOCKS5 proxy — credentials are optional
@@ -460,6 +466,10 @@ async with PageFetch(proxy="custom") as client:
 # Decodo proxy with German exit node
 async with PageFetch(proxy="decodo") as client:
     result = await client.fetch("https://example.de")
+
+# Byteful sticky session with a 2-hour TTL token
+async with PageFetch(proxy="byteful", session_duration="2h") as client:
+    result = await client.fetch("https://example.com")
 
 # Rotate proxy sessions across requests
 async with PageFetch(proxy="byteful", session_rotation="rotate") as client:
@@ -508,6 +518,7 @@ Non-HTML content is handled immediately at the HTTP layer, bypassing all browser
 | `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in `Accept-Language` header |
 | `humanize` | `bool` | `False` | Add randomized delays mimicking human interactions |
 | `session_rotation` | `str` | `"sticky"` | `"sticky"` or `"rotate"` proxy session rotation |
+| `session_duration` | `str \| int \| None` | `None` | Optional sticky-session TTL forwarded to residential providers. Decodo → `-sessionduration-<minutes>` (1–1440 min); Byteful → `_ttl_<n><unit>` (1 min – 7 days). See DECODO_DOCS §4, BYTEFUL_DOCS §4. |
 | `request_pacing` | `float` | `0.0` | Seconds of delay between browser requests |
 | `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |

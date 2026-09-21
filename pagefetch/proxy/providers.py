@@ -14,6 +14,13 @@ Supported provider values:
 * ``byteful`` — residential provider whose URLs embed a session ID as
   ``user_s_<id>``. The URL is read from ``BYTEFUL_PROXY_URL`` and
   ``session_rotation`` controls sticky vs. rotating exit selection.
+
+Both residential providers document optional session-TTL tokens that the
+injector appends when ``session_duration`` is configured:
+
+* Decodo — ``sessionduration-<minutes>`` (DECODO_DOCS §4; range 1–1440).
+* Byteful — ``_ttl_<number><unit>`` (BYTEFUL_DOCS §4; range 1 minute to
+  7 days, units ``m``/``h``/``d``).
 """
 
 from __future__ import annotations
@@ -38,6 +45,14 @@ RESIDENTIAL_PROVIDERS = frozenset({"decodo", "byteful"})
 # is supported by httpx[http2,socks] via python-socks and resolves hostnames
 # remotely (useful when local DNS cannot reach the target).
 CUSTOM_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
+
+# Documented bounds for the optional session-TTL token. Both providers
+# accept sticky sessions that survive longer than the implicit default
+# only when the corresponding TTL token is appended to the username.
+# DECODO_DOCS §4: ``sessionduration`` is "Range: 1 to 1440 (minutes)".
+# BYTEFUL_DOCS §4: TTL "minimum 1 minute, maximum 7 days".
+_DECODO_SESSION_DURATION_MINUTES = (1, 1440)  # inclusive
+_BYTEFUL_SESSION_DURATION_SECONDS = (60, 7 * 24 * 3600)  # inclusive
 
 
 @dataclass(slots=True, frozen=True)
@@ -113,20 +128,64 @@ def _rewrite_username(proxy_url: str, new_raw_user: str) -> str:
     )
 
 
-def _inject_byteful_session(proxy_url: str, session_id: str) -> str:
+def _format_byteful_ttl(seconds: int) -> str:
+    """Return Byteful's documented TTL token (``_ttl_<number><unit>``).
+
+    BYTEFUL_DOCS §4 documents three accepted units: ``m``, ``h``, ``d`` with
+    a maximum lifetime of 7 days. We pick the largest unit that yields a
+    whole number so the token stays compact (``_ttl_30m`` rather than
+    ``_ttl_1800m``) and clamp to the documented 7-day upper bound.
+    """
+    lo, hi = _BYTEFUL_SESSION_DURATION_SECONDS
+    if seconds < lo:
+        # Below the documented 1-minute minimum; surface it so the caller
+        # gets a precise error rather than silently coercing to zero.
+        raise ProxyConfigurationError(
+            "byteful session_duration must be at least 1 minute (BYTEFUL_DOCS §4)"
+        )
+    if seconds > hi:
+        raise ProxyConfigurationError(
+            "byteful session_duration must be at most 7 days (BYTEFUL_DOCS §4)"
+        )
+    if seconds % (24 * 3600) == 0:
+        return f"{seconds // (24 * 3600)}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 60}m"
+
+
+def _inject_byteful_session(
+    proxy_url: str,
+    session_id: str,
+    *,
+    session_duration_seconds: int | None = None,
+) -> str:
     """Append Byteful's documented ``_s_<id>`` sticky-session token.
 
     See BYTEFUL_DOCS §4: ``residential.byteful.com:8000:{username}_s_{id}:{password}``.
     Omitting the token yields the Basic Random Residential Proxy form,
-    which rotates the egress IP on every request.
+    which rotates the egress IP on every request. When ``session_duration_seconds``
+    is provided the TTL token is appended as documented in BYTEFUL_DOCS §4
+    (``_ttl_<number><unit>``); 1 minute minimum, 7 days maximum.
     """
     parsed = urlsplit(proxy_url)
     if not parsed.username:
         return proxy_url
-    return _rewrite_username(proxy_url, f"{unquote(parsed.username)}_s_{session_id}")
+    username = unquote(parsed.username)
+    if session_duration_seconds is not None:
+        ttl_token = _format_byteful_ttl(session_duration_seconds)
+        username = f"{username}_s_{session_id}_ttl_{ttl_token}"
+    else:
+        username = f"{username}_s_{session_id}"
+    return _rewrite_username(proxy_url, username)
 
 
-def _inject_decodo_session(proxy_url: str, session_id: str) -> str:
+def _inject_decodo_session(
+    proxy_url: str,
+    session_id: str,
+    *,
+    session_duration_seconds: int | None = None,
+) -> str:
     """Append Decodo's documented ``-session-<id>`` sticky-session token.
 
     See DECODO_DOCS §3 (Scheme A) and §4 (parameter matrix). Targeting
@@ -135,38 +194,66 @@ def _inject_decodo_session(proxy_url: str, session_id: str) -> str:
     is not prefixed with the literal ``user-`` token.  We auto-prepend the
     prefix when the supplied username lacks it; an already-prefixed
     username is preserved so callers can pass either ``prodUser`` or
-    ``user-prodUser``.
+    ``user-prodUser``.  When ``session_duration_seconds`` is provided the
+    ``sessionduration-<minutes>`` token is appended as documented in
+    DECODO_DOCS §4 (1–1440 minutes inclusive).
     """
     parsed = urlsplit(proxy_url)
     if not parsed.username:
         return proxy_url
     raw_user = unquote(parsed.username)
     base = raw_user if raw_user.startswith("user-") else f"user-{raw_user}"
-    return _rewrite_username(proxy_url, f"{base}-session-{session_id}")
+    username = f"{base}-session-{session_id}"
+    if session_duration_seconds is not None:
+        minutes = session_duration_seconds // 60
+        lo, hi = _DECODO_SESSION_DURATION_MINUTES
+        if minutes < lo:
+            raise ProxyConfigurationError(
+                "decodo session_duration must be at least 1 minute (DECODO_DOCS §4)"
+            )
+        if minutes > hi:
+            raise ProxyConfigurationError(
+                "decodo session_duration must be at most 1440 minutes (DECODO_DOCS §4)"
+            )
+        username = f"{username}-sessionduration-{minutes}"
+    return _rewrite_username(proxy_url, username)
 
 
 # Provider-specific sticky-session injectors. ``custom`` proxies have no
 # concept of session affinity — callers must pass the URL through
 # verbatim — so they are intentionally absent here.  See DECODO_DOCS §3,
 # §4 and BYTEFUL_DOCS §4 for the documented grammars.
-_SESSION_INJECTORS: dict[str, Callable[[str, str], str]] = {
+_SESSION_INJECTORS: dict[str, Callable[..., str]] = {
     "decodo": _inject_decodo_session,
     "byteful": _inject_byteful_session,
 }
 
 
-def inject_session_id_for(provider: str, proxy_url: str, session_id: str) -> str:
+def inject_session_id_for(
+    provider: str,
+    proxy_url: str,
+    session_id: str,
+    *,
+    session_duration_seconds: int | None = None,
+) -> str:
     """Inject a sticky session ID using the syntax required by *provider*.
 
     Dispatches to the provider-specific injector registered in
     :data:`_SESSION_INJECTORS`.  Unknown providers and ``custom`` are
     returned unchanged so callers cannot accidentally emit a token the
-    upstream gateway will reject.
+    upstream gateway will reject.  When ``session_duration_seconds`` is
+    provided, the provider's documented TTL/duration token is appended
+    after the session ID (``-sessionduration-<minutes>`` for Decodo,
+    ``_ttl_<number><unit>`` for Byteful).
     """
     injector = _SESSION_INJECTORS.get(provider)
     if injector is None:
         return proxy_url
-    return injector(proxy_url, session_id)
+    return injector(
+        proxy_url,
+        session_id,
+        session_duration_seconds=session_duration_seconds,
+    )
 
 
 def make_domain_session(domain: str) -> str:

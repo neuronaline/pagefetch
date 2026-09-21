@@ -264,6 +264,217 @@ def test_unsupported_provider_lists_valid_options():
     assert set(VALID_PROXY_PROVIDERS) == {"none", "custom", "decodo", "byteful"}
 
 
+def test_decodo_session_duration_injects_documented_token():
+    """DECODO_DOCS §4 documents ``sessionduration-<minutes>`` (1–1440 min)
+    as the documented sticky-session TTL token. The injector must append it
+    in the same hyphen-delimited targeting block as the session ID and
+    auto-prepend ``user-`` when missing.
+    """
+    from pagefetch.proxy.providers import inject_session_id_for
+
+    # Bare username: ``user-`` is auto-prepended; ``-sessionduration-30``
+    # follows the existing ``-session-<id>`` block (DECODO_DOCS §4).
+    rewritten = inject_session_id_for(
+        "decodo",
+        "http://prodUser:secret@gate.decodo.com:7000",
+        "abc123456789",
+        session_duration_seconds=30 * 60,
+    )
+    assert rewritten.startswith(
+        "http://user-prodUser-session-abc123456789-sessionduration-30:secret@"
+    )
+
+    # Already-prefixed username stays prefixed (no double ``user-``).
+    prefixed = inject_session_id_for(
+        "decodo",
+        "http://user-prodUser:secret@gate.decodo.com:7000",
+        "abc123456789",
+        session_duration_seconds=120,
+    )
+    assert prefixed.startswith(
+        "http://user-prodUser-session-abc123456789-sessionduration-2:secret@"
+    )
+
+    # Pre-existing targeting tokens are preserved.
+    preserved = inject_session_id_for(
+        "decodo",
+        "http://user-prodUser-country-us:secret@gate.decodo.com:7000",
+        "abc123456789",
+        session_duration_seconds=600,
+    )
+    assert (
+        "user-prodUser-country-us-session-abc123456789-sessionduration-10"
+        in preserved
+    )
+
+    # Out-of-range values fail loud with the documented limits in the message.
+    with pytest.raises(ProxyConfigurationError, match="1440 minutes"):
+        inject_session_id_for(
+            "decodo",
+            "http://prodUser:secret@gate.decodo.com:7000",
+            "abc123456789",
+            session_duration_seconds=1441 * 60,
+        )
+    with pytest.raises(ProxyConfigurationError, match="at least 1 minute"):
+        inject_session_id_for(
+            "decodo",
+            "http://prodUser:secret@gate.decodo.com:7000",
+            "abc123456789",
+            session_duration_seconds=30,  # 30 seconds < 1 minute
+        )
+
+
+def test_byteful_session_duration_injects_documented_ttl_token():
+    """BYTEFUL_DOCS §4 documents ``_ttl_<n><unit>`` (1 minute – 7 days)
+    as the documented sticky-session TTL token. The injector must append
+    it after ``_s_<id>`` and pick the largest unit that yields a whole
+    number (so the token stays compact).
+    """
+    from pagefetch.proxy.providers import inject_session_id_for
+
+    base = "https://user:secret@residential.byteful.com:8000"
+
+    # 30 minutes → ``_ttl_30m``.
+    thirty_minutes = inject_session_id_for(
+        "byteful", base, "abc123456789", session_duration_seconds=30 * 60
+    )
+    assert "_s_abc123456789_ttl_30m" in thirty_minutes
+
+    # 2 hours → ``_ttl_2h`` (largest whole-unit).
+    two_hours = inject_session_id_for(
+        "byteful", base, "abc123456789", session_duration_seconds=2 * 3600
+    )
+    assert "_s_abc123456789_ttl_2h" in two_hours
+
+    # 1 day → ``_ttl_1d`` (BYTEFUL_DOCS §4 max documented unit).
+    one_day = inject_session_id_for(
+        "byteful", base, "abc123456789", session_duration_seconds=24 * 3600
+    )
+    assert "_s_abc123456789_ttl_1d" in one_day
+
+    # 7 days (the documented maximum).
+    seven_days = inject_session_id_for(
+        "byteful", base, "abc123456789", session_duration_seconds=7 * 24 * 3600
+    )
+    assert "_s_abc123456789_ttl_7d" in seven_days
+
+    # Below 1 minute and above 7 days must surface a documented-bounds error.
+    with pytest.raises(ProxyConfigurationError, match="at least 1 minute"):
+        inject_session_id_for(
+            "byteful", base, "abc123456789", session_duration_seconds=30
+        )
+    with pytest.raises(ProxyConfigurationError, match="at most 7 days"):
+        inject_session_id_for(
+            "byteful", base, "abc123456789", session_duration_seconds=8 * 24 * 3600
+        )
+
+
+def test_session_duration_round_trips_through_pagefetch_resolve(monkeypatch):
+    """``session_duration`` must propagate from ``PageFetchConfig`` all the
+    way through ``_resolve_proxy_url`` so a sticky HTTP request actually
+    carries the documented TTL token in the proxy URL.
+    """
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user-prodUser:secret@gate.decodo.com:7000",
+    )
+    client = PageFetch(
+        proxy="decodo",
+        session_duration="45m",
+        cache_enabled=False,
+    )
+    try:
+        url = client._resolve_proxy_url("decodo", "https://example.com/path")
+        assert url is not None
+        assert "-sessionduration-45" in url
+        assert "-session-" in url  # the documented sticky token is still present
+    finally:
+        client._closed = True
+
+    monkeypatch.setenv(
+        "BYTEFUL_PROXY_URL",
+        "https://user:secret@residential.byteful.com:8000",
+    )
+    client_b = PageFetch(
+        proxy="byteful",
+        session_duration=2 * 3600,
+        cache_enabled=False,
+    )
+    try:
+        url_b = client_b._resolve_proxy_url("byteful", "https://example.com/path")
+        assert url_b is not None
+        assert "_s_" in url_b and "_ttl_2h" in url_b
+    finally:
+        client_b._closed = True
+
+    # ``session_rotation=rotate`` must still skip the TTL token (no token is
+    # appended in rotate mode per DECODO_DOCS §2 / BYTEFUL_DOCS §3).
+    client_rotate = PageFetch(
+        proxy="byteful",
+        session_rotation="rotate",
+        session_duration="30m",
+        cache_enabled=False,
+    )
+    try:
+        url_r = client_rotate._resolve_proxy_url(
+            "byteful", "https://example.com/path"
+        )
+        assert url_r == "https://user:secret@residential.byteful.com:8000"
+    finally:
+        client_rotate._closed = True
+
+
+def test_session_duration_config_validation():
+    """The config layer must surface obvious input errors up-front so the
+    user sees a clean ``ValueError`` rather than a downstream provider
+    rejection at request time.
+    """
+    with pytest.raises(ValueError, match="positive integer"):
+        PageFetchConfig(session_duration=-1)
+    with pytest.raises(ValueError, match="positive integer"):
+        PageFetchConfig(session_duration=True)
+    # ``0`` is meaningless — ``None`` already means "no TTL token", and
+    # both residential providers reject sub-minute TTLs at request time.
+    with pytest.raises(ValueError, match="positive integer"):
+        PageFetchConfig(session_duration=0)
+    # Duration strings are parsed by ``parse_duration``; bad units must
+    # surface the same error the rest of the library raises for malformed
+    # duration strings.
+    with pytest.raises(ValueError):
+        PageFetchConfig(session_duration="bad-unit")
+
+
+def test_session_duration_is_part_of_cache_key():
+    """``session_duration`` must be part of the cache key so toggling the
+    TTL between fetches produces a fresh upstream request instead of a
+    stale hit from a different TTL bucket. Mirrors the existing
+    ``session_rotation`` treatment.
+    """
+    base = build_cache_key("https://example.com/", mode="auto", proxy="byteful")
+    # Same provider + URL, different TTL bucket → distinct key.
+    with_ttl = build_cache_key(
+        "https://example.com/",
+        mode="auto",
+        proxy="byteful",
+        settings={"session_duration": 30 * 60},
+    )
+    with_other_ttl = build_cache_key(
+        "https://example.com/",
+        mode="auto",
+        proxy="byteful",
+        settings={"session_duration": 2 * 3600},
+    )
+    none_ttl = build_cache_key(
+        "https://example.com/",
+        mode="auto",
+        proxy="byteful",
+        settings={"session_duration": None},
+    )
+    assert base != with_ttl
+    assert with_ttl != with_other_ttl
+    assert with_ttl != none_ttl
+
+
 # ---------------------------------------------------------------------------
 # SQLite cache: failed results must never be persisted (data integrity)
 # ---------------------------------------------------------------------------

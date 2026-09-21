@@ -65,6 +65,15 @@ proxy: none
 #   rotate — new exit IP per request
 session_rotation: sticky
 
+# Optional sticky-session TTL forwarded to the residential provider
+# (DECODO_DOCS §4, BYTEFUL_DOCS §4).  When set, the matching documented
+# token is appended during sticky-session injection:
+#   • Decodo  → ``-sessionduration-<minutes>`` (1–1440 minutes)
+#   • Byteful → ``_ttl_<n><unit>``         (1 minute – 7 days)
+# Accepted values: ``"30m"``, ``"2h"``, ``"1d"`` or an integer-seconds
+# count.  Comment out to use the provider's documented default behavior.
+# session_duration: 30m
+
 # ── Cache ───────────────────────────────────────────────────
 cache_enabled: true
 cache_ttl: 24h               # s, m, h, d  suffixes accepted

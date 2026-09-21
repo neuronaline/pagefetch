@@ -100,6 +100,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Proxy session rotation strategy (default: sticky)",
     )
     parser.add_argument(
+        "--session-duration",
+        metavar="DURATION",
+        default=argparse.SUPPRESS,
+        help=(
+            "Optional sticky-session TTL forwarded to the residential "
+            "provider (e.g. '30m', '2h', '1d'). Appended as "
+            "``-sessionduration-<minutes>`` for Decodo or "
+            "``_ttl_<n><unit>`` for Byteful (DECODO_DOCS §4, "
+            "BYTEFUL_DOCS §4). Omit to use the provider default."
+        ),
+    )
+    parser.add_argument(
         "--request-pacing",
         type=float,
         metavar="SECONDS",
@@ -193,6 +205,8 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         overrides["humanize"] = args.humanize
     if hasattr(args, "session_rotation"):
         overrides["session_rotation"] = args.session_rotation
+    if hasattr(args, "session_duration"):
+        overrides["session_duration"] = args.session_duration
     if hasattr(args, "request_pacing"):
         overrides["request_pacing"] = args.request_pacing
     if hasattr(args, "stealth_level"):
@@ -235,6 +249,7 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
             "session_rotation",
             None if preset_override else config.session_rotation,
         ),
+        session_duration=overrides.get("session_duration", config.session_duration),
         request_pacing=overrides.get(
             "request_pacing",
             None if preset_override else config.request_pacing,
@@ -291,6 +306,7 @@ async def _run(args: argparse.Namespace) -> int:
         accept_language=config.accept_language,
         humanize=config.humanize,
         session_rotation=config.session_rotation,
+        session_duration=config.session_duration,
         request_pacing=config.request_pacing,
         stealth_level=config.stealth_level,
         cleaning_level=config.cleaning_level,

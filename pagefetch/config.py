@@ -93,6 +93,14 @@ class PageFetchConfig:
     accept_language: str = "en-US,en;q=0.5"
     humanize: bool = False
     session_rotation: Literal["sticky", "rotate"] = "sticky"
+    # Sticky-session TTL forwarded to the residential provider. ``None``
+    # means "no TTL token", which is the provider's documented default
+    # (Decodo: implicit 10-minute sticky window; Byteful: implicit attempt
+    # to retain the IP for up to 7 days).  When set, the matching
+    # documented token is appended during sticky-session injection
+    # (``-sessionduration-<minutes>`` for Decodo, ``_ttl_<n><unit>`` for
+    # Byteful).  See DECODO_DOCS §4 and BYTEFUL_DOCS §4.
+    session_duration: int | None = None
     request_pacing: float = 0.0
     stealth_level: Literal["off", "balanced", "max"] = "off"
     raise_on_error: bool = False
@@ -173,6 +181,14 @@ class PageFetchConfig:
         ):
             raise ValueError(
                 f"session_rotation must be one of {sorted(VALID_SESSION_ROTATION)}"
+            )
+        if self.session_duration is not None and (
+            not isinstance(self.session_duration, int)
+            or isinstance(self.session_duration, bool)
+            or self.session_duration <= 0
+        ):
+            raise ValueError(
+                "session_duration must be a positive integer (seconds) or None"
             )
         if (
             not isinstance(self.request_pacing, int | float)
@@ -259,6 +275,7 @@ class PageFetchConfig:
             accept_language=flat.get("accept_language", "en-US,en;q=0.5"),
             humanize=flat.get("humanize"),
             session_rotation=flat.get("session_rotation"),
+            session_duration=flat.get("session_duration"),
             request_pacing=flat.get("request_pacing"),
             stealth_level=flat.get("stealth_level", "off"),
             raise_on_error=flat.get("raise_on_error", False),
@@ -290,6 +307,7 @@ class PageFetchConfig:
         accept_language: str = "en-US,en;q=0.5",
         humanize: bool | None = None,
         session_rotation: Literal["sticky", "rotate"] | None = None,
+        session_duration: str | int | None = None,
         request_pacing: float | None = None,
         stealth_level: Literal["off", "balanced", "max"] = "off",
         raise_on_error: bool = False,
@@ -356,6 +374,19 @@ class PageFetchConfig:
             raise ValueError("accept_language must be a non-empty string")
         if not isinstance(session_rotation, str) or session_rotation not in VALID_SESSION_ROTATION:
             raise ValueError(f"session_rotation must be one of {sorted(VALID_SESSION_ROTATION)}")
+        if session_duration is not None:
+            if (
+                isinstance(session_duration, bool)
+                or not isinstance(session_duration, (str, int))
+            ):
+                raise ValueError(
+                    "session_duration must be a duration string ('30m', '2h', '1d'), "
+                    "a positive integer (seconds), or None"
+                )
+            if isinstance(session_duration, int) and session_duration <= 0:
+                raise ValueError(
+                    "session_duration must be a positive integer (seconds) or None"
+                )
         if (
             not isinstance(request_pacing, int | float)
             or isinstance(request_pacing, bool)
@@ -378,6 +409,17 @@ class PageFetchConfig:
             raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
         ttl = parse_duration(cache_ttl)
         path = Path(cache_path).expanduser() if cache_path is not None else user_cache_path("pagefetch") / "cache.sqlite3"
+        # ``session_duration`` accepts either a duration string (``"30m"``,
+        # ``"2h"``, ``"1d"``) or an integer-seconds value. ``None`` is
+        # preserved so the dataclass field can carry the documented
+        # "no TTL token" default.
+        session_duration_seconds: int | None
+        if session_duration is None:
+            session_duration_seconds = None
+        elif isinstance(session_duration, str):
+            session_duration_seconds = parse_duration(session_duration)
+        else:
+            session_duration_seconds = int(session_duration)
         return cls(
             mode=mode,
             proxy=proxy,
@@ -399,6 +441,7 @@ class PageFetchConfig:
             accept_language=accept_language.strip(),
             humanize=humanize,
             session_rotation=session_rotation,
+            session_duration=session_duration_seconds,
             request_pacing=float(request_pacing),
             stealth_level=stealth_level,
             raise_on_error=raise_on_error,

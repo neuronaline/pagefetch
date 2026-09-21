@@ -97,6 +97,7 @@ class PageFetch:
         accept_language: str = "en-US,en;q=0.5",
         humanize: bool | None = None,
         session_rotation: Literal["sticky", "rotate"] | None = None,
+        session_duration: str | int | None = None,
         request_pacing: float | None = None,
         stealth_level: Literal["off", "balanced", "max"] = "off",
         raise_on_error: bool = False,
@@ -124,6 +125,7 @@ class PageFetch:
             accept_language=accept_language,
             humanize=humanize,
             session_rotation=session_rotation,
+            session_duration=session_duration,
             request_pacing=request_pacing,
             stealth_level=stealth_level,
             raise_on_error=raise_on_error,
@@ -193,6 +195,8 @@ class PageFetch:
         if cfg.request_pacing > 0:
             parts.append(f"pacing={cfg.request_pacing:.1f}s")
         parts.append(f"session={cfg.session_rotation}")
+        if cfg.session_duration is not None:
+            parts.append(f"session_ttl={cfg.session_duration}s")
         parts.append(f"lang={cfg.accept_language}")
         if cfg.mode == "auto":
             parts.append("mode=auto (HTTP→browser)")
@@ -511,6 +515,13 @@ class PageFetch:
             "humanize": self.config.humanize,
             "max_redirects": self.config.max_redirects,
             "session_rotation": self.config.session_rotation,
+            # ``session_duration`` only affects how the residential proxy
+            # URL is constructed; a cached response is technically the
+            # same content either way.  We still include it in the cache
+            # key so that callers who toggle TTL between fetches see
+            # fresh upstream requests rather than stale hits, mirroring
+            # the existing ``session_rotation`` treatment above.
+            "session_duration": self.config.session_duration,
         }
         settings.update(operation_settings)
         return settings
@@ -893,7 +904,10 @@ class PageFetch:
           every request when no session token is appended.
         - Residential providers in ``sticky`` mode get a domain-stable
           session ID embedded in the username so the same exit is reused
-          across requests for the same site.
+          across requests for the same site.  When the config carries a
+          ``session_duration``, the matching documented TTL token is also
+          appended (``-sessionduration-<minutes>`` for Decodo,
+          ``_ttl_<n><unit>`` for Byteful — DECODO_DOCS §4, BYTEFUL_DOCS §4).
 
         Used by both the HTTP and browser transports so the two paths cannot
         drift on rotation semantics.
@@ -907,7 +921,10 @@ class PageFetch:
             return settings.url
         domain = registrable_host(url) or url
         return inject_session_id_for(
-            provider, settings.url, make_domain_session(domain)
+            provider,
+            settings.url,
+            make_domain_session(domain),
+            session_duration_seconds=self.config.session_duration,
         )
 
     def _browser_pool_target(self, provider: str, url: str) -> tuple[str, ProxySettings]:
