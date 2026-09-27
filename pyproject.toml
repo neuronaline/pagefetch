@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pagefetch"
-version = "0.9.3"
+version = "0.9.4"
 description = "Asynchronous HTTP-first web fetching with conservative content extraction and browser fallback"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,6 +31,7 @@ classifiers = [
   "Topic :: Internet :: WWW/HTTP",
   "Topic :: Software Development :: Libraries :: Python Modules",
   "Topic :: Text Processing :: Markup :: HTML",
+  "Typing :: Typed",
 ]
 dependencies = [
   "aiosqlite>=0.20,<1",
@@ -44,6 +45,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/neuronaline/pagefetch"
+Documentation = "https://github.com/neuronaline/pagefetch#readme"
 Repository = "https://github.com/neuronaline/pagefetch.git"
 Issues = "https://github.com/neuronaline/pagefetch/issues"
 
@@ -65,9 +67,13 @@ pagefetch = "pagefetch.cli:main"
 [tool.setuptools.packages.find]
 include = ["pagefetch*"]
 
+[tool.setuptools.package-data]
+pagefetch = ["py.typed"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py311"

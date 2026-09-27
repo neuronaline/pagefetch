@@ -7,6 +7,7 @@ import asyncio
 import logging
 import random
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from .client import PageFetch
@@ -304,34 +305,11 @@ async def run_batch(
             f"(was {config.mode})",
             file=sys.stderr,
         )
-    async with PageFetch(
-        mode=effective_mode,
-        proxy=config.proxy,
-        cache_enabled=config.cache_enabled,
-        cache_ttl=config.cache_ttl,
-        cache_path=config.cache_path,
-        http_concurrency=config.http_concurrency,
-        browser_concurrency=config.browser_concurrency,
-        http_timeout=config.http_timeout,
-        browser_timeout=config.browser_timeout,
-        retries_http=config.retries_http,
-        retries_browser=config.retries_browser,
-        max_redirects=config.max_redirects,
-        max_content_size=config.max_content_size,
-        confidence_threshold=config.confidence_threshold,
-        block_images=config.block_images,
-        block_level=config.block_level,
-        accept_language=config.accept_language,
-        humanize=config.humanize,
-        session_rotation=config.session_rotation,
-        session_duration=config.session_duration,
-        request_pacing=config.request_pacing,
-        stealth_level=config.stealth_level,
-        cleaning_level=config.cleaning_level,
-        raise_on_error=config.raise_on_error,
-        screenshot_max_bytes=config.screenshot_max_bytes,
-        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
-    ) as client:
+    if effective_mode != config.mode:
+        client_config = replace(config, mode=effective_mode)
+    else:
+        client_config = config
+    async with PageFetch(config=client_config) as client:
         if use_extract:
             results = []
             pacing = config.request_pacing or 0.0

@@ -128,10 +128,15 @@ def test_custom_proxy_url_resolves_for_each_scheme(monkeypatch):
         assert settings.url == f"{scheme}://1.2.3.4:1080"
         # browser_config strips credentials — there are none, so only ``server``.
         assert settings.browser_config() == {"server": f"{scheme}://1.2.3.4:1080"}
+    # PROXY_URL fallback is honored when CUSTOM_PROXY_URL is unset
+    monkeypatch.delenv("CUSTOM_PROXY_URL", raising=False)
+    monkeypatch.setenv("PROXY_URL", "socks5://1.2.3.4:1080")
+    assert resolve_proxy("custom").url == "socks5://1.2.3.4:1080"
 
 
 def test_custom_proxy_missing_env_raises(monkeypatch):
     monkeypatch.delenv("CUSTOM_PROXY_URL", raising=False)
+    monkeypatch.delenv("PROXY_URL", raising=False)
     with pytest.raises(ProxyConfigurationError, match="CUSTOM_PROXY_URL"):
         resolve_proxy("custom")
 
@@ -863,6 +868,11 @@ def test_config_rejects_invalid_direct_values_and_unknown_yaml_keys(tmp_path):
     with pytest.raises(ValueError, match="cache_enabld"):
         PageFetchConfig.from_yaml(config_path)
 
+    # PageFetch supports direct PageFetchConfig instances and from_config
+    valid_cfg = PageFetchConfig(mode="http")
+    assert PageFetch(config=valid_cfg).config == valid_cfg
+    assert PageFetch.from_config(valid_cfg).config == valid_cfg
+
 
 def test_cli_override_preserves_yaml_safety_limits(tmp_path):
     config_path = tmp_path / "pagefetch.yaml"
@@ -969,6 +979,12 @@ async def test_fetch_with_raise_on_error_does_not_leak_counter(handler):
 
 @pytest.mark.asyncio
 async def test_concurrent_close_does_not_hang_when_first_teardown_fails(tmp_path):
+    """Regression guard: when one browser teardown hangs and the first
+    ``close()`` caller is cancelled, a subsequent ``close()`` must still
+    drain the rest of the pool and return. The per-resource close timeout
+    (``_RESOURCE_CLOSE_TIMEOUT = 0.5`` s) bounds teardown delays so hung
+    resources do not block completion.
+    """
     client = PageFetch(cache_enabled=False, cache_path=tmp_path / "cache.sqlite3")
 
     blocker = asyncio.Event()
@@ -1072,6 +1088,15 @@ def test_detector_does_not_leak_noscript_or_false_flag_recaptcha():
     report_real = analyze_html(html_real_challenge)
     assert report_real.challenge is True
     assert report_real.score <= 0.10
+
+    # Case 4: Duplicate tag structure across visible body and noscript must not drop visible text
+    html_dup = (
+        "<html><body><div><p>Please log in</p><p>Important update for all members with comprehensive details and verified facts.</p></div>"
+        "<noscript><p>Please log in</p></noscript></body></html>"
+    )
+    report_dup = analyze_html(html_dup)
+    assert report_dup.challenge is False
+    assert report_dup.score >= 0.30
 
 
 def test_xvfb_display_initial_state():

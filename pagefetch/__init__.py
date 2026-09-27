@@ -21,7 +21,15 @@ from importlib.metadata import version as _pkg_version
 
 from .bootstrap import RuntimeBootstrapError, auto_bootstrap_browser, ensure_runtime_requirements
 from .client import PageFetch
-from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
+from .config import (
+    VALID_BLOCK_LEVELS,
+    VALID_CLEANING_LEVELS,
+    VALID_MODES,
+    VALID_PROXIES,
+    VALID_SESSION_ROTATION,
+    VALID_STEALTH_LEVELS,
+    PageFetchConfig,
+)
 from .exceptions import PageFetchError
 from .models import (
     FetchErrorInfo,
@@ -36,6 +44,7 @@ from .models import (
     StylesheetInfo,
 )
 from .processing import StructureLimits, extract_structure
+from .proxy.providers import ProxyConfigurationError
 
 # Attach a NullHandler so library consumers that do not configure logging
 # never see "No handler found" warnings.
@@ -56,7 +65,7 @@ except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
     # Mirrors the version declared in ``pyproject.toml`` so that
     # ``pagefetch.__version__`` is usable before the distribution metadata
     # is installed (editable checkouts, sdists).
-    __version__ = "0.9.3"
+    __version__ = "0.9.4"
 
 __all__ = [
     "FetchErrorInfo",
@@ -69,13 +78,18 @@ __all__ = [
     "PageFetchConfig",
     "PageFetchError",
     "PageStructure",
+    "ProxyConfigurationError",
     "RuntimeBootstrapError",
     "ScriptInfo",
     "StructureLimits",
     "StructureNode",
     "StylesheetInfo",
+    "VALID_BLOCK_LEVELS",
+    "VALID_CLEANING_LEVELS",
     "VALID_MODES",
     "VALID_PROXIES",
+    "VALID_SESSION_ROTATION",
+    "VALID_STEALTH_LEVELS",
     "auto_bootstrap_browser",
     "ensure_runtime_requirements",
     "extract_structure",

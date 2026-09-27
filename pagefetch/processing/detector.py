@@ -99,6 +99,16 @@ FRAMEWORK_PATTERNS = (
 PLACEHOLDER_PATTERNS = ("loading...", "loading…", "skeleton", "spinner", "please wait")
 WALL_PATTERNS = ("sign in to continue", "log in to continue", "consent required", "accept cookies to continue")
 
+_CHALLENGE_DOM_RE = re.compile(
+    "|".join(re.escape(pattern) for pattern in CHALLENGE_DOM_PATTERNS),
+    re.IGNORECASE,
+)
+_FRAMEWORK_RE = re.compile(
+    "|".join(re.escape(pattern) for pattern in FRAMEWORK_PATTERNS),
+    re.IGNORECASE,
+)
+_NOISE_TAG_NAMES = frozenset({"script", "style", "template", "noscript"})
+
 
 @dataclass(slots=True, frozen=True)
 class ConfidenceReport:
@@ -124,16 +134,48 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     # reused by metadata extraction, where JSON-LD script nodes are meaningful.
     noise_tags = soup(["script", "style", "template", "noscript"])
     script_size = sum(len(str(tag)) for tag in noise_tags if tag.name == "script")
+    # Identify visible text while skipping noise subtrees. BeautifulSoup's
+    # ``Tag.__hash__`` calls ``str(self)`` and ``Tag.__eq__`` matches on HTML
+    # string equality, so storing tags directly in a set serializes subtrees
+    # and falsely drops identical visible tags elsewhere in the document.
+    # We use memoized ancestor lookup keyed by Python object ``id()``, which
+    # runs in nanoseconds, never serializes, and avoids false positives.
+    noise_ids: set[int] = {id(tag) for tag in noise_tags}
+    safe_ids: set[int] = set()
+
+    def _is_in_noise(node: object) -> bool:
+        curr = getattr(node, "parent", None)
+        path: list[int] = []
+        while curr is not None:
+            cid = id(curr)
+            if cid in noise_ids:
+                noise_ids.update(path)
+                return True
+            if cid in safe_ids:
+                safe_ids.update(path)
+                return False
+            if getattr(curr, "name", None) in _NOISE_TAG_NAMES:
+                noise_ids.add(cid)
+                noise_ids.update(path)
+                return True
+            path.append(cid)
+            curr = getattr(curr, "parent", None)
+        safe_ids.update(path)
+        return False
+
     text_root = soup.body or soup
     text = " ".join(
         value
         for node in text_root.find_all(string=True)
         if node.parent is not None
-        and not node.find_parent({"script", "style", "template", "noscript"})
+        and not _is_in_noise(node)
         and (value := str(node).strip())
     )
     lowered_text = text.lower()
-    lowered_html = html.lower()
+    # HTML-level pattern matches use a case-insensitive regex over the raw
+    # HTML string instead of ``html.lower()``; lower-casing a 25 MB string
+    # allocates a second 25 MB copy for no functional benefit when every
+    # downstream match is already case-insensitive (``re.IGNORECASE``).
     text_len = len(text)
     word_count = len(re.findall(r"\w+", text, re.UNICODE))
     reasons: list[str] = []
@@ -218,7 +260,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and (text_len < 400 or not (bool(paragraphs) or bool(semantic)))
     )
     dom_challenge = (
-        any(pattern in lowered_html for pattern in CHALLENGE_DOM_PATTERNS)
+        bool(_CHALLENGE_DOM_RE.search(html))
         and not has_substantive_content
     )
     weak_hits = sum(pattern in lowered_text for pattern in WEAK_CHALLENGE_PATTERNS)
@@ -236,7 +278,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     explicit_js = any(pattern in lowered_text for pattern in JS_PATTERNS) and (
         text_len < 400 or not (bool(paragraphs) or bool(semantic))
     )
-    framework = any(pattern in lowered_html for pattern in FRAMEWORK_PATTERNS)
+    framework = bool(_FRAMEWORK_RE.search(html))
     mounts = soup.select("#app:empty, #root:empty, #__next:empty, [data-reactroot]:empty")
     shell = explicit_js or bool(mounts) or (framework and text_len < 250) or (
         script_size > max(10_000, text_len * 8) and text_len < 400

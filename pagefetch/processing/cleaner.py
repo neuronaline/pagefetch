@@ -98,9 +98,11 @@ def clean_html(
     .. note::
 
         ``clean_html`` never mutates its input. When ``html`` is a
-        :class:`BeautifulSoup`, an independent copy is made (via BeautifulSoup's
-        ``__copy__``) before any ``decompose()`` runs. Callers may safely reuse
-        the original tree after cleaning.
+        :class:`BeautifulSoup`, an independent deep copy is made (via
+        :func:`copy.deepcopy`) before any ``decompose()`` runs so that
+        the lxml C-level parser's shared navigation references cannot
+        leak mutations back to the caller's tree. Callers may safely
+        reuse the original tree after cleaning.
     """
     if cleaning_level not in _VALID_CLEANING_LEVELS:
         raise ValueError(f"cleaning_level must be one of {sorted(_VALID_CLEANING_LEVELS)}")
@@ -108,11 +110,22 @@ def clean_html(
         raise TypeError(
             f"clean_html expects str or BeautifulSoup, got {type(html).__name__}"
         )
-    # Work on a copy so the caller's BeautifulSoup is never mutated by
-    # ``decompose()`` side effects. BeautifulSoup implements ``__copy__`` to
-    # walk the full subtree and produce a disconnected but fully independent
-    # tree, which is exactly the contract we need.
-    soup = _copy.copy(html) if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml")
+    # Work on an independent copy so the caller's BeautifulSoup is never
+    # mutated by ``decompose()`` side effects. ``_copy.copy`` (BeautifulSoup's
+    # ``__copy__``) walks the tree, but the underlying lxml C-level parser
+    # keeps shared references for navigation generators (``stripped_strings``,
+    # ``parents``) — a ``decompose`` call here could leak back into the
+    # caller's tree and silently drop navigation links / footer images that
+    # downstream consumers depend on (see :mod:`pagefetch.processing.html`
+    # which reuses ``raw_soup`` after this call). ``copy.deepcopy`` walks
+    # the tree fully and produces a genuinely disjoint tree; the cost is
+    # comparable to one ``lxml`` parse, which is already on the critical
+    # path.
+    soup = (
+        _copy.deepcopy(html)
+        if isinstance(html, BeautifulSoup)
+        else BeautifulSoup(html, "lxml")
+    )
 
     # Build a visible-text snapshot only when noscript tags exist. This lets the
     # noscript rule distinguish a fallback that is already rendered elsewhere

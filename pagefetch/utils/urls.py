@@ -69,7 +69,7 @@ def _default_resolve_host_ips(hostname: str) -> list[str]:
     except (socket.gaierror, UnicodeError, OSError):
         resolved: tuple[str, ...] = ()
     else:
-        resolved = tuple({info[4][0] for info in infos if info and info[4]})
+        resolved = tuple(dict.fromkeys(info[4][0] for info in infos if info and info[4]))
     with _DNS_CACHE_LOCK:
         if len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
             expired = [k for k, v in _DNS_CACHE.items() if now - v[0] >= _DNS_CACHE_TTL_SECONDS]

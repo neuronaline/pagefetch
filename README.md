@@ -250,6 +250,13 @@ client = PageFetch(
     raise_on_error=False,     # Raise PageFetchError instead of returning error result
     screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…)
 )
+
+# Alternatively, initialize from an existing PageFetchConfig instance:
+config = PageFetchConfig.from_yaml("config.yaml")
+client = PageFetch(config=config)  # or PageFetch.from_config(config)
+
+# Or load directly from a YAML file in one shot:
+client = PageFetch.from_yaml("config.yaml")
 ```
 
 ### Modes
@@ -288,9 +295,11 @@ Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not c
 | `FetchResult`, `LinkInfo`, `ImageInfo`, `FetchErrorInfo` | Result dataclasses |
 | `PageStructure`, `StructureNode`, `StylesheetInfo`, `InlineStylesheet`, `ScriptInfo`, `InlineScript` | Page-structure summary types |
 | `StructureLimits`, `extract_structure` | Lower-level structure extraction engine |
-| `PageFetchError`, `RuntimeBootstrapError` | Exception hierarchy |
+| `PageFetchError`, `ProxyConfigurationError`, `RuntimeBootstrapError` | Exception hierarchy |
 | `ensure_runtime_requirements`, `auto_bootstrap_browser` | Runtime dependency validation & installation |
-| `VALID_MODES`, `VALID_PROXIES` | Configuration constants |
+| `VALID_MODES`, `VALID_PROXIES`, `VALID_STEALTH_LEVELS`, `VALID_BLOCK_LEVELS`, `VALID_CLEANING_LEVELS`, `VALID_SESSION_ROTATION` | Configuration & validation constants |
+
+PageFetch is fully typed (PEP 561 compliant, shipping with `py.typed`). Type checkers like `mypy` and `pyright` will automatically discover in-line type annotations.
 
 ---
 

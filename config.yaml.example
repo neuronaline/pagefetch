@@ -38,13 +38,39 @@ retries_browser: 2
 # small. Comment in to override the 50 MiB default.
 # screenshot_max_bytes: 52428800
 
+# Multiplicative byte margin over max_content_size for browser-mode pre-render checks
+# browser_pre_check_byte_margin: 1.5
+
+# ── Stealth & Anti-Detection ────────────────────────────────
+# Anti-detection preset: off | balanced | max
+#   off      — humanize=false, block_level=aggressive, request_pacing=0.0, session_rotation=sticky
+#   balanced — humanize=true,  block_level=balanced,   request_pacing=0.5, session_rotation=rotate
+#   max      — humanize=true,  block_level=minimal,    request_pacing=2.0, session_rotation=rotate
+# Explicitly set options below override the preset values.
+stealth_level: off
+
+# Add small randomized delays to mimic human interaction
+humanize: false
+
+# Resource blocking aggressiveness: minimal | balanced | aggressive
+block_level: aggressive
+
+# Block images in browser mode (saves bandwidth; auto-disabled in balanced/max stealth)
+block_images: true
+
+# Value sent as the Accept-Language header
+accept_language: "en-US,en;q=0.5"
+
+# Seconds of delay between browser requests (0.0 = none)
+request_pacing: 0.0
+
 # ── Proxy ───────────────────────────────────────────────────
 # Provider:  none  |  custom  |  decodo  |  byteful
 #
 # • ``custom`` — any standard HTTP, HTTPS, or SOCKS5 proxy you
 #   control or rent (datacenter, corporate gateway, Tor, etc.).
-#   Read the URL from ``CUSTOM_PROXY_URL`` (env var).  The URL
-#   is passed through verbatim — no username rewriting.
+#   Read the URL from ``CUSTOM_PROXY_URL`` (fallback ``PROXY_URL``).
+#   The URL is passed through verbatim — no username rewriting.
 #
 # • ``decodo`` — residential provider.  Read the URL from
 #   ``DECODO_PROXY_URL`` (env var).  ``session_rotation``

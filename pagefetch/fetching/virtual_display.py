@@ -175,38 +175,54 @@ class XvfbDisplay:
             raise XvfbLaunchError(f"failed to spawn Xvfb: {exc}") from exc
 
         assert self._process.stdout is not None
+        # Hold the stdout read end explicitly so we can close it once the
+        # display number has been parsed. ``Popen.__exit__`` only closes
+        # the pipe at process teardown; leaving the read FD open across
+        # the whole client lifetime leaks one descriptor per ``XvfbDisplay``
+        # and eventually trips ``EMFILE`` on long-running consumers.
         display_fd = self._process.stdout.fileno()
         os.set_blocking(display_fd, False)
         display_data = b""
         deadline = time.monotonic() + self._STARTUP_TIMEOUT
-        while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                self.stop()
-                raise XvfbLaunchError("Xvfb exited before allocating a display")
-            try:
-                display_data += os.read(display_fd, 32)
-            except BlockingIOError:
-                pass
-            if b"\n" in display_data:
-                raw_display = display_data.split(b"\n", 1)[0]
+        try:
+            while time.monotonic() < deadline:
+                if self._process.poll() is not None:
+                    self.stop()
+                    raise XvfbLaunchError("Xvfb exited before allocating a display")
                 try:
-                    display_num = int(raw_display)
-                except ValueError:
-                    self.stop()
-                    raise XvfbLaunchError("Xvfb returned an invalid display number") from None
-                if display_num < 0:
-                    self.stop()
-                    raise XvfbLaunchError("Xvfb returned an invalid display number")
-                self._display_num = display_num
-                self._display = f":{display_num}"
-            if self._display_num is not None and self._socket_path(self._display_num).exists():
-                logger.debug(
-                    "Xvfb ready on display %s (pid=%d)",
-                    self._display,
-                    self._process.pid,
-                )
-                return self._display
-            time.sleep(self._STARTUP_POLL)
+                    display_data += os.read(display_fd, 32)
+                except BlockingIOError:
+                    pass
+                if b"\n" in display_data:
+                    raw_display = display_data.split(b"\n", 1)[0]
+                    try:
+                        display_num = int(raw_display)
+                    except ValueError:
+                        self.stop()
+                        raise XvfbLaunchError("Xvfb returned an invalid display number") from None
+                    if display_num < 0:
+                        self.stop()
+                        raise XvfbLaunchError("Xvfb returned an invalid display number")
+                    self._display_num = display_num
+                    self._display = f":{display_num}"
+                if self._display_num is not None and self._socket_path(self._display_num).exists():
+                    logger.debug(
+                        "Xvfb ready on display %s (pid=%d)",
+                        self._display,
+                        self._process.pid,
+                    )
+                    return self._display
+                time.sleep(self._STARTUP_POLL)
+        finally:
+            # Always release the read end of the stdout pipe — both on
+            # success and on every error path. Closing the high-level
+            # stream is sufficient: ``BufferedReader.close`` cascades to
+            # ``FileIO.close`` which calls ``os.close`` on the
+            # descriptor. We use ``suppress`` because test doubles do
+            # not always implement ``close``.
+            if self._process and self._process.stdout is not None:
+                with suppress(Exception):  # noqa: BLE001 — best-effort cleanup
+                    self._process.stdout.close()
 
         display = self._display or (
             f"display number {self._display_num}" if self._display_num is not None else "an allocated display"
@@ -228,13 +244,37 @@ class XvfbDisplay:
             return
         if proc.poll() is not None:
             return
-        with suppress(ProcessLookupError):
-            proc.send_signal(signal.SIGTERM)
+        # Signal the entire process group rather than only the Xvfb
+        # parent. ``start_new_session=True`` puts Xvfb in its own
+        # session/process-group, so ``os.killpg`` reaches any helper
+        # subprocesses Xvfb may have spawned (font/fontconfig/glvnd
+        # helpers, the X server's own internal threads from the kernel's
+        # perspective) without needing to track them individually.
+        pgid: int | None
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            pgid = None
+        current_pgrp = os.getpgrp()
+        if pgid is not None and pgid > 0 and pgid != current_pgrp:
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGTERM)
+        else:
+            with suppress(ProcessLookupError):
+                proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=self._SHUTDOWN_TIMEOUT)
         except subprocess.TimeoutExpired:
-            with suppress(ProcessLookupError):
-                proc.kill()
+            # Escalate to SIGKILL on the whole group. Falling back to
+            # ``proc.kill()`` is not enough — a wedged Xvfb child
+            # spawned before ``SIGTERM`` would still hold the
+            # parent-death link and outlive us.
+            if pgid is not None and pgid > 0 and pgid != current_pgrp:
+                with suppress(ProcessLookupError):
+                    os.killpg(pgid, signal.SIGKILL)
+            else:
+                with suppress(ProcessLookupError):
+                    proc.kill()
             with suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=self._KILL_TIMEOUT)
 

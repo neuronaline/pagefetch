@@ -7,6 +7,7 @@ import logging
 import random
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from hashlib import md5
@@ -65,6 +66,158 @@ else:
     _HOST_OS = "linux"
 
 
+# Maximum number of pooled ``httpx.AsyncClient`` instances kept alive per
+# PageFetch client. Each pooled client owns its own connection pool and a
+# set of keep-alive sockets; residential proxies in ``sticky`` mode inject a
+# per-domain session ID into the proxy URL, so without a bound every new
+# domain would mint a new client and leak file descriptors until ``EMFILE``
+# fires. 50 covers any realistic single-tenant fan-out while keeping the
+# eviction churn low. ``OrderedDict`` is used as the backing store so the
+# public attribute still satisfies ``len()`` and ``== {}`` for tests.
+_MAX_PROXY_HTTP_CLIENTS = 50
+
+
+class _ProxyClientPool:
+    """Bounded LRU pool of ``httpx.AsyncClient`` instances keyed by proxy URL.
+
+    Evicted clients are scheduled for asynchronous ``aclose()`` on the
+    running event loop — the eviction path itself never blocks — and any
+    pending eviction tasks are awaited by :meth:`aclose_all` during the
+    outer :meth:`PageFetch.close` so no socket or FD leaks past teardown.
+    """
+
+    __slots__ = ("_max_size", "_clients", "_eviction_tasks")
+
+    def __init__(self, max_size: int = _MAX_PROXY_HTTP_CLIENTS) -> None:
+        self._max_size = max_size
+        self._clients: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
+        self._eviction_tasks: set[asyncio.Task[None]] = set()
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._clients
+
+    def __len__(self) -> int:
+        return len(self._clients)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            return dict(self._clients) == other
+        if isinstance(other, _ProxyClientPool):
+            return self._clients == other._clients
+        return NotImplemented
+
+    def __iter__(self):
+        return iter(self._clients)
+
+    def get(self, key: str) -> httpx.AsyncClient | None:
+        client = self._clients.get(key)
+        if client is not None:
+            self._clients.move_to_end(key)
+        return client
+
+    def values(self):
+        return self._clients.values()
+
+    def clear(self) -> None:
+        self._clients.clear()
+
+    def put(self, key: str, client: httpx.AsyncClient) -> None:
+        """Insert *client* under *key*, evicting the oldest entry if needed.
+
+        Eviction schedules ``aclose()`` in the background and never blocks
+        the caller, so the hot path stays cheap even under heavy churn.
+        """
+        if key in self._clients:
+            old_client = self._clients[key]
+            if old_client is not client:
+                self._schedule_close(key, old_client)
+            self._clients[key] = client
+            self._clients.move_to_end(key)
+            return
+        self._clients[key] = client
+        if len(self._clients) > self._max_size:
+            evicted_key, evicted_client = self._clients.popitem(last=False)
+            self._schedule_close(evicted_key, evicted_client)
+
+    def _schedule_close(self, key: str, client: httpx.AsyncClient) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop — nothing to schedule. The evicted client
+            # will be GC'd; httpx.AsyncClient does not hold native
+            # resources once it has never been opened.
+            return
+        task = loop.create_task(self._safe_close(key, client))
+        self._eviction_tasks.add(task)
+        task.add_done_callback(self._eviction_tasks.discard)
+
+    @staticmethod
+    async def _safe_close(key: str, client: httpx.AsyncClient) -> Exception | None:
+        try:
+            await asyncio.wait_for(client.aclose(), timeout=_RESOURCE_CLOSE_TIMEOUT)
+            return None
+        except TimeoutError as exc:
+            logger.warning("proxy client %s close timed out after %.1f seconds", key, _RESOURCE_CLOSE_TIMEOUT)
+            return exc
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            logger.debug("evicted proxy client close failed (%s): %s", key, type(exc).__name__)
+            return exc
+
+    async def aclose_all(self) -> list[Exception | None]:
+        """Await pending evictions, then close every still-pooled client.
+
+        Returns the list of exceptions raised by individual ``aclose()`` calls
+        (or ``None`` for each successful close) so callers can log per-client
+        failures the same way they did for the previous gather-on-values
+        teardown loop.
+        """
+        clients = list(self._clients.values())
+        self._clients.clear()
+        pending = list(self._eviction_tasks)
+        self._eviction_tasks.clear()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        results = await asyncio.gather(
+            *(self._safe_close(f"pool-{i}", client) for i, client in enumerate(clients)),
+            return_exceptions=True,
+        )
+        return [r if isinstance(r, Exception) else None for r in results]
+
+
+class _AsyncPacer:
+    """Async token-bucket pacer for the ``request_pacing`` bot-evasion signal.
+
+    The previous implementation interleaved ``asyncio.sleep`` with
+    ``create_task`` in :meth:`PageFetch.fetch_many`, serialising task
+    creation and starving the semaphore when many URLs were queued. This
+    pacer lets every task be created immediately while still guaranteeing
+    a uniformly distributed inter-request gap: each call to
+    :meth:`acquire` reserves a slot at ``now + random.uniform(0, max_delay)``
+    and sleeps until that slot. Slot reservation is lock-guarded but the
+    actual sleep happens outside the lock so concurrent acquires do not
+    block each other once they have their slot.
+    """
+
+    __slots__ = ("_max_delay", "_lock", "_next_release")
+
+    def __init__(self, max_delay: float) -> None:
+        if max_delay < 0:
+            raise ValueError("max_delay must be non-negative")
+        self._max_delay = float(max_delay)
+        self._lock = asyncio.Lock()
+        self._next_release = time.monotonic()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            base = max(now, self._next_release)
+            target = base + random.uniform(0, self._max_delay)
+            self._next_release = target
+        delay = base - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
 class PageFetch:
     """Asynchronous HTTP-first page fetcher with automatic Camoufox fallback.
 
@@ -76,6 +229,7 @@ class PageFetch:
     def __init__(
         self,
         *,
+        config: PageFetchConfig | None = None,
         mode: Literal["auto", "http", "browser"] = "auto",
         proxy: Literal["none", "custom", "decodo", "byteful"] = "none",
         cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
@@ -103,43 +257,52 @@ class PageFetch:
         screenshot_max_bytes: int = 50 * 1024 * 1024,
         browser_pre_check_byte_margin: float = 1.5,
     ) -> None:
-        self.config = PageFetchConfig.build(
-            mode=mode,
-            proxy=proxy,
-            cleaning_level=cleaning_level,
-            http_concurrency=http_concurrency,
-            browser_concurrency=browser_concurrency,
-            cache_enabled=cache_enabled,
-            cache_ttl=cache_ttl,
-            cache_path=cache_path,
-            http_timeout=http_timeout,
-            browser_timeout=browser_timeout,
-            retries_http=retries_http,
-            retries_browser=retries_browser,
-            max_redirects=max_redirects,
-            max_content_size=max_content_size,
-            confidence_threshold=confidence_threshold,
-            block_images=block_images,
-            block_level=block_level,
-            accept_language=accept_language,
-            humanize=humanize,
-            session_rotation=session_rotation,
-            session_duration=session_duration,
-            request_pacing=request_pacing,
-            stealth_level=stealth_level,
-            raise_on_error=raise_on_error,
-            screenshot_max_bytes=screenshot_max_bytes,
-            browser_pre_check_byte_margin=browser_pre_check_byte_margin,
-        )
+        if config is not None:
+            if not isinstance(config, PageFetchConfig):
+                raise TypeError(f"config must be an instance of PageFetchConfig, got {type(config).__name__}")
+            self.config = config
+        else:
+            self.config = PageFetchConfig.build(
+                mode=mode,
+                proxy=proxy,
+                cleaning_level=cleaning_level,
+                http_concurrency=http_concurrency,
+                browser_concurrency=browser_concurrency,
+                cache_enabled=cache_enabled,
+                cache_ttl=cache_ttl,
+                cache_path=cache_path,
+                http_timeout=http_timeout,
+                browser_timeout=browser_timeout,
+                retries_http=retries_http,
+                retries_browser=retries_browser,
+                max_redirects=max_redirects,
+                max_content_size=max_content_size,
+                confidence_threshold=confidence_threshold,
+                block_images=block_images,
+                block_level=block_level,
+                accept_language=accept_language,
+                humanize=humanize,
+                session_rotation=session_rotation,
+                session_duration=session_duration,
+                request_pacing=request_pacing,
+                stealth_level=stealth_level,
+                raise_on_error=raise_on_error,
+                screenshot_max_bytes=screenshot_max_bytes,
+                browser_pre_check_byte_margin=browser_pre_check_byte_margin,
+            )
         self._http_semaphore = asyncio.Semaphore(self.config.http_concurrency)
         self._browser_semaphore = asyncio.Semaphore(self.config.browser_concurrency)
         self._http_clients: dict[str, httpx.AsyncClient] = {}
         self._http_fetchers: dict[str, HTTPFetcher] = {}
-        # Per-proxy-URL httpx clients (Phase 1 Item 3).  Reusing a single
-        # client per proxy keeps TCP/TLS keep-alive and HTTP/2 multiplexing
-        # alive across requests, instead of constructing a fresh client on
-        # every call and paying a handshake + TIME_WAIT cost.
-        self._proxy_http_clients: dict[str, httpx.AsyncClient] = {}
+        # Per-proxy-URL httpx clients (Phase 1 Item 3, hardened for sticky
+        # residential proxies). Residential gateways in ``sticky`` mode
+        # inject a per-domain session token into the proxy URL, so without
+        # a bound every distinct domain would mint a new client — and
+        # every client keeps its own connection pool and keep-alive
+        # sockets alive. ``_ProxyClientPool`` enforces a hard LRU ceiling
+        # and schedules ``aclose()`` on eviction so we never blow past
+        # ``EMFILE``.
+        self._proxy_http_clients: _ProxyClientPool = _ProxyClientPool()
         # Phase 3 Item 7: pool key is just the provider name ("none",
         # "custom", "decodo", "byteful") so a plain dict suffices — at most
         # four entries can ever exist.  Concurrency is bounded by
@@ -166,6 +329,16 @@ class PageFetch:
         # wait when no fetches are in flight.
         self._drain_event = asyncio.Event()
         self._drain_event.set()
+
+    @classmethod
+    def from_config(cls, config: PageFetchConfig) -> PageFetch:
+        """Create a PageFetch client with an existing PageFetchConfig instance."""
+        return cls(config=config)
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> PageFetch:
+        """Create a PageFetch client from a YAML configuration file."""
+        return cls(config=PageFetchConfig.from_yaml(path))
 
     async def __aenter__(self) -> PageFetch:
         await self.start()
@@ -257,13 +430,7 @@ class PageFetch:
                     *(self._close_resource(client.aclose) for client in self._http_clients.values()),
                     return_exceptions=True,
                 )
-                proxy_results = await asyncio.gather(
-                    *(
-                        self._close_resource(client.aclose)
-                        for client in self._proxy_http_clients.values()
-                    ),
-                    return_exceptions=True,
-                )
+                proxy_results = await self._proxy_http_clients.aclose_all()
                 for failure in (*browser_results, *client_results, *proxy_results):
                     if isinstance(failure, Exception):
                         logger.warning("resource cleanup failed: %s", type(failure).__name__)
@@ -449,17 +616,21 @@ class PageFetch:
                         fetched_at=datetime.now(UTC),
                     )
 
+        pacer: _AsyncPacer | None = None
         if self.config.request_pacing > 0 and len(unique) > 1:
-            # Stagger task creation to avoid a synchronized burst of
-            # requests arriving at the same instant — a strong bot signal.
-            tasks: list[asyncio.Task[FetchResult]] = []
-            for i, item in enumerate(unique):
-                if i > 0:
-                    await asyncio.sleep(random.uniform(0, self.config.request_pacing))
-                tasks.append(asyncio.create_task(one(item)))
-            fetched = await asyncio.gather(*tasks)
-        else:
-            fetched = await asyncio.gather(*(one(item) for item in unique))
+            # Build a single pacer that distributes the inter-request delay
+            # across the whole batch instead of serialising task creation.
+            # The previous ``for ... await asyncio.sleep(...)`` loop took
+            # ``len(unique) * request_pacing`` wall-clock seconds just to
+            # *launch* the tasks, leaving the HTTP/browser semaphore idle.
+            pacer = _AsyncPacer(self.config.request_pacing)
+
+        async def paced_one(item: str) -> FetchResult:
+            if pacer is not None:
+                await pacer.acquire()
+            return await one(item)
+
+        fetched = await asyncio.gather(*(paced_one(item) for item in unique))
         by_url = dict(zip(unique, fetched, strict=True))
         # Duplicate URLs need independent copies: ``FetchResult`` holds
         # mutable containers (``links``, ``images``, ``metadata``,
@@ -627,6 +798,14 @@ class PageFetch:
                     error=FetchErrorInfo("unknown_error", f"An unexpected error occurred while {error_context}.", False, type(exc).__name__),
                     started_at=started_at, should_raise=should_raise,
                 )
+            else:
+                # Stamp duration on the successful path. ``_finish_error``
+                # already populates ``duration_ms`` on the error branches and
+                # the cache-hit branch above sets it from ``started_at``;
+                # leaving it unset here caused every fresh fetch to persist
+                # ``duration_ms = None`` into the SQLite cache.
+                if result.duration_ms is None:
+                    result.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
             result.warnings[:0] = warnings
             if not result.success and should_raise and result.error:
                 raise PageFetchError(result.error, url=result.url)
@@ -923,9 +1102,12 @@ class PageFetch:
         fresh client per proxied request, paying a TCP/TLS handshake on every
         URL and exhausting ``TIME_WAIT`` sockets.  Pooling by proxy URL keeps
         the keep-alive socket warm and lets HTTP/2 multiplexing work across
-        requests to the same exit.  Lifecycle is owned by ``PageFetch.close``;
-        ``_teardown`` awaits ``aclose`` on every client this provider hands
-        out.
+        requests to the same exit.  Residential proxies in ``sticky`` mode
+        inject a per-domain session token, so the pool is bounded by an
+        LRU ceiling (``_ProxyClientPool``) to avoid file-descriptor leaks.
+        Lifecycle is owned by ``PageFetch.close``; ``_teardown`` awaits
+        ``aclose_all`` on every client this provider hands out plus any
+        eviction tasks scheduled by the LRU.
         """
         cached = self._proxy_http_clients.get(proxy_url)
         if cached is not None:
@@ -946,7 +1128,7 @@ class PageFetch:
                     max_keepalive_connections=self.config.http_concurrency,
                 ),
             )
-            self._proxy_http_clients[proxy_url] = client
+            self._proxy_http_clients.put(proxy_url, client)
             return client
 
     def _headers_for_url(self, url: str) -> dict[str, str]:

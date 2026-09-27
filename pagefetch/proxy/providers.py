@@ -287,10 +287,10 @@ def resolve_proxy(provider: str) -> ProxySettings:
         return ProxySettings(provider="none", url=None)
 
     if provider == "custom":
-        full_url = os.getenv("CUSTOM_PROXY_URL")
+        full_url = os.getenv("CUSTOM_PROXY_URL") or os.getenv("PROXY_URL")
         if not full_url:
             raise ProxyConfigurationError(
-                "missing proxy settings: CUSTOM_PROXY_URL with a full "
+                "missing proxy settings: CUSTOM_PROXY_URL (or PROXY_URL) with a full "
                 "proxy URL, e.g. socks5://user:pass@host:1080"
             )
         return parse_proxy_url(full_url, provider="custom")

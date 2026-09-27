@@ -9,13 +9,49 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
 from ..constants import REDIRECT_STATUS_CODES, RETRYABLE_STATUS_CODES
 from ..models import FetchErrorInfo
 from ..utils.urls import validate_url
+
+
+# Header names that may carry credentials or other material that must never
+# leak across origins. Lookups are case-insensitive (``Authorization`` /
+# ``authorization`` are equivalent) so we normalize once at comparison time.
+_CREDENTIAL_HEADERS: frozenset[str] = frozenset(
+    {"authorization", "cookie", "proxy-authorization"}
+)
+
+
+def _strip_credentials(headers: dict[str, str]) -> dict[str, str]:
+    """Return a copy of *headers* with credential-bearing entries removed."""
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in _CREDENTIAL_HEADERS
+    }
+
+
+def _is_cross_origin(current_url: str, next_url: str) -> bool:
+    """Return True if *current_url* and *next_url* differ in scheme, host, or port."""
+    cur = urlsplit(current_url)
+    nxt = urlsplit(next_url)
+    if cur.scheme.lower() != nxt.scheme.lower():
+        return True
+    cur_host = (cur.hostname or "").lower().rstrip(".")
+    nxt_host = (nxt.hostname or "").lower().rstrip(".")
+    if not cur_host or not nxt_host:
+        # Missing host means a malformed redirect; treat as cross-origin so
+        # we drop credentials rather than risk leaking them.
+        return True
+    if cur_host != nxt_host:
+        return True
+    cur_port = cur.port or (443 if cur.scheme.lower() == "https" else 80)
+    nxt_port = nxt.port or (443 if nxt.scheme.lower() == "https" else 80)
+    return cur_port != nxt_port
 
 
 @dataclass(slots=True)
@@ -138,10 +174,14 @@ class HTTPFetcher:
     ) -> HTTPResponse:
         client = client or self.client
         current_url = url
+        # Operate on a working copy so the caller's dict is never mutated.
+        # The same-origin/cross-origin decision below needs to mutate this
+        # without affecting ``headers`` references the caller still holds.
+        current_headers: dict[str, str] | None = dict(headers) if headers else None
         redirect_count = 0
         while True:
             try:
-                async with client.stream("GET", current_url, headers=headers) as response:
+                async with client.stream("GET", current_url, headers=current_headers) as response:
                     # Pre-flight redirect handling. ``follow_redirects`` is
                     # forced off on every httpx client (see ``HTTPFetcher.fetch``
                     # and ``PageFetch._http_fetcher``) so the SSRF guard has
@@ -185,6 +225,14 @@ class HTTPFetcher:
                                 ),
                                 status_code=response.status_code,
                             ) from exc
+                        # Strip credential-bearing headers when the redirect
+                        # crosses an origin boundary — otherwise an attacker
+                        # who controls the redirect target can harvest the
+                        # caller's ``Authorization``/``Cookie``/proxy auth
+                        # in plaintext. Same-origin redirects keep the full
+                        # header set so internal app routing still works.
+                        if current_headers is not None and _is_cross_origin(current_url, next_url):
+                            current_headers = _strip_credentials(current_headers)
                         current_url = next_url
                         redirect_count += 1
                         continue
