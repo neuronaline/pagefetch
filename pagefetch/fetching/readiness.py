@@ -68,14 +68,27 @@ async def wait_for_stability(
     fast_polls = 2
     polls_done = 0
     while time.monotonic() < deadline:
-        metrics = await page.evaluate(
-            """() => ({
-                text: (document.body?.innerText || '').length,
-                dom: document.documentElement?.outerHTML.length || 0
-            })"""
-        )
+        # Phase 3 Item 8: avoid serialising the entire DOM tree into a
+        # string on every poll — ``getElementsByTagName('*').length``
+        # walks the document once to count nodes without allocating a
+        # single string, which is dramatically cheaper than
+        # ``document.documentElement.outerHTML.length`` on a 10k-node page.
+        # Node counts also more directly reflect structural changes
+        # (script insertions, lazy-loaded comment sections) than string
+        # length, so the tolerance can be tightened accordingly.
+        try:
+            metrics = await page.evaluate(
+                """() => ({
+                    text: (document.body?.innerText || '').length,
+                    dom: document.getElementsByTagName('*').length
+                })"""
+            )
+        except Exception:
+            metrics = {}
+        if not isinstance(metrics, dict):
+            metrics = {}
         current = (int(metrics.get("text", 0)), int(metrics.get("dom", 0)))
-        if previous and abs(current[0] - previous[0]) < 20 and abs(current[1] - previous[1]) < 100:
+        if previous and abs(current[0] - previous[0]) < 20 and abs(current[1] - previous[1]) < 5:
             unchanged += 1
             if unchanged >= stable_rounds:
                 if network_activity is None:

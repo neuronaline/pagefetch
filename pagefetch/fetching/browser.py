@@ -7,9 +7,7 @@ import logging
 import os
 import random
 import sys
-import threading
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
@@ -26,26 +24,6 @@ from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
 
 logger = logging.getLogger("pagefetch.fetching.browser")
-
-# ``DISPLAY`` is process-global, while fetchers may run from different event
-# loops in different threads.  A thread lock is therefore required here;
-# asyncio.Lock is loop-affine.  Acquisition is polled asynchronously below so
-# a launch in another thread never blocks an event loop.
-_DISPLAY_LAUNCH_LOCK = threading.Lock()
-
-
-@asynccontextmanager
-async def _display_launch_lock():
-    """Hold the process-wide launch lock without blocking an event loop."""
-    acquired = False
-    try:
-        while not _DISPLAY_LAUNCH_LOCK.acquire(blocking=False):  # noqa: ASYNC110
-            await asyncio.sleep(0.01)
-        acquired = True
-        yield
-    finally:
-        if acquired:
-            _DISPLAY_LAUNCH_LOCK.release()
 
 # Resource-type blocking sets per stealth level.
 #   minimal:   only pure overhead (media, beacon) + websocket
@@ -258,39 +236,14 @@ class BrowserFetcher:
                     browser_env["GDK_BACKEND"] = "x11"
                     browser_env["MOZ_ENABLE_WAYLAND"] = "0"
                     options["virtual_display"] = self._xvfb.display
+                # ``options["env"]`` is a per-subprocess dict handed to the
+                # Camoufox/Playwright launch path, so the caller's
+                # ``os.environ`` is never mutated and no global launch lock
+                # is required to keep concurrent launches from racing on
+                # ``DISPLAY``.
                 options["env"] = browser_env
-
-                # AsyncCamoufox starts Firefox during ``__aenter__()`` and
-                # the child inherits os.environ.  Keep the temporary DISPLAY
-                # and Wayland mutation confined to that spawn and always restore the
-                # caller's process environment, including on cancellation.
-                async with _display_launch_lock():
-                    previous_display = os.environ.get("DISPLAY")
-                    previous_wayland = os.environ.get("WAYLAND_DISPLAY")
-                    previous_privileged_wayland = os.environ.get("X_PRIVILEGED_WAYLAND_SOCKET")
-                    previous_gdk_backend = os.environ.get("GDK_BACKEND")
-                    previous_moz_wayland = os.environ.get("MOZ_ENABLE_WAYLAND")
-                    try:
-                        if use_xvfb:
-                            os.environ["DISPLAY"] = self._xvfb.display
-                            os.environ.pop("WAYLAND_DISPLAY", None)
-                            os.environ.pop("X_PRIVILEGED_WAYLAND_SOCKET", None)
-                            os.environ["GDK_BACKEND"] = "x11"
-                            os.environ["MOZ_ENABLE_WAYLAND"] = "0"
-                        self._manager = AsyncCamoufox(**options)
-                        self._browser = await self._manager.__aenter__()
-                    finally:
-                        def _restore(key: str, val: str | None) -> None:
-                            if val is None:
-                                os.environ.pop(key, None)
-                            else:
-                                os.environ[key] = val
-
-                        _restore("DISPLAY", previous_display)
-                        _restore("WAYLAND_DISPLAY", previous_wayland)
-                        _restore("X_PRIVILEGED_WAYLAND_SOCKET", previous_privileged_wayland)
-                        _restore("GDK_BACKEND", previous_gdk_backend)
-                        _restore("MOZ_ENABLE_WAYLAND", previous_moz_wayland)
+                self._manager = AsyncCamoufox(**options)
+                self._browser = await self._manager.__aenter__()
             except TransportFailure:
                 raise
             except Exception as exc:

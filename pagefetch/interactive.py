@@ -1,28 +1,29 @@
-"""Interactive CLI menu for PageFetch."""
+"""Declarative interactive wizard for PageFetch.
+
+The wizard collects the user's choices through a small sequence of prompts
+and then delegates to ``cli.run_batch`` for the actual fetch/extract work.
+All formatting, validation, and config-building logic lives in ``cli.py``
+so the CLI and interactive modes stay in lockstep.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
-import random
 import sys
 from pathlib import Path
 
-from .client import PageFetch
+from .cli import parse_input_urls, run_batch
 from .config import (
-    VALID_CLEANING_LEVELS,
     VALID_MODES,
+    VALID_OUTPUT_FORMATS,
     VALID_PROXIES,
+    VALID_SCREENSHOT_MODES,
     PageFetchConfig,
 )
-from .models import FetchResult
-from .utils.rendering import render_results
-from .utils.urls import read_urls_from_file
 
 
 def _clear_screen() -> None:
-    """Clear the terminal screen."""
     if not sys.stdout.isatty():
         return
     if os.name == "nt":
@@ -32,625 +33,128 @@ def _clear_screen() -> None:
 
 
 def _banner() -> None:
-    """Print the PageFetch banner."""
     print("=" * 58)
     print("  PageFetch  -  Web Page Content Fetcher")
     print("=" * 58)
     print()
 
 
-def _header(title: str) -> None:
-    """Print a section header."""
-    print()
-    print(f"  --- {title} ---")
-    print()
-
-
-def _prompt(prompt_text: str, default: str = "") -> str:
-    """Show a prompt and return the user's input (stripped)."""
-    if default:
-        display = f"{prompt_text} [{default}]: "
-    else:
-        display = f"{prompt_text}: "
+def _prompt(text: str, default: str = "") -> str:
+    display = f"{text} [{default}]: " if default else f"{text}: "
     try:
         value = input(display).strip()
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         print()
         return ""
     return value or default
 
 
-def _confirm(prompt_text: str, default: bool = True) -> bool:
-    """Ask a yes/no question."""
-    suffix = " [Y/n]: " if default else " [y/N]: "
-    try:
-        answer = input(prompt_text + suffix).strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return default
-    if not answer:
-        return default
-    return answer in ("y", "yes")
-
-
-def _render_results(
-    results: list[FetchResult],
-    output_format: str,
-    include_html: bool,
-    include_structure: bool = False,
-    compact_structure: bool = False,
-    include_screenshot: bool = False,
-) -> str:
-    """Render fetch results in the chosen format."""
-    return render_results(
-        results,
-        output_format,
-        include_html=include_html,
-        include_structure=include_structure,
-        compact_structure=compact_structure,
-        include_screenshot=include_screenshot,
-    )
-
-
-def _apply_debug(settings: dict) -> None:
-    """Configure the pagefetch logger to match the current debug setting."""
-    logger = logging.getLogger("pagefetch")
-    if settings.get("debug"):
-        if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
-            handler = logging.StreamHandler()
-            logger.addHandler(handler)
-        logger.setLevel(logging.DEBUG)
-    else:
-        logger.setLevel(logging.WARNING)
-
-
-async def _fetch_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
-    """Fetch a single URL."""
-    if _requires_extract(settings):
-        return await _extract_url(client, url, settings)
-    result = await client.fetch(
-        url,
-        mode=settings.get("mode"),
-        proxy=settings.get("proxy"),
-        use_cache=settings.get("use_cache", True),
-        cache_ttl=settings.get("cache_ttl"),
-    )
-    return [result]
-
-
-async def _extract_url(client: PageFetch, url: str, settings: dict) -> list[FetchResult]:
-    """Extract a single URL (RAW HTML + optional structure/screenshot)."""
-    result = await client.extract(
-        url,
-        structure=settings.get("structure", True),
-        compact_structure=settings.get("compact_structure", False),
-        screenshot=settings.get("screenshot", "none"),
-        screenshot_format=settings.get("screenshot_format", "png"),
-        proxy=settings.get("proxy"),
-        use_cache=settings.get("use_cache", True),
-        cache_ttl=settings.get("cache_ttl"),
-    )
-    return [result]
-
-
-async def _fetch_file(client: PageFetch, filepath: str, settings: dict) -> list[FetchResult]:
-    """Fetch all URLs listed in a file."""
-    try:
-        urls = read_urls_from_file(filepath)
-    except FileNotFoundError:
-        print(f"\n  Error: file not found: {filepath!r}")
-        return []
-    if not urls:
-        print("\n  Error: the file does not contain any URLs.")
-        return []
-    print(f"\n  Fetching {len(urls)} URL(s)...\n")
-    if _requires_extract(settings):
-        # Honor ``request_pacing`` here the same way ``fetch_many`` does for
-        # non-extraction paths; without it a list of N URLs would all arrive
-        # at the target in a synchronized burst — a strong bot signal.
-        groups: list[list[FetchResult]] = []
-        pacing = client.config.request_pacing or 0.0
-        for i, url in enumerate(urls):
-            if i > 0 and pacing > 0:
-                await asyncio.sleep(random.uniform(0, pacing))
-            groups.append(await _extract_url(client, url, settings))
-        return [result for group in groups for result in group]
-    return await client.fetch_many(
-        urls,
-        mode=settings.get("mode"),
-        proxy=settings.get("proxy"),
-        use_cache=settings.get("use_cache", True),
-        cache_ttl=settings.get("cache_ttl"),
-    )
-
-
-def _requires_extract(settings: dict) -> bool:
-    """Return whether the selected output needs browser extraction data."""
-    return settings.get("format") in {"raw", "structure"} or settings.get("screenshot") != "none"
-
-
-def _handle_fetch(client: PageFetch, settings: dict, loop: asyncio.AbstractEventLoop) -> None:
-    """Interactive fetch flow: URL or file."""
-    _clear_screen()
-    _banner()
-    _header("Fetch")
-
-    print("  1. Enter a single URL")
-    print("  2. Load URLs from a text file (one per line)")
-    print("  3. Back to main menu")
-    print()
-
-    choice = _prompt("  Choose", "1")
-
-    if choice == "3":
-        return
-
-    _apply_debug(settings)
-    if choice == "2":
-        filepath = _prompt("  File path")
-        if not filepath:
-            return
-        results = loop.run_until_complete(_fetch_file(client, filepath, settings))
-    else:
-        url = _prompt("  URL")
-        if not url:
-            return
-        # Auto-prefix with https:// if no scheme
-        if not url.startswith(("http://", "https://")):
-            if _confirm(f"  No scheme detected. Use 'https://{url}'?", default=True):
-                url = f"https://{url}"
-        results = loop.run_until_complete(_fetch_url(client, url, settings))
-
-    if not results:
-        return
-
-    _clear_screen()
-    _banner()
-    _header("Results")
-
-    total = len(results)
-    success_count = sum(1 for r in results if r.success)
-    cache_count = sum(1 for r in results if r.from_cache)
-
-    print(f"  {total} URL(s) — {success_count} succeeded ({cache_count} from cache), "
-          f"{total - success_count} failed\n")
-
-    output_format = settings.get("format", "markdown")
-    include_html = settings.get("include_html", False)
-    include_structure = output_format == "structure"
-
-    rendered = _render_results(
-        results,
-        output_format,
-        include_html,
-        include_structure,
-    )
-    output_file = settings.get("output")
-
-    if output_file:
-        path = Path(output_file)
-        path.write_text(rendered, encoding="utf-8")
-        print(f"  Results saved to: {path.resolve()}\n")
-    else:
-        print(rendered)
-
-    # Show per-URL summary
-    print()
-    print("  --- Summary ---")
-    for i, result in enumerate(results, 1):
-        status = "OK" if result.success else "FAIL"
-        title = result.title or "(no title)"
-        duration = f"{result.duration_ms:.0f}ms" if result.duration_ms else "N/A"
-        cache_tag = " [cache]" if result.from_cache else ""
-        method = result.fetch_method or "?"
-        tag = f"[{method}]{cache_tag}"
-        print(f"  {i:>3}. [{status}] {duration} {tag}")
-        print(f"       {title}")
-        print(f"       {result.url}")
-        if result.error:
-            print(f"       Error: {result.error.message}")
-        print()
-
-    input("\n  Press Enter to continue...")
-
-
-def _handle_extract(client: PageFetch, settings: dict, loop: asyncio.AbstractEventLoop) -> None:
-    """Interactive extract flow: RAW HTML + structure + screenshot for a URL."""
-    _clear_screen()
-    _banner()
-    _header("Extract")
-
-    print("  Extract fetches the page via the browser and returns the raw HTML,")
-    print("  an optional structure tree, and an optional screenshot.\n")
-
-    url = _prompt("  URL")
-    if not url:
-        return
-    if not url.startswith(("http://", "https://")):
-        if _confirm(f"  No scheme detected. Use 'https://{url}'?", default=True):
-            url = f"https://{url}"
-
-    _apply_debug(settings)
-    results = loop.run_until_complete(_extract_url(client, url, settings))
-
-    if not results:
-        return
-
-    _clear_screen()
-    _banner()
-    _header("Results")
-
-    result = results[0]
-    status = "OK" if result.success else "FAIL"
-    title = result.title or "(no title)"
-    duration = f"{result.duration_ms:.0f}ms" if result.duration_ms else "N/A"
-    cache_tag = " [cache]" if result.from_cache else ""
-    method = result.fetch_method or "?"
-    tag = f"[{method}]{cache_tag}"
-    print(f"  [{status}] {duration} {tag}")
-    print(f"       {title}")
-    print(f"       {result.url}")
-    if result.error:
-        print(f"       Error: {result.error.message}")
-    print()
-    has_structure = result.structure is not None
-    has_screenshot = result.screenshot is not None
-    print(f"  RAW HTML: {len(result.html or ''):,} chars")
-    print(f"  Structure: {'yes' if has_structure else 'no'}")
-    if has_screenshot:
-        print(f"  Screenshot: {len(result.screenshot):,} bytes ({result.screenshot_format})")
-    else:
-        print("  Screenshot: no")
-    if result.warnings:
-        print("\n  Warnings:")
-        for warning in result.warnings:
-            print(f"    - {warning}")
-    print()
-
-    output_format = settings.get("format", "markdown")
-    rendered = _render_results(
-        [result],
-        output_format,
-        include_html=False,
-        include_structure=has_structure,
-        compact_structure=settings.get("compact_structure", False),
-        include_screenshot=has_screenshot,
-    )
-    output_file = settings.get("output")
-    if output_file:
-        path = Path(output_file)
-        path.write_text(rendered, encoding="utf-8")
-        print(f"  Results saved to: {path.resolve()}\n")
-    else:
-        print(rendered)
-
-    input("\n  Press Enter to continue...")
-
-
-def _settings_menu(settings: dict) -> None:
-    """Interactive settings submenu."""
+def _choose(text: str, options: frozenset[str], default: str) -> str:
+    """Prompt until the user enters one of *options*; ``default`` is pre-selected."""
+    options_str = ", ".join(sorted(options))
     while True:
-        _clear_screen()
-        _banner()
-        _header("Settings")
-
-        mode = settings.get("mode") or "auto"
-        proxy = settings.get("proxy") or "none"
-        cleaning_level = settings.get("cleaning_level") or "standard"
-        fmt = settings.get("format", "markdown")
-        cache_ttl = settings.get("cache_ttl") or "(config/default)"
-        output = settings.get("output", "none")
-        include_html = "yes" if settings.get("include_html") else "no"
-        structure = "yes" if settings.get("structure", True) else "no"
-        compact_structure = "yes" if settings.get("compact_structure") else "no"
-        screenshot = settings.get("screenshot", "none")
-        screenshot_format = settings.get("screenshot_format", "png")
-        debug = "yes" if settings.get("debug") else "no"
-        config_file = settings.get("config_file", "none")
-        no_cache = "yes" if settings.get("no_cache") else "no"
-
-        print(f"  1. Fetch mode          : {mode}")
-        print(f"  2. Proxy provider      : {proxy}")
-        print(f"  3. Output format       : {fmt}")
-        print(f"  4. Cache TTL           : {cache_ttl}")
-        print(f"  5. Output file         : {output}")
-        print(f"  6. Include raw HTML    : {include_html}")
-        print(f"  7. Extract structure   : {structure}")
-        print(f"  8. Compact structure   : {compact_structure}")
-        print(f"  9. Screenshot          : {screenshot}")
-        print(f" 10. Screenshot format   : {screenshot_format}")
-        print(f" 11. Debug logging       : {debug}")
-        print(f" 12. Disable cache       : {no_cache}")
-        print(f" 13. Config file (YAML)  : {config_file}")
-        print(f" 14. Cleaning level      : {cleaning_level}")
-        print("  0. Back to main menu")
-        print()
-
-        choice = _prompt("  Choose", "0")
-
-        if choice == "0":
-            return
-        elif choice == "1":
-            print(f"\n  Options: {', '.join(sorted(VALID_MODES))}")
-            val = _prompt("  Fetch mode", mode)
-            if val in VALID_MODES:
-                settings["mode"] = val
-            else:
-                print(f"  Invalid mode: {val}")
-                input("  Press Enter...")
-        elif choice == "2":
-            print("\n  Options: " + ", ".join(sorted(VALID_PROXIES)))
-            print("  custom — any HTTP/HTTPS/SOCKS5 proxy via CUSTOM_PROXY_URL")
-            print("  decodo — Decodo residential (DECODO_PROXY_URL)")
-            print("  byteful — Byteful residential (BYTEFUL_PROXY_URL)")
-            val = _prompt("  Proxy provider", proxy)
-            if val in VALID_PROXIES:
-                settings["proxy"] = val
-                if val == "custom":
-                    print("  → set CUSTOM_PROXY_URL to your proxy URL")
-                    print("    e.g. CUSTOM_PROXY_URL=socks5://user:pass@host:1080")
-            else:
-                print(f"  Invalid proxy: {val}")
-                input("  Press Enter...")
-        elif choice == "3":
-            print("\n  Options: markdown, json, html, structure, raw")
-            val = _prompt("  Output format", fmt)
-            if val in ("markdown", "json", "html", "structure", "raw"):
-                settings["format"] = val
-            else:
-                print(f"  Invalid format: {val}")
-                input("  Press Enter...")
-        elif choice == "4":
-            default_ttl = "" if cache_ttl == "(config/default)" else cache_ttl
-            val = _prompt("  Cache TTL (e.g. 30s, 15m, 24h, 7d)", default_ttl)
-            if val:
-                settings["cache_ttl"] = val
-        elif choice == "5":
-            val = _prompt("  Output file path (leave empty to print to console)", output if output != "none" else "")
-            settings["output"] = val if val else None
-        elif choice == "6":
-            settings["include_html"] = _confirm("  Include raw HTML in output?", default=settings.get("include_html", False))
-        elif choice == "7":
-            settings["structure"] = _confirm(
-                "  Extract the page structure tree?",
-                default=settings.get("structure", True),
-            )
-        elif choice == "8":
-            settings["compact_structure"] = _confirm(
-                "  Use the compact (LLM-friendly) structure variant?",
-                default=settings.get("compact_structure", False),
-            )
-        elif choice == "9":
-            print("\n  Options: none, viewport, full")
-            val = _prompt("  Screenshot mode", screenshot)
-            if val in ("none", "viewport", "full"):
-                settings["screenshot"] = val
-            else:
-                print(f"  Invalid screenshot mode: {val}")
-                input("  Press Enter...")
-        elif choice == "10":
-            print("\n  Options: png, jpeg")
-            val = _prompt("  Screenshot format", screenshot_format)
-            if val in ("png", "jpeg"):
-                settings["screenshot_format"] = val
-            else:
-                print(f"  Invalid screenshot format: {val}")
-                input("  Press Enter...")
-        elif choice == "11":
-            settings["debug"] = _confirm("  Enable debug logging?", default=settings.get("debug", False))
-            _apply_debug(settings)
-        elif choice == "12":
-            settings["no_cache"] = _confirm("  Disable cache?", default=settings.get("no_cache", False))
-            if settings.get("no_cache"):
-                settings["use_cache"] = False
-            else:
-                settings.pop("use_cache", None)
-        elif choice == "13":
-            val = _prompt("  Config file path (leave empty for defaults)", config_file if config_file != "none" else "")
-            settings["config_file"] = val if val else None
-        elif choice == "14":
-            print(f"\n  Options: {', '.join(sorted(VALID_CLEANING_LEVELS))}")
-            val = _prompt("  Cleaning level", cleaning_level)
-            if val in VALID_CLEANING_LEVELS:
-                settings["cleaning_level"] = val
-            else:
-                print(f"  Invalid cleaning level: {val}")
-                input("  Press Enter...")
+        value = _prompt(f"{text} ({options_str})", default)
+        if value in options:
+            return value
+        print(f"  invalid choice: {value!r}")
 
 
-def _view_config(settings: dict) -> None:
-    """Display current settings."""
-    _clear_screen()
-    _banner()
-    _header("Current Configuration")
+def _resolve_urls(raw: str) -> list[str]:
+    """Return the URL list for *raw* (single URL, file path, or bare domain)."""
+    if not raw:
+        return []
+    return parse_input_urls(raw)
 
-    config_file = settings.get("config_file")
-    if config_file:
-        print(f"  Config file  : {config_file}")
-        config = PageFetchConfig.from_yaml(config_file)
-    else:
-        print("  Config file  : (defaults)")
-        config = PageFetchConfig()
 
-    # Use explicit None checks (matching ``_init_client``) so a settings key
-    # that is set to a falsy value (e.g. ``""`` or ``False``) is honored
-    # rather than silently falling back to the config-file default.
-    mode = settings.get("mode") if settings.get("mode") is not None else config.mode
-    proxy = settings.get("proxy") if settings.get("proxy") is not None else config.proxy
-    cleaning_level = (
-        settings.get("cleaning_level") if settings.get("cleaning_level") is not None else config.cleaning_level
+def _run_wizard(config: PageFetchConfig) -> int:
+    """Drive the URL(s) → run_batch flow and return a process exit code."""
+    raw = _prompt("  URL or path to a URL list file")
+    try:
+        urls = _resolve_urls(raw)
+    except ValueError as exc:
+        print(f"\n  Error: {exc}")
+        input("  Press Enter to continue...")
+        return 2
+    if not urls:
+        return 0
+
+    output_format = _choose("  Output format", VALID_OUTPUT_FORMATS, "markdown")
+    include_html = output_format == "html"
+
+    screenshot_mode = _choose(
+        "  Screenshot mode", VALID_SCREENSHOT_MODES, "none"
+    )
+    effective_format = output_format
+    if screenshot_mode != "none" and output_format in {"markdown", "html"}:
+        # Screenshot bytes are only renderable in raw/json; auto-promote so
+        # the wizard matches ``cli.run_batch``'s mode-promotion behaviour.
+        effective_format = "json"
+
+    output_raw = _prompt("  Output file path (empty = print to console)")
+    output = Path(output_raw).expanduser() if output_raw else None
+
+    return asyncio.run(
+        run_batch(
+            config,
+            urls,
+            output_format=effective_format,
+            include_html=include_html,
+            screenshot=screenshot_mode,
+            output=output,
+        )
     )
 
-    print(f"  Mode             : {mode}")
-    print(f"  Proxy            : {proxy}")
-    print(f"  Cleaning level   : {cleaning_level}")
-    print(f"  Format           : {settings.get('format', 'markdown')}")
-    print(f"  Cache TTL    : {settings.get('cache_ttl', '24h')}")
-    print(f"  Output file  : {settings.get('output', 'none')}")
-    print(f"  Include HTML      : {'yes' if settings.get('include_html') else 'no'}")
-    print(f"  Extract structure : {'yes' if settings.get('structure', True) else 'no'}")
-    print(f"  Compact structure : {'yes' if settings.get('compact_structure') else 'no'}")
-    print(f"  Screenshot        : {settings.get('screenshot', 'none')}")
-    print(f"  Screenshot format : {settings.get('screenshot_format', 'png')}")
-    print(f"  Debug             : {'yes' if settings.get('debug') else 'no'}")
-    print(f"  No cache          : {'yes' if settings.get('no_cache') else 'no'}")
+
+def _build_config() -> PageFetchConfig:
+    """Ask the user for the few options that the wizard exposes."""
     print()
-
-    input("  Press Enter to continue...")
-
-
-def _init_client(settings: dict) -> PageFetch:
-    """Create a PageFetch client from current settings."""
-    config_file = settings.get("config_file")
-    if config_file:
-        config = PageFetchConfig.from_yaml(config_file)
-    else:
-        config = PageFetchConfig()
-
-    mode = settings.get("mode") if settings.get("mode") is not None else config.mode
-    proxy = settings.get("proxy") if settings.get("proxy") is not None else config.proxy
-    cleaning_level = (
-        settings.get("cleaning_level") if settings.get("cleaning_level") is not None else config.cleaning_level
-    )
-    use_cache = settings.get("use_cache", config.cache_enabled)
-    cache_ttl = settings.get("cache_ttl") or config.cache_ttl
-
-    return PageFetch(
-        mode=mode,
-        proxy=proxy,
-        cleaning_level=cleaning_level,
-        cache_enabled=use_cache,
-        cache_ttl=cache_ttl,
-        cache_path=config.cache_path,
-        http_concurrency=config.http_concurrency,
-        browser_concurrency=config.browser_concurrency,
-        http_timeout=config.http_timeout,
-        browser_timeout=config.browser_timeout,
-        retries_http=config.retries_http,
-        retries_browser=config.retries_browser,
-        max_redirects=config.max_redirects,
-        max_content_size=config.max_content_size,
-        confidence_threshold=config.confidence_threshold,
-        block_images=config.block_images,
-        block_level=config.block_level,
-        accept_language=config.accept_language,
-        humanize=config.humanize,
-        session_rotation=config.session_rotation,
-        session_duration=config.session_duration,
-        request_pacing=config.request_pacing,
-        stealth_level=config.stealth_level,
-        raise_on_error=config.raise_on_error,
-        screenshot_max_bytes=config.screenshot_max_bytes,
-        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
-    )
-
-
-# Settings keys that influence ``PageFetch`` construction. Changing any
-# other key (``format``, ``screenshot``, ``include_html``, etc.) only
-# affects how results are rendered and does NOT require rebuilding the
-# client — which (for browser mode) means a fresh Camoufox process.
-_CLIENT_FINGERPRINT_KEYS = (
-    "mode",
-    "proxy",
-    "use_cache",
-    "no_cache",
-    "cache_ttl",
-    "config_file",
-    "cleaning_level",
-)
-
-
-def _client_fingerprint(settings: dict) -> tuple:
-    """Return a stable hash of the settings that determine client config.
-
-    Output-formatting settings (e.g. ``format``, ``screenshot``,
-    ``include_html``, ``debug``) are intentionally excluded so the menu
-    loop can avoid re-spawning the client (and re-launching the browser
-    process) when only those change.
-    """
-    return tuple(
-        (key, settings.get(key)) for key in _CLIENT_FINGERPRINT_KEYS
-    )
+    proxy = _choose("  Proxy provider", VALID_PROXIES, "none")
+    if proxy != "none":
+        env_var = f"{proxy.upper()}_PROXY_URL"
+        if not os.environ.get(env_var):
+            print(f"  → set {env_var} to your proxy URL before running")
+    mode = _choose("  Fetch mode", VALID_MODES, "auto")
+    config = PageFetchConfig(proxy=proxy, mode=mode)
+    print()
+    return config
 
 
 def interactive_main() -> int:
-    """Run the interactive CLI menu loop."""
-    settings: dict = {
-        "format": "markdown",
-        "include_html": False,
-        "structure": True,
-        "compact_structure": False,
-        "screenshot": "none",
-        "screenshot_format": "png",
-        "debug": False,
-        "cache_ttl": None,
-        "output": None,
-        "no_cache": False,
-        "mode": None,
-        "proxy": None,
-        "config_file": None,
-        "cleaning_level": None,
-    }
-
-    _apply_debug(settings)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    client = _init_client(settings)
-    # Tracks the client-relevant subset of ``settings`` at the time of
-    # the last ``_init_client`` call. We only respawn the client (and
-    # therefore the browser process) when this fingerprint actually
-    # changes — output-format settings like ``format`` or ``screenshot``
-    # are excluded because they don't affect the client.
-    last_client_fingerprint = _client_fingerprint(settings)
-
-    try:
-        while True:
-            _clear_screen()
-            _banner()
-
-            print("  1. Fetch URL(s)")
-            print("  2. Extract URL (RAW HTML + structure + screenshot)")
-            print("  3. Settings")
-            print("  4. View current config")
-            print("  5. Exit")
-            print()
-
-            choice = _prompt("  Choose", "1")
-
-            try:
-                if choice == "1":
-                    _handle_fetch(client, settings, loop)
-                elif choice == "2":
-                    _handle_extract(client, settings, loop)
-                elif choice == "3":
-                    _settings_menu(settings)
-                elif choice == "4":
-                    _view_config(settings)
-                elif choice == "5":
-                    print("\n  Goodbye!")
-                    break
-
-                if choice in {"1", "2", "3"}:
-                    current_fingerprint = _client_fingerprint(settings)
-                    if current_fingerprint != last_client_fingerprint:
-                        try:
-                            loop.run_until_complete(client.close())
-                        except Exception:
-                            pass
-                        client = _init_client(settings)
-                        last_client_fingerprint = current_fingerprint
-            except KeyboardInterrupt:
-                print("\n\n  Interrupted. Goodbye!")
-                break
-            except Exception as exc:
-                print(f"\n  Unexpected error: {exc}")
-                input("  Press Enter to continue...")
-
+    """Run the interactive wizard loop."""
+    config = PageFetchConfig()
+    while True:
+        _clear_screen()
+        _banner()
+        print("  1. Fetch URL(s)")
+        print("  2. Configure & fetch")
+        print("  3. Exit")
+        print()
+        choice = _prompt("  Choose", "1")
         try:
-            loop.run_until_complete(client.close())
-        except Exception:
-            pass
-    finally:
-        loop.close()
-    return 0
+            if choice == "1":
+                code = _run_wizard(config)
+                if code:
+                    print(f"\n  pagefetch exited with code {code}")
+                input("  Press Enter to continue...")
+            elif choice == "2":
+                config = _build_config()
+                code = _run_wizard(config)
+                if code:
+                    print(f"\n  pagefetch exited with code {code}")
+                input("  Press Enter to continue...")
+            elif choice == "3":
+                print("\n  Goodbye!")
+                return 0
+            else:
+                print(f"\n  Invalid choice: {choice!r}")
+                input("  Press Enter to continue...")
+        except KeyboardInterrupt:
+            print("\n\n  Interrupted. Goodbye!")
+            return 0
+        except (ValueError, OSError) as exc:
+            print(f"\n  Error: {exc}")
+            input("  Press Enter to continue...")
+
+
+if __name__ == "__main__":
+    raise SystemExit(interactive_main())

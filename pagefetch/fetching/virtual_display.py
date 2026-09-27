@@ -13,16 +13,49 @@ stops it from :meth:`~pagefetch.fetching.browser.BrowserFetcher.close`.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from contextlib import suppress
 from pathlib import Path
 
 logger = logging.getLogger("pagefetch.fetching.virtual_display")
+
+# Linux-only parent-death signal. When the Python process exits — cleanly,
+# via signal, or OOM-killed — the kernel delivers ``PR_SET_PDEATHSIG`` to
+# every child registered with it, so Xvfb cannot outlive its parent.
+_PR_SET_PDEATHSIG = 1
+
+
+def _set_pdeathsig() -> None:
+    """Ask the kernel to ``SIGTERM`` this process when its parent dies.
+
+    Runs in the forked child before ``execve`` so the prctl state is
+    established before Xvfb starts. No-op on non-Linux platforms where the
+    symbol is unavailable; the caller must guard invocation.
+    """
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL(None)
+    except OSError:
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        except OSError:
+            # Containers without glibc/prctl fall back to the process-group
+            # based cleanup already handled by ``stop()``.
+            return
+    if not hasattr(libc, "prctl"):
+        return
+    # ``prctl`` returns -1 on error; raising is unnecessary — failing the
+    # child launch here would mask any downstream Xvfb diagnostic.
+    libc.prctl(_PR_SET_PDEATHSIG, signal.SIGTERM)
+
 
 
 class XvfbError(RuntimeError):
@@ -121,14 +154,21 @@ class XvfbDisplay:
             "RANDR",
         ]
         try:
-            self._process = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                # New session group keeps cleanup safe even if the parent
-                # is signalled.
-                start_new_session=True,
-            )
+            # On Linux, register ``PR_SET_PDEATHSIG`` so the kernel cleans up
+            # this Xvfb if the parent Python process is killed unexpectedly
+            # (``SIGKILL``, OOM, ``os._exit``); ``start_new_session`` alone
+            # detaches the child from the controlling terminal but does not
+            # bind its lifetime to ours. ``atexit`` covers the graceful exit
+            # path, which prctl does not trigger.
+            popen_kwargs: dict[str, object] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+                "start_new_session": True,
+            }
+            if sys.platform.startswith("linux"):
+                popen_kwargs["preexec_fn"] = _set_pdeathsig
+            self._process = subprocess.Popen(args, **popen_kwargs)
+            atexit.register(self.stop)
         except OSError as exc:
             self._display = None
             self._display_num = None
@@ -179,6 +219,7 @@ class XvfbDisplay:
 
     def stop(self) -> None:
         """Terminate the Xvfb subprocess (no-op if not running)."""
+        atexit.unregister(self.stop)
         proc = self._process
         self._process = None
         self._display = None

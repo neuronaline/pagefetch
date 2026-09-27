@@ -136,9 +136,9 @@ def build_parser() -> argparse.ArgumentParser:
 def _inputs(value: str) -> list[str]:
     if value.startswith(("http://", "https://")):
         return [value]
-    path = Path(value)
+    path = Path(value).expanduser()
     if path.is_file():
-        return read_urls_from_file(value)
+        return read_urls_from_file(path)
     # Check if it looks explicitly like a local file path
     file_exts = {".txt", ".csv", ".json", ".yaml", ".yml", ".urls", ".list", ".tsv", ".log", ".in"}
     is_explicit_path = value.startswith(("./", "../", "/", "~", ".\\", "..\\")) or "\\" in value
@@ -151,6 +151,10 @@ def _inputs(value: str) -> list[str]:
     if "/" in value or path.suffix:
         raise ValueError(f"file not found: {value!r}")
     return [value]
+
+
+parse_input_urls = _inputs
+
 
 
 def _render(
@@ -262,15 +266,29 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
     )
 
 
-async def _run(args: argparse.Namespace) -> int:
-    urls = _inputs(args.input)
+async def run_batch(
+    config: PageFetchConfig,
+    urls: list[str],
+    *,
+    output_format: str = "markdown",
+    include_html: bool = False,
+    screenshot: str = "none",
+    screenshot_format: str = "png",
+    output: Path | None = None,
+) -> int:
+    """Run a fetch/extract batch using *config* and write results.
+
+    This is the shared execution core used by both the argparse ``cli.main``
+    path and the interactive wizard.  Callers own prompting, validation, and
+    any UI-specific concerns; this helper returns a process exit code so the
+    interactive menu can also surface a meaningful status to the terminal.
+
+    Returns 0 on full success, 1 if every URL failed, 3 on partial failure.
+    Validation errors (empty URL list, bad inputs) raise ``ValueError``.
+    """
     if not urls:
         raise ValueError("the input file does not contain any URLs")
-    config = _build_config(args)
-    output_format = args.format
     extract_structure = output_format in {"structure", "raw"}
-    screenshot = getattr(args, "screenshot", "none") or "none"
-    screenshot_format = getattr(args, "screenshot_format", "png") or "png"
     include_screenshot = screenshot != "none" and output_format in {"raw", "json"}
     # Screenshot capture (and structure/raw output) requires the rendered DOM;
     # auto-promote to browser mode so the call doesn't surface a
@@ -335,12 +353,12 @@ async def _run(args: argparse.Namespace) -> int:
     rendered = _render(
         results,
         output_format,
-        args.include_html,
+        include_html,
         include_structure=extract_structure,
         include_screenshot=include_screenshot,
     )
-    if args.output:
-        args.output.write_text(rendered, encoding="utf-8")
+    if output:
+        output.write_text(rendered, encoding="utf-8")
     else:
         try:
             print(rendered)
@@ -357,6 +375,22 @@ async def _run(args: argparse.Namespace) -> int:
     if success_count < total:
         return 3  # partial failure
     return 0
+
+
+async def _run(args: argparse.Namespace) -> int:
+    urls = _inputs(args.input)
+    screenshot = getattr(args, "screenshot", "none") or "none"
+    screenshot_format = getattr(args, "screenshot_format", "png") or "png"
+    config = _build_config(args)
+    return await run_batch(
+        config,
+        urls,
+        output_format=args.format,
+        include_html=args.include_html,
+        screenshot=screenshot,
+        screenshot_format=screenshot_format,
+        output=args.output,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

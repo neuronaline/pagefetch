@@ -7,7 +7,6 @@ import logging
 import random
 import sys
 import time
-from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from hashlib import md5
@@ -136,14 +135,22 @@ class PageFetch:
         self._browser_semaphore = asyncio.Semaphore(self.config.browser_concurrency)
         self._http_clients: dict[str, httpx.AsyncClient] = {}
         self._http_fetchers: dict[str, HTTPFetcher] = {}
-        self._browser_fetchers: OrderedDict[str, BrowserFetcher] = OrderedDict()
-        self._browser_fetcher_users: dict[str, int] = {}
-        self._browser_pool_limit = max(
-            self.config.browser_concurrency,
-            min(32, self.config.browser_concurrency * 2),
-        )
+        # Per-proxy-URL httpx clients (Phase 1 Item 3).  Reusing a single
+        # client per proxy keeps TCP/TLS keep-alive and HTTP/2 multiplexing
+        # alive across requests, instead of constructing a fresh client on
+        # every call and paying a handshake + TIME_WAIT cost.
+        self._proxy_http_clients: dict[str, httpx.AsyncClient] = {}
+        # Phase 3 Item 7: pool key is just the provider name ("none",
+        # "custom", "decodo", "byteful") so a plain dict suffices — at most
+        # four entries can ever exist.  Concurrency is bounded by
+        # ``_browser_semaphore``; the previous LRU/``asyncio.Condition``
+        # bookkeeping only added deadlock risk during ``close()`` without
+        # providing extra throughput.  ``_browser_init_lock`` is the only
+        # lock needed — it serializes the first ``new_browser_fetcher``
+        # call when two coroutines race for the same provider key.
+        self._browser_fetchers: dict[str, BrowserFetcher] = {}
+        self._browser_init_lock = asyncio.Lock()
         self._http_init_lock = asyncio.Lock()
-        self._browser_pool_condition = asyncio.Condition()
         self._cache = SQLiteCache(self.config.cache_path) if self.config.cache_enabled else None
         self._started = False
         self._closed = False
@@ -250,15 +257,22 @@ class PageFetch:
                     *(self._close_resource(client.aclose) for client in self._http_clients.values()),
                     return_exceptions=True,
                 )
-                for failure in (*browser_results, *client_results):
+                proxy_results = await asyncio.gather(
+                    *(
+                        self._close_resource(client.aclose)
+                        for client in self._proxy_http_clients.values()
+                    ),
+                    return_exceptions=True,
+                )
+                for failure in (*browser_results, *client_results, *proxy_results):
                     if isinstance(failure, Exception):
                         logger.warning("resource cleanup failed: %s", type(failure).__name__)
                 if self._cache:
                     await self._close_resource(self._cache.close)
                 self._browser_fetchers.clear()
-                self._browser_fetcher_users.clear()
                 self._http_fetchers.clear()
                 self._http_clients.clear()
+                self._proxy_http_clients.clear()
                 self._closed = True
                 self._closing = False
         except asyncio.CancelledError:
@@ -399,27 +413,41 @@ class PageFetch:
         ordered = list(urls)
         unique = list(dict.fromkeys(ordered))
 
+        # Bound the fanout of ``fetch_many`` so a single batch with thousands
+        # of URLs cannot create that many concurrent cache reads against the
+        # shared SQLite connection (which aiosqlite serializes internally,
+        # queueing them on its per-connection lock) nor thousands of
+        # ``FetchResult`` instances alive at once. The gate is the looser of
+        # the two transport semaphores plus a small buffer for cache hits
+        # that never reach the network.
+        fanout_limit = max(
+            self.config.http_concurrency,
+            self.config.browser_concurrency,
+        ) * 2
+        fanout_sem = asyncio.Semaphore(fanout_limit)
+
         async def one(item: str) -> FetchResult:
-            try:
-                return await self.fetch(
-                    item,
-                    mode=mode,
-                    proxy=proxy,
-                    use_cache=use_cache,
-                    cache_ttl=cache_ttl,
-                    raise_on_error=raise_on_error,
-                )
-            except PageFetchError as exc:
-                # Use the raw item string — normalize_url may itself raise for
-                # the same invalid URL that produced the error; ``str(item)``
-                # preserves the original input verbatim.
-                return FetchResult(
-                    url=str(item),
-                    success=False,
-                    proxy_provider=proxy or self.config.proxy,
-                    error=exc.error,
-                    fetched_at=datetime.now(UTC),
-                )
+            async with fanout_sem:
+                try:
+                    return await self.fetch(
+                        item,
+                        mode=mode,
+                        proxy=proxy,
+                        use_cache=use_cache,
+                        cache_ttl=cache_ttl,
+                        raise_on_error=raise_on_error,
+                    )
+                except PageFetchError as exc:
+                    # Use the raw item string — normalize_url may itself raise for
+                    # the same invalid URL that produced the error; ``str(item)``
+                    # preserves the original input verbatim.
+                    return FetchResult(
+                        url=str(item),
+                        success=False,
+                        proxy_provider=proxy or self.config.proxy,
+                        error=exc.error,
+                        fetched_at=datetime.now(UTC),
+                    )
 
         if self.config.request_pacing > 0 and len(unique) > 1:
             # Stagger task creation to avoid a synchronized burst of
@@ -433,20 +461,20 @@ class PageFetch:
         else:
             fetched = await asyncio.gather(*(one(item) for item in unique))
         by_url = dict(zip(unique, fetched, strict=True))
-        # Duplicate URLs need independent copies: FetchResult holds mutable
-        # containers (``links``, ``images``, ``metadata``, ``warnings``) and
-        # callers must be able to mutate one entry without aliasing the rest.
-        # ``dataclasses.replace`` would only shallow-copy those references, so
-        # ``deepcopy`` is required — the cost is bounded by the number of
-        # mutable fields, not the size of immutable strings (HTML, screenshot
-        # bytes) which ``deepcopy`` references without copying.
-        from copy import deepcopy
+        # Duplicate URLs need independent copies: ``FetchResult`` holds
+        # mutable containers (``links``, ``images``, ``metadata``,
+        # ``warnings``) and callers must be able to mutate one entry without
+        # aliasing the rest. ``FetchResult.clone()`` shares the immutable
+        # payloads (HTML, screenshot bytes, structure) by reference and only
+        # shallow-copies the mutable containers — far cheaper than
+        # :func:`copy.deepcopy`, which used to walk the entire DOM tree and
+        # block the event loop for hundreds of milliseconds.
         results: list[FetchResult] = []
         emitted: set[int] = set()
         for item in ordered:
             result = by_url[item]
             if id(result) in emitted:
-                result = deepcopy(result)
+                result = result.clone()
             emitted.add(id(result))
             results.append(result)
         return results
@@ -862,10 +890,14 @@ class PageFetch:
                 if cache_key in self._http_fetchers:
                     return self._http_fetchers[cache_key]
                 resolve_proxy(provider)
+                # ``follow_redirects=False`` lets ``HTTPFetcher._request``
+                # intercept every redirect response so each ``Location``
+                # header is validated by the SSRF guard before the next
+                # network hop (Phase 1 Item 2).
                 client = httpx.AsyncClient(
                     headers=BROWSER_HEADERS,
                     timeout=httpx.Timeout(self.config.http_timeout),
-                    follow_redirects=True,
+                    follow_redirects=False,
                     max_redirects=self.config.max_redirects,
                     http2=True,
                     limits=httpx.Limits(
@@ -879,8 +911,43 @@ class PageFetch:
                     self._http_semaphore,
                     retries=self.config.retries_http,
                     max_content_size=self.config.max_content_size,
+                    max_redirects=self.config.max_redirects,
+                    proxy_client_provider=self._proxy_client_provider,
                 )
         return self._http_fetchers[cache_key]
+
+    async def _proxy_client_provider(self, proxy_url: str) -> httpx.AsyncClient:
+        """Return a pooled ``httpx.AsyncClient`` keyed by *proxy_url*.
+
+        Phase 1 Item 3: the previous implementation created and tore down a
+        fresh client per proxied request, paying a TCP/TLS handshake on every
+        URL and exhausting ``TIME_WAIT`` sockets.  Pooling by proxy URL keeps
+        the keep-alive socket warm and lets HTTP/2 multiplexing work across
+        requests to the same exit.  Lifecycle is owned by ``PageFetch.close``;
+        ``_teardown`` awaits ``aclose`` on every client this provider hands
+        out.
+        """
+        cached = self._proxy_http_clients.get(proxy_url)
+        if cached is not None:
+            return cached
+        async with self._http_init_lock:
+            cached = self._proxy_http_clients.get(proxy_url)
+            if cached is not None:
+                return cached
+            client = httpx.AsyncClient(
+                headers=BROWSER_HEADERS,
+                timeout=httpx.Timeout(self.config.http_timeout),
+                follow_redirects=False,
+                max_redirects=self.config.max_redirects,
+                http2=True,
+                proxy=proxy_url,
+                limits=httpx.Limits(
+                    max_connections=self.config.http_concurrency * 2,
+                    max_keepalive_connections=self.config.http_concurrency,
+                ),
+            )
+            self._proxy_http_clients[proxy_url] = client
+            return client
 
     def _headers_for_url(self, url: str) -> dict[str, str]:
         headers = dict(BROWSER_HEADERS)
@@ -950,41 +1017,29 @@ class PageFetch:
         provider: str,
         url: str,
     ) -> tuple[str, ProxySettings, BrowserFetcher]:
+        """Return a long-lived :class:`BrowserFetcher` for *provider*.
+
+        Phase 3 Item 7: the pool is keyed only by ``provider`` so a plain
+        ``dict`` lookup is enough. Concurrency is bounded by
+        ``self._browser_semaphore``; this method only guarantees that two
+        coroutines racing for the same key do not double-spawn a browser.
+        """
         cache_key, proxy = self._browser_pool_target(provider, url)
-        evicted: BrowserFetcher | None = None
-        async with self._browser_pool_condition:
-            while cache_key not in self._browser_fetchers:
-                if len(self._browser_fetchers) < self._browser_pool_limit:
-                    break
-                idle_key = next(
-                    (
-                        key
-                        for key in self._browser_fetchers
-                        if self._browser_fetcher_users.get(key, 0) == 0
-                    ),
-                    None,
-                )
-                if idle_key is not None:
-                    evicted = self._browser_fetchers.pop(idle_key)
-                    self._browser_fetcher_users.pop(idle_key, None)
-                    break
-                await self._browser_pool_condition.wait()
-            if cache_key not in self._browser_fetchers:
-                self._browser_fetchers[cache_key] = self._new_browser_fetcher(proxy)
-                self._browser_fetcher_users[cache_key] = 0
-            self._browser_fetchers.move_to_end(cache_key)
-            self._browser_fetcher_users[cache_key] += 1
-            fetcher = self._browser_fetchers[cache_key]
-        if evicted is not None:
-            await self._close_browser_quietly(evicted)
+        fetcher = self._browser_fetchers.get(cache_key)
+        if fetcher is not None:
+            return cache_key, proxy, fetcher
+        async with self._browser_init_lock:
+            fetcher = self._browser_fetchers.get(cache_key)
+            if fetcher is None:
+                fetcher = self._new_browser_fetcher(proxy)
+                self._browser_fetchers[cache_key] = fetcher
         return cache_key, proxy, fetcher
 
     async def _release_browser_fetcher(self, cache_key: str) -> None:
-        async with self._browser_pool_condition:
-            users = self._browser_fetcher_users.get(cache_key, 0)
-            if users > 0:
-                self._browser_fetcher_users[cache_key] = users - 1
-            self._browser_pool_condition.notify_all()
+        # ``_browser_semaphore`` already enforces concurrency; the pool no
+        # longer tracks per-key user counts or evicts idle fetchers, so the
+        # release is a no-op kept as a single funnel for future hooks.
+        return None
 
     @staticmethod
     async def _close_browser_quietly(fetcher: BrowserFetcher) -> None:

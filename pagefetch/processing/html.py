@@ -52,8 +52,19 @@ def process_html(
     if confidence is None:
         confidence = analyze_html(html, soup=raw_soup)
     cleaned = clean_html(raw_soup, cleaning_level)
-    links = extract_links(cleaned, base_url)
-    images = extract_images(cleaned, base_url)
+    # Phase 3 Item 9: links and images are extracted from the ORIGINAL
+    # soup, not the cleaned one. ``cleaning_level="maximum"`` removes
+    # ``<nav>``, ``<header>``, ``<footer>``, ``<aside>`` and sidebar
+    # containers, so any navigation link, footer image, or sidebar
+    # reference living there would silently vanish from the caller's
+    # page graph. Markdown/text continue to be derived from ``cleaned``
+    # so the editor-facing summary still benefits from noise removal;
+    # structural data (links / images) must mirror the real page graph.
+    # ``clean_html`` does not mutate its input — see ``cleaner.clean_html``
+    # for the ``__copy__`` guarantee — so reusing ``raw_soup`` here is
+    # safe and avoids parsing a second copy of the tree.
+    links = extract_links(raw_soup, base_url)
+    images = extract_images(raw_soup, base_url)
     markdown = html_to_markdown(cleaned, base_url)
     text = "\n".join(line.strip() for line in cleaned.get_text("\n").splitlines() if line.strip())
     return ProcessedHTML(title, markdown, text, metadata, links, images, confidence, warnings)

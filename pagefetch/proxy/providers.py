@@ -65,10 +65,16 @@ class ProxySettings:
         if not self.url:
             return None
         parsed = urlsplit(self.url)
-        config = {
-            "server": urlunsplit(
-                (parsed.scheme, parsed.netloc.split("@")[-1], "", "", "")
-            )
+        # Rebuild the server from the parsed components rather than splitting
+        # ``netloc`` on ``"@"``; a raw ``@`` in the username or password would
+        # otherwise be treated as the userinfo/host separator and corrupt the
+        # resulting ``server`` value.
+        port_part = f":{parsed.port}" if parsed.port else ""
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        config: dict[str, str] = {
+            "server": f"{parsed.scheme}://{hostname}{port_part}"
         }
         if parsed.username:
             config["username"] = unquote(parsed.username)

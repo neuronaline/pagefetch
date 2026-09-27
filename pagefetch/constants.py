@@ -49,6 +49,11 @@ _UA_POOL_BY_OS: dict[str, tuple[str, ...]] = {
 RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 BLOCKED_STATUS_CODES = frozenset({403, 429})
 
+# HTTP redirect status codes the manual redirect loop in ``HTTPFetcher._request``
+# has to handle. ``follow_redirects=False`` is set on every httpx client so the
+# SSRF guard can validate each ``Location`` header before the next hop.
+REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+
 XML_TYPES = ("application/xml", "text/xml", "+xml")
 SAFE_RESPONSE_HEADERS = frozenset(
     {"cache-control", "content-language", "content-location", "date", "etag", "last-modified"}

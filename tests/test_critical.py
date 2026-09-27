@@ -17,7 +17,7 @@ from pagefetch.cache.keys import build_cache_key
 from pagefetch.cache.sqlite import SQLiteCache
 from pagefetch.cli import _build_config, build_parser
 from pagefetch.config import PageFetchConfig
-from pagefetch.fetching.http import HTTPFetcher
+from pagefetch.fetching.http import HTTPFetcher, TransportFailure
 from pagefetch.models import FetchResult
 from pagefetch.proxy.providers import ProxyConfigurationError, redact_proxy_url, resolve_proxy
 from pagefetch.utils.urls import normalize_url, validate_url
@@ -32,6 +32,40 @@ def test_url_validation_and_normalization():
     assert normalize_url("http://example.com:8080") == "http://example.com:8080/"
     with pytest.raises(ValueError):
         validate_url("file:///tmp/page")
+
+
+def test_validate_url_blocks_hostname_resolving_to_private_ip(monkeypatch):
+    """Phase 1 Item 1: ``validate_url`` must reject hostnames whose DNS
+    resolves to a private/loopback/metadata address.  The previous textual
+    filter let ``127.0.0.1.nip.io`` and ``localtest.me`` slip through by
+    swallowing the ``ip_address`` ``ValueError`` and returning ``True``.
+    """
+    from pagefetch.utils import urls as urls_module
+
+    def fake_resolve(host: str) -> list[str]:
+        # ``nip.io`` and similar wildcard DNS services map the label to a
+        # literal loopback address; emulate that resolver behaviour.
+        if host == "127.0.0.1.nip.io":
+            return ["127.0.0.1"]
+        if host == "localtest.me":
+            return ["127.0.0.1"]
+        if host == "metadata.aws.example":
+            return ["169.254.169.254"]
+        if host == "example.com":
+            return ["93.184.216.34"]
+        return []
+
+    monkeypatch.setattr(urls_module, "resolve_host_ips", fake_resolve)
+    # Wildcard-style hostnames that resolve into the unsafe ranges are blocked.
+    for hostile in (
+        "https://127.0.0.1.nip.io/",
+        "http://localtest.me/admin",
+        "http://metadata.aws.example/latest/meta-data/",
+    ):
+        with pytest.raises(ValueError, match="SSRF"):
+            validate_url(hostile)
+    # A hostname resolving to a public address still validates.
+    assert validate_url("https://example.com/").hostname == "example.com"
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +99,23 @@ def test_proxy_environment_resolves_and_redacts(monkeypatch):
         "password": "secret:value",
     }
     assert redact_proxy_url(settings.url) == "http://***:***@proxy.example:1234"
+    # Phase 4 Item 10: a raw ``@`` in the password must not be treated as
+    # the userinfo/host separator when ``browser_config`` rebuilds the
+    # ``server`` field. The previous implementation split ``netloc`` on
+    # ``"@"`` and produced a corrupted ``server`` URL.
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user:p@ssword@proxy.example:1234",
+    )
+    raw_at = resolve_proxy("decodo")
+    assert raw_at.browser_config()["server"] == "http://proxy.example:1234"
+    assert raw_at.browser_config()["password"] == "p@ssword"
+    monkeypatch.setenv(
+        "DECODO_PROXY_URL",
+        "http://user:pass@[::1]:8080",
+    )
+    ipv6_proxy = resolve_proxy("decodo")
+    assert ipv6_proxy.browser_config()["server"] == "http://[::1]:8080"
 
 
 def test_custom_proxy_url_resolves_for_each_scheme(monkeypatch):
@@ -442,6 +493,13 @@ def test_session_duration_config_validation():
     # duration strings.
     with pytest.raises(ValueError):
         PageFetchConfig(session_duration="bad-unit")
+    # Phase 4 Item 12: bare-digit duration strings (``"3600"``, ``"0"``)
+    # round-trip through ``parse_duration`` so YAML/CLI values that arrive
+    # quoted as strings flow through the same code path as integers.
+    from pagefetch.utils.durations import parse_duration
+
+    assert parse_duration("3600") == 3600
+    assert parse_duration("0") == 0
 
 
 def test_session_duration_is_part_of_cache_key():
@@ -627,6 +685,55 @@ async def test_http_retry_backoff_releases_shared_semaphore(monkeypatch):
         await client.aclose()
 
 
+async def test_http_redirect_to_private_address_is_blocked_pre_flight():
+    """Phase 1 Item 2: ``HTTPFetcher`` must validate every ``Location`` header
+    before opening a new connection.  The pre-Phase-1 implementation let
+    httpx follow redirects, which exposed a race window in which the SSRF
+    guard ran only after the connection to a private/metadata target was
+    already established.
+    """
+    from pagefetch.utils import urls as urls_module
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/leak":
+            return httpx.Response(
+                302, headers={"Location": "http://127.0.0.1:8200/secret"}, request=request
+            )
+        return httpx.Response(200, text="ok", request=request)
+
+    # Inject a deterministic DNS resolver that maps ``attacker.example`` to a
+    # public address so the initial URL validates; the SSRF guard must still
+    # reject the redirect target ``127.0.0.1`` before any second hop.
+    original_resolve = urls_module.resolve_host_ips
+
+    def fake_resolve(host: str) -> list[str]:
+        if host == "attacker.example":
+            return ["203.0.113.10"]
+        return original_resolve(host)
+
+    urls_module.resolve_host_ips = fake_resolve
+    try:
+        transport = httpx.MockTransport(handler)
+        # ``follow_redirects=False`` mirrors the production client setup.
+        http_client = httpx.AsyncClient(transport=transport, follow_redirects=False)
+        fetcher = HTTPFetcher(
+            http_client,
+            asyncio.Semaphore(1),
+            retries=0,
+            max_content_size=1024,
+            max_redirects=5,
+        )
+        try:
+            with pytest.raises(TransportFailure) as exc_info:
+                await fetcher.fetch("https://attacker.example/leak")
+            assert exc_info.value.error.code == "ssrf_blocked"
+            assert exc_info.value.error.retryable is False
+        finally:
+            await http_client.aclose()
+    finally:
+        urls_module.resolve_host_ips = original_resolve
+
+
 # ---------------------------------------------------------------------------
 # Mode contracts: HTTP-only clients must never escalate to a real browser
 # ---------------------------------------------------------------------------
@@ -700,6 +807,32 @@ async def test_auto_does_not_fall_back_for_http_failure(handler, predicate):
         result = await client.fetch("https://example.com/x")
     assert not result.success
     assert result.error is not None and predicate(result)
+
+
+async def test_proxy_http_clients_are_pooled_per_proxy_url():
+    """Phase 1 Item 3: the per-proxy ``httpx.AsyncClient`` must be reused
+    across requests so TCP/TLS keep-alive and HTTP/2 multiplexing survive.
+    The previous implementation constructed and tore down a fresh client on
+    every proxied request, wasting handshakes and exhausting ``TIME_WAIT``
+    sockets for large batches.
+    """
+    client = PageFetch(mode="http", proxy="custom", cache_enabled=False)
+    try:
+        url_a = "http://user:pass@proxy-a.example:1080"
+        url_b = "http://user:pass@proxy-b.example:1080"
+        first = await client._proxy_client_provider(url_a)
+        second = await client._proxy_client_provider(url_a)
+        third = await client._proxy_client_provider(url_b)
+        # Same proxy URL → identical pooled client.
+        assert first is second
+        # Different proxy URL → distinct pooled client.
+        assert first is not third
+        # Both clients must be registered for ``close()`` to tear them down.
+        assert len(client._proxy_http_clients) == 2
+    finally:
+        await client.close()
+    # ``close()`` must drain the proxy pool without leaking clients.
+    assert client._proxy_http_clients == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1138,332 @@ def test_srcset_comma_url_candidate():
     assert (
         image_candidate(soup.find("img"))
         == "https://res.cloudinary.com/demo/image/upload/w_300,h_200/sample.jpg"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 regression assertions (Süreç & Kaynak İzolasyonu)
+# ---------------------------------------------------------------------------
+
+
+def test_browser_start_does_not_mutate_caller_environ(monkeypatch):
+    """Phase 2 Item 5: ``BrowserFetcher.start`` must pass the Xvfb ``DISPLAY``
+    to the Camoufox subprocess via ``options["env"]`` rather than mutating
+    the caller's ``os.environ``. Mutating process-global state across async
+    tasks / threads broke unrelated components; the per-subprocess dict must
+    now be the sole transport of ``DISPLAY`` to Firefox.
+    """
+    import os
+    import sys
+    import types
+
+    monkey_display = ":42"
+    monkeypatch.setenv("DISPLAY", monkey_display)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.delenv("X_PRIVILEGED_WAYLAND_SOCKET", raising=False)
+    monkeypatch.delenv("GDK_BACKEND", raising=False)
+    monkeypatch.delenv("MOZ_ENABLE_WAYLAND", raising=False)
+
+    # Provide a stand-in ``camoufox.async_api`` module so ``start()`` does
+    # not need the real browser runtime to exercise the env wiring.
+    captured: dict[str, object] = {}
+
+    class _FakeManager:
+        async def __aenter__(self) -> "_FakeManager":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    def _fake_async_camoufox(**options: object) -> _FakeManager:
+        captured["options"] = options
+        return _FakeManager()
+
+    fake_async_api = types.ModuleType("camoufox.async_api")
+    fake_async_api.AsyncCamoufox = _fake_async_camoufox  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "camoufox", types.ModuleType("camoufox"))
+    monkeypatch.setitem(sys.modules, "camoufox.async_api", fake_async_api)
+
+    from pagefetch.fetching import browser as browser_module
+    from pagefetch.proxy.providers import ProxySettings
+    from pagefetch import bootstrap as bootstrap_module
+
+    # Bypass the runtime bootstrap check — we are not actually launching the
+    # browser, just exercising the env-wiring path.
+    async def _noop_bootstrap() -> None:
+        return None
+
+    monkeypatch.setattr(bootstrap_module, "bootstrap_browser", _noop_bootstrap)
+
+    # Build a minimal BrowserFetcher with a running Xvfb surrogate so
+    # ``start()`` skips the Xvfb-start branch entirely.
+    fetcher = browser_module.BrowserFetcher(
+        asyncio.Semaphore(1),
+        timeout=10.0,
+        retries=0,
+        proxy=ProxySettings(provider="none", url=None),
+        max_content_size=1024,
+    )
+    fetcher._xvfb = browser_module.XvfbDisplay.__new__(browser_module.XvfbDisplay)
+    fetcher._xvfb._display = ":99"  # type: ignore[attr-defined]
+    # ``is_running`` is a property backed by ``_process.poll() is None``;
+    # substitute a sentinel whose ``poll`` never reports a code.
+    class _AliveSentinel:
+        def poll(self) -> None:
+            return None
+
+    fetcher._xvfb._process = _AliveSentinel()  # type: ignore[attr-defined]
+
+    asyncio.run(fetcher.start())
+
+    # Caller's environment must be untouched.
+    assert os.environ.get("DISPLAY") == monkey_display, (
+        "BrowserFetcher.start must not mutate os.environ['DISPLAY']; "
+        f"expected {monkey_display!r}, got {os.environ.get('DISPLAY')!r}"
+    )
+    assert "WAYLAND_DISPLAY" not in os.environ
+    assert "X_PRIVILEGED_WAYLAND_SOCKET" not in os.environ
+    # The subprocess env must carry the Xvfb display value.
+    opts = captured["options"]
+    assert isinstance(opts, dict)
+    assert opts["env"]["DISPLAY"] == ":99"
+    assert opts["env"]["GDK_BACKEND"] == "x11"
+    assert opts["env"]["MOZ_ENABLE_WAYLAND"] == "0"
+    assert "WAYLAND_DISPLAY" not in opts["env"]
+
+
+def test_xvfb_popen_uses_pdeathsig_pre_exec_on_linux(monkeypatch):
+    """Phase 2 Item 6: On Linux, ``XvfbDisplay.start`` must install a
+    ``preexec_fn`` that calls ``prctl(PR_SET_PDEATHSIG, SIGTERM)`` so the
+    kernel cleans up Xvfb if the parent Python process dies unexpectedly.
+    Outside Linux the gate must be skipped so non-Linux CI / dev boxes still
+    work.
+    """
+    import sys
+
+    from pagefetch.fetching import virtual_display as vd
+
+    monkeypatch.setattr(vd, "_set_pdeathsig", lambda: None, raising=True)
+
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        pid = 4242
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured["kwargs"] = kwargs
+            captured["args"] = args
+            self._stdout = type("_Stdout", (), {"fileno": lambda self: 1})()
+
+        @property
+        def stdout(self) -> object:
+            return self._stdout
+
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, sig: int) -> None:  # pragma: no cover
+            pass
+
+        def wait(self, timeout: float | None = None) -> int:  # pragma: no cover
+            return 0
+
+        def kill(self) -> None:  # pragma: no cover
+            pass
+
+    monkeypatch.setattr(vd.subprocess, "Popen", _FakeProcess)
+    monkeypatch.setattr(vd.shutil, "which", lambda _: "/usr/bin/Xvfb")
+    monkeypatch.setattr(vd.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(vd.os, "set_blocking", lambda *a, **k: None)
+    monkeypatch.setattr(vd.os, "read", lambda *_a, **_k: b"")
+    monkeypatch.setattr(vd.time, "sleep", lambda *_a, **_k: (_ for _ in ()).throw(vd.XvfbLaunchError("timeout")))
+    # Path.exists on the X11 socket must succeed so the launch loop returns early.
+    monkeypatch.setattr(vd, "Path", type("_P", (), {"exists": staticmethod(lambda self: True)}))
+
+    display = vd.XvfbDisplay()
+    try:
+        if sys.platform.startswith("linux"):
+            try:
+                display.start()
+            except vd.XvfbLaunchError:
+                pass
+            kwargs = captured["kwargs"]
+            assert "preexec_fn" in kwargs, (
+                "Xvfb.start must register preexec_fn on Linux so the kernel "
+                "delivers SIGTERM when the parent Python process dies."
+            )
+            assert kwargs["preexec_fn"] is vd._set_pdeathsig
+        # On non-Linux, preexec_fn must be absent so the gate is skipped.
+        if not sys.platform.startswith("linux"):
+            kwargs = captured["kwargs"]
+            assert "preexec_fn" not in kwargs
+    finally:
+        try:
+            display.stop()
+        except Exception:
+            pass
+
+
+def test_fetch_result_clone_isolates_mutable_containers():
+    """Phase 2 Item 7: ``FetchResult.clone`` must yield an independent copy
+    whose mutable containers (``warnings``, ``links``, ``images``,
+    ``metadata``) can be mutated without aliasing the original, while
+    keeping immutable payloads (HTML, screenshot bytes, structure) shared
+    by reference. The previous ``deepcopy`` walked the entire DOM tree and
+    blocked the event loop; ``clone`` is a ``dataclasses.replace`` over the
+    four mutable fields only.
+    """
+    result = FetchResult(
+        url="https://example.com/",
+        success=True,
+        html="<html>large payload</html>",
+        markdown="# large payload",
+        text="large payload",
+        warnings=["w0"],
+        links=[],
+        images=[],
+        metadata={"k": "v"},
+    )
+
+    twin = result.clone()
+    # Independent mutable containers, identical contents.
+    assert twin is not result
+    assert twin.warnings is not result.warnings and twin.warnings == ["w0"]
+    assert twin.links is not result.links and twin.links == []
+    assert twin.images is not result.images and twin.images == []
+    assert twin.metadata is not result.metadata and twin.metadata == {"k": "v"}
+    # Immutable payloads are shared by reference.
+    assert twin.html is result.html
+    assert twin.markdown is result.markdown
+    assert twin.text is result.text
+
+    # Mutating the clone must not bleed back into the original.
+    twin.warnings.append("w1")
+    twin.links.append("l1")
+    twin.images.append("i1")
+    twin.metadata["k2"] = "v2"
+    assert result.warnings == ["w0"]
+    assert result.links == []
+    assert result.images == []
+    assert result.metadata == {"k": "v"}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 regression assertions (Algoritmik Sadeleştirme)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_browser_pool_is_a_plain_dict_and_reuses_fetcher_per_provider():
+    """Phase 3 Item 7: the browser pool must be a plain ``dict[str,
+    BrowserFetcher]`` (max ~4 keys — one per provider) backed by a single
+    ``_browser_init_lock``. The previous implementation carried a 32-entry
+    LRU ring plus an ``asyncio.Condition`` whose waiters were never woken
+    during ``close()`` (deadlock risk) and whose eviction logic added
+    hundreds of lines for a pool that could never exceed four entries.
+    """
+    client = PageFetch(cache_enabled=False, browser_concurrency=1)
+    try:
+        assert isinstance(client._browser_fetchers, dict)
+        # No OrderedDict / Condition / user-counter / numeric pool limit.
+        assert not hasattr(client, "_browser_pool_condition")
+        assert not hasattr(client, "_browser_fetcher_users")
+        assert not hasattr(client, "_browser_pool_limit")
+        # The remaining lock is a plain ``asyncio.Lock`` so two coroutines
+        # racing for the same provider key cannot double-spawn a browser.
+        assert isinstance(client._browser_init_lock, asyncio.Lock)
+
+        # Two acquires for the same provider must hand back identical
+        # fetcher objects — provider is the cache key, so concurrency
+        # capping belongs on ``_browser_semaphore``, not on per-key
+        # bookkeeping.
+        first_cache_key, _, first_fetcher = await client._acquire_browser_fetcher(
+            "none", "https://example.com/a"
+        )
+        second_cache_key, _, second_fetcher = await client._acquire_browser_fetcher(
+            "none", "https://example.com/b"
+        )
+        await client._release_browser_fetcher(first_cache_key)
+        await client._release_browser_fetcher(second_cache_key)
+        assert first_cache_key == "none" == second_cache_key
+        assert first_fetcher is second_fetcher
+    finally:
+        await client.close()
+
+
+def test_wait_for_stability_uses_node_count_not_outerhtml():
+    """Phase 3 Item 8: the readiness poll must NOT serialise the entire
+    DOM into a string every 80–150 ms. Inspecting the actual JavaScript
+    expression passed to ``page.evaluate`` guarantees we paid that cost
+    only when reviewing the source — the old ``outerHTML.length``
+    evaluation allocated megabytes of string per poll on large pages and
+    was the dominant CPU cost in the readiness wait.
+    """
+    import inspect
+    import re
+
+    from pagefetch.fetching import readiness
+
+    # The two probe functions are full Python coroutines; the metric we
+    # really care about lives inside the ``page.evaluate(...)`` literal.
+    # Grab the JS literal so the surrounding docstring (which mentions the
+    # obsolete metric for context) is excluded from the check.
+    metrics_match = re.search(
+        r"metrics\s*=\s*await\s+page\.evaluate\(\s*((?:\"\"\"(?:.|\n)*?\"\"\"|'''(?:.|\n)*?'''))",
+        inspect.getsource(readiness.wait_for_stability),
+        flags=re.MULTILINE,
+    )
+    assert metrics_match is not None, "wait_for_stability must call page.evaluate to read DOM metrics"
+    js_literal = metrics_match.group(1)
+    assert "getElementsByTagName('*').length" in js_literal
+    assert "outerHTML" not in js_literal
+
+
+def test_maximum_cleaning_preserves_links_and_images_for_page_graph():
+    """Phase 3 Item 9: links and images must be extracted from the
+    ORIGINAL soup, not the cleaned one. ``cleaning_level="maximum"``
+    removes ``<nav>``, ``<header>``, ``<footer>`` and ``<aside>`` — any
+    navigation, footer, or sidebar edge the page carries would silently
+    disappear from ``FetchResult.links`` / ``FetchResult.images`` if we
+    extracted from the cleaned tree. Markdown continues to drop the chrome
+    so the summary stays reader-friendly; structural data mirrors reality.
+    """
+    from pagefetch.processing.html import process_html
+
+    html = (
+        "<html><body>"
+        "<nav><a href='/about'>About</a><a href='/contact'>Contact</a></nav>"
+        "<aside><a href='/promo'>Promo</a></aside>"
+        "<footer>"
+        "<a href='/privacy'>Privacy</a>"
+        "<img src='/logo.png' alt='Logo'>"
+        "</footer>"
+        "<main><h1>Real Article</h1><img src='/hero.jpg' alt='Hero'></main>"
+        "</body></html>"
+    )
+    processed = process_html(
+        html,
+        "https://example.com/",
+        cleaning_level="maximum",
+    )
+
+    # Markdown faithfully drops the chrome (this is the contract).
+    assert "/about" not in processed.markdown
+    assert "/privacy" not in processed.markdown
+    # But the link & image graphs still expose every edge from the page,
+    # regardless of the cleanup level — duplication-free relative URLs.
+    link_hrefs = sorted({link.url for link in processed.links})
+    image_srcs = sorted({image.url for image in processed.images})
+    assert link_hrefs == sorted(
+        {
+            "https://example.com/about",
+            "https://example.com/contact",
+            "https://example.com/promo",
+            "https://example.com/privacy",
+        }
+    )
+    assert image_srcs == sorted(
+        {"https://example.com/logo.png", "https://example.com/hero.jpg"}
     )
 
 

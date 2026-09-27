@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from typing import Any
 
@@ -162,6 +162,25 @@ class FetchResult:
         self.links = [] if self.links is None else self.links
         self.images = [] if self.images is None else self.images
         self.warnings = [] if self.warnings is None else self.warnings
+
+    def clone(self) -> FetchResult:
+        """Return an independent copy safe to mutate without aliasing siblings.
+
+        Immutable payloads (``html``, ``markdown``, ``text``, ``screenshot``
+        bytes, ``structure``, ``error``, primitive scalars, ``datetime``)
+        are shared by reference — copying them would balloon memory and
+        block the event loop in :func:`copy.deepcopy` for nothing. Only the
+        mutable containers that callers are expected to mutate — ``metadata``,
+        ``links``, ``images``, ``warnings`` — receive shallow list/dict
+        copies via :func:`dataclasses.replace`.
+        """
+        return replace(
+            self,
+            metadata=dict(self.metadata),
+            links=list(self.links),
+            images=list(self.images),
+            warnings=list(self.warnings),
+        )
 
     def to_dict(
         self,
