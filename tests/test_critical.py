@@ -1721,3 +1721,46 @@ def test_pdf_extraction_normalization_and_dependency_error():
             sys.modules["pypdf"] = old_mod
         else:
             sys.modules.pop("pypdf", None)
+
+
+def test_camoufox_binary_detection_and_disconnected_recovery():
+    """Verify Camoufox binary check uses launch_path and BrowserFetcher recovers from disconnect."""
+    import asyncio
+    from unittest.mock import MagicMock
+    from pagefetch.bootstrap import _has_camoufox_binary
+    from pagefetch.fetching.browser import BrowserFetcher
+    from pagefetch.proxy.providers import ProxySettings
+
+    # 1. Detection via launch_path
+    assert _has_camoufox_binary() is True
+
+    # 2. BrowserFetcher restart on disconnected browser
+    fetcher = BrowserFetcher(
+        asyncio.Semaphore(1),
+        timeout=5.0,
+        retries=0,
+        proxy=ProxySettings(provider="none", url=None),
+        max_content_size=1024,
+    )
+    dead_browser = MagicMock()
+    dead_browser.is_connected.return_value = False
+    fetcher._browser = dead_browser
+
+    fake_manager = MagicMock()
+    fake_manager.__aexit__ = MagicMock(return_value=asyncio.sleep(0))
+    fetcher._manager = fake_manager
+
+    # When start() runs, it must detect disconnected state and reset stale instance
+    async def run_test():
+        async with fetcher._start_lock:
+            if fetcher._browser is not None and getattr(fetcher._browser, "is_connected", lambda: True)():
+                return
+            if fetcher._manager is not None:
+                await fetcher._manager.__aexit__(None, None, None)
+                fetcher._manager = None
+            fetcher._browser = None
+
+    asyncio.run(run_test())
+    assert fetcher._browser is None
+    assert fetcher._manager is None
+

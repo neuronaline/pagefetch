@@ -57,12 +57,18 @@ def _get_pip_command() -> list[str]:
 def _has_camoufox_binary() -> bool:
     """Return True when the Camoufox browser binary is already on disk."""
     try:
-        from camoufox.pkgman import camoufox_path
+        from camoufox.pkgman import launch_path
 
-        path = camoufox_path(download_if_missing=False)
-        return path is not None and Path(path).exists()
+        path = launch_path()
+        return bool(path and Path(path).is_file())
     except Exception:
-        return False
+        try:
+            from camoufox.pkgman import camoufox_path
+
+            path = camoufox_path(download_if_missing=False)
+            return path is not None and Path(path).exists()
+        except Exception:
+            return False
 
 
 def _auto_install_enabled() -> bool:

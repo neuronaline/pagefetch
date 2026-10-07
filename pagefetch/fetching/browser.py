@@ -175,18 +175,19 @@ class BrowserFetcher:
         return options
 
     async def start(self) -> None:
-        if self._browser is not None:
+        if self._browser is not None and getattr(self._browser, "is_connected", lambda: True)():
             return
         async with self._start_lock:
-            if self._browser is not None:
+            if self._browser is not None and getattr(self._browser, "is_connected", lambda: True)():
                 return
-            # Clean up a stale manager left behind by an earlier reset
+            # Clean up a stale manager left behind by an earlier reset or crash
             if self._manager is not None:
                 try:
                     await self._manager.__aexit__(None, None, None)
                 except Exception:
                     pass
                 self._manager = None
+            self._browser = None
 
             # Auto-install camoufox + browser binary on first use so the
             # import and launch below do not fail with a "not installed"
@@ -475,10 +476,13 @@ class BrowserFetcher:
                     if request_url.startswith(("http://", "https://")):
                         external_script = registrable_host(request_url) != _main_site
 
-            if is_blocked_type or external_frame or external_script:
-                await route.abort()
-            else:
-                await route.continue_()
+            try:
+                if is_blocked_type or external_frame or external_script:
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                pass
 
         await page.route("**/*", route_handler)
         return network
@@ -775,6 +779,12 @@ class BrowserFetcher:
             finally:
                 self._manager = None
                 self._browser = None
+        elif self._browser is not None:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
         xvfb = self._xvfb
         self._xvfb = None
         if xvfb is not None:
