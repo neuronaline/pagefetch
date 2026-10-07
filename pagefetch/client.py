@@ -7,7 +7,6 @@ import logging
 import random
 import sys
 import time
-from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Iterable
 from datetime import UTC, datetime
 from hashlib import md5
@@ -19,7 +18,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .cache import SQLiteCache, build_cache_key
-from .config import VALID_MODES, VALID_PROXIES, PageFetchConfig
+from .config import _UNSET, VALID_MODES, VALID_PROXIES, PageFetchConfig
 from .constants import (
     _UA_POOL_BY_OS,
     BLOCKED_STATUS_CODES,
@@ -31,15 +30,22 @@ from .exceptions import PageFetchError
 from .fetching import BrowserFetcher, HTTPFetcher, HTTPResponse, TransportFailure
 from .models import FetchErrorInfo, FetchResult
 from .processing.detector import ConfidenceReport, analyze_html
-from .processing.html import process_html
-from .processing.non_html import (
-    MissingOptionalDependency,
-    process_pdf,
-    process_text,
-    process_xml,
+from .processing.pipeline import (
+    build_document_result,
+    build_html_result,
+    build_pdf_result,
+    build_text_result,
+    build_xml_result,
+    decode_response_body,
+    detect_document_kind,
+    is_html_like,
+    is_pdf_content,
+    is_xml_content,
+    looks_like_html,
+    parse_content_type,
 )
-from .processing.structure import StructureLimits, extract_structure
 from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
+from .proxy.pool import _MAX_PROXY_HTTP_CLIENTS, _ProxyClientPool
 from .proxy.providers import (
     inject_session_id_for,
     make_domain_session,
@@ -64,124 +70,6 @@ elif sys.platform == "darwin":
     _HOST_OS = "macos"
 else:
     _HOST_OS = "linux"
-
-
-# Maximum number of pooled ``httpx.AsyncClient`` instances kept alive per
-# PageFetch client. Each pooled client owns its own connection pool and a
-# set of keep-alive sockets; residential proxies in ``sticky`` mode inject a
-# per-domain session ID into the proxy URL, so without a bound every new
-# domain would mint a new client and leak file descriptors until ``EMFILE``
-# fires. 50 covers any realistic single-tenant fan-out while keeping the
-# eviction churn low. ``OrderedDict`` is used as the backing store so the
-# public attribute still satisfies ``len()`` and ``== {}`` for tests.
-_MAX_PROXY_HTTP_CLIENTS = 50
-
-
-class _ProxyClientPool:
-    """Bounded LRU pool of ``httpx.AsyncClient`` instances keyed by proxy URL.
-
-    Evicted clients are scheduled for asynchronous ``aclose()`` on the
-    running event loop — the eviction path itself never blocks — and any
-    pending eviction tasks are awaited by :meth:`aclose_all` during the
-    outer :meth:`PageFetch.close` so no socket or FD leaks past teardown.
-    """
-
-    __slots__ = ("_max_size", "_clients", "_eviction_tasks")
-
-    def __init__(self, max_size: int = _MAX_PROXY_HTTP_CLIENTS) -> None:
-        self._max_size = max_size
-        self._clients: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
-        self._eviction_tasks: set[asyncio.Task[None]] = set()
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._clients
-
-    def __len__(self) -> int:
-        return len(self._clients)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, dict):
-            return dict(self._clients) == other
-        if isinstance(other, _ProxyClientPool):
-            return self._clients == other._clients
-        return NotImplemented
-
-    def __iter__(self):
-        return iter(self._clients)
-
-    def get(self, key: str) -> httpx.AsyncClient | None:
-        client = self._clients.get(key)
-        if client is not None:
-            self._clients.move_to_end(key)
-        return client
-
-    def values(self):
-        return self._clients.values()
-
-    def clear(self) -> None:
-        self._clients.clear()
-
-    def put(self, key: str, client: httpx.AsyncClient) -> None:
-        """Insert *client* under *key*, evicting the oldest entry if needed.
-
-        Eviction schedules ``aclose()`` in the background and never blocks
-        the caller, so the hot path stays cheap even under heavy churn.
-        """
-        if key in self._clients:
-            old_client = self._clients[key]
-            if old_client is not client:
-                self._schedule_close(key, old_client)
-            self._clients[key] = client
-            self._clients.move_to_end(key)
-            return
-        self._clients[key] = client
-        if len(self._clients) > self._max_size:
-            evicted_key, evicted_client = self._clients.popitem(last=False)
-            self._schedule_close(evicted_key, evicted_client)
-
-    def _schedule_close(self, key: str, client: httpx.AsyncClient) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop — nothing to schedule. The evicted client
-            # will be GC'd; httpx.AsyncClient does not hold native
-            # resources once it has never been opened.
-            return
-        task = loop.create_task(self._safe_close(key, client))
-        self._eviction_tasks.add(task)
-        task.add_done_callback(self._eviction_tasks.discard)
-
-    @staticmethod
-    async def _safe_close(key: str, client: httpx.AsyncClient) -> Exception | None:
-        try:
-            await asyncio.wait_for(client.aclose(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-            return None
-        except TimeoutError as exc:
-            logger.warning("proxy client %s close timed out after %.1f seconds", key, _RESOURCE_CLOSE_TIMEOUT)
-            return exc
-        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
-            logger.debug("evicted proxy client close failed (%s): %s", key, type(exc).__name__)
-            return exc
-
-    async def aclose_all(self) -> list[Exception | None]:
-        """Await pending evictions, then close every still-pooled client.
-
-        Returns the list of exceptions raised by individual ``aclose()`` calls
-        (or ``None`` for each successful close) so callers can log per-client
-        failures the same way they did for the previous gather-on-values
-        teardown loop.
-        """
-        clients = list(self._clients.values())
-        self._clients.clear()
-        pending = list(self._eviction_tasks)
-        self._eviction_tasks.clear()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        results = await asyncio.gather(
-            *(self._safe_close(f"pool-{i}", client) for i, client in enumerate(clients)),
-            return_exceptions=True,
-        )
-        return [r if isinstance(r, Exception) else None for r in results]
 
 
 class _AsyncPacer:
@@ -245,7 +133,7 @@ class PageFetch:
         max_redirects: int = 10,
         max_content_size: int = 25 * 1024 * 1024,
         confidence_threshold: float = 0.80,
-        block_images: bool = True,
+        block_images: Any = _UNSET,
         block_level: Literal["minimal", "balanced", "aggressive"] | None = None,
         accept_language: str = "en-US,en;q=0.5",
         humanize: bool | None = None,
@@ -593,7 +481,15 @@ class PageFetch:
         ) * 2
         fanout_sem = asyncio.Semaphore(fanout_limit)
 
-        async def one(item: str) -> FetchResult:
+        pacer: _AsyncPacer | None = None
+        if self.config.request_pacing > 0 and len(unique) > 1:
+            # Build a single pacer that distributes the inter-request delay
+            # across the whole batch instead of serialising task creation.
+            pacer = _AsyncPacer(self.config.request_pacing)
+
+        async def run_one(item: str) -> FetchResult:
+            if pacer is not None:
+                await pacer.acquire()
             async with fanout_sem:
                 try:
                     return await self.fetch(
@@ -616,21 +512,7 @@ class PageFetch:
                         fetched_at=datetime.now(UTC),
                     )
 
-        pacer: _AsyncPacer | None = None
-        if self.config.request_pacing > 0 and len(unique) > 1:
-            # Build a single pacer that distributes the inter-request delay
-            # across the whole batch instead of serialising task creation.
-            # The previous ``for ... await asyncio.sleep(...)`` loop took
-            # ``len(unique) * request_pacing`` wall-clock seconds just to
-            # *launch* the tasks, leaving the HTTP/browser semaphore idle.
-            pacer = _AsyncPacer(self.config.request_pacing)
-
-        async def paced_one(item: str) -> FetchResult:
-            if pacer is not None:
-                await pacer.acquire()
-            return await one(item)
-
-        fetched = await asyncio.gather(*(paced_one(item) for item in unique))
+        fetched = await asyncio.gather(*(run_one(item) for item in unique))
         by_url = dict(zip(unique, fetched, strict=True))
         # Duplicate URLs need independent copies: ``FetchResult`` holds
         # mutable containers (``links``, ``images``, ``metadata``,
@@ -819,6 +701,43 @@ class PageFetch:
         finally:
             await self._finish_operation()
 
+    async def _escalate_to_browser(
+        self,
+        url: str,
+        proxy: str,
+        status_code: int | None = None,
+    ) -> FetchResult:
+        # Auto-mode double-hit softening delay
+        await asyncio.sleep(random.uniform(0.5, 3.0))
+        return await self._fetch_browser(url, proxy, status_code=status_code)
+
+    def _degraded_http_result(
+        self,
+        url: str,
+        response: HTTPResponse,
+        html: str,
+        raw_soup: BeautifulSoup,
+        report: ConfidenceReport,
+        content_type: str,
+        proxy: str,
+        reason: str,
+    ) -> FetchResult:
+        available = self._result_from_html(
+            original_url=url,
+            final_url=response.url,
+            status_code=response.status_code,
+            html=html,
+            content_type=content_type,
+            encoding=response.encoding,
+            proxy=proxy,
+            method="http",
+            response_headers=response.headers,
+            soup=raw_soup,
+            confidence=report,
+        )
+        available.warnings.extend([reason, "Content may be incomplete."])
+        return available
+
     async def _fetch_http_or_auto(
         self,
         url: str,
@@ -863,12 +782,7 @@ class PageFetch:
                 escalate_to_browser = True
             if escalate_to_browser:
                 logger.info("HTTP %s; using browser for %s", response.status_code, url)
-                # ── auto-mode double-hit softening ──
-                # Insert a short random delay before the browser fallback so
-                # the same proxy/source IP does not emit two different TLS
-                # stacks (httpx → Camoufox) back-to-back — a strong bot signal.
-                await asyncio.sleep(random.uniform(0.5, 3.0))
-                return await self._fetch_browser(
+                return await self._escalate_to_browser(
                     url,
                     proxy,
                     status_code=response.status_code,
@@ -880,33 +794,19 @@ class PageFetch:
             )
 
         content_type = self._content_type(response.headers.get("Content-Type"))
-        if self._is_pdf(content_type, response.content):
+        kind = detect_document_kind(content_type, response.content)
+        if kind == "pdf":
             return self._result_from_pdf(url, response, proxy)
-        if self._is_xml(content_type):
+        if kind == "xml":
             return self._result_from_xml(url, response, proxy)
-        if (
-            content_type.startswith("text/plain")
-            or content_type == "application/json"
-            or content_type.endswith("+json")
-        ):
-            # application/json and +json subtypes are treated like text/plain:
-            # they have no HTML structure to render in a browser, so spinning
-            # up Camoufox for a JSON payload would burn latency for zero extra
-            # content.  The caller's :class:`FetchResult` still surfaces the
-            # raw bytes via ``text`` / ``markdown``.
+        if kind == "text":
             return self._result_from_text(url, response, proxy)
-        if not self._is_html_like(content_type) and not self._looks_like_html(response.content):
-            # Auto mode escalates non-HTML responses (binary blobs, RSS-in-
-            # disguise, etc.) to the browser so SPA fallbacks and JS-
-            # rendered pages still get a chance to surface real content.
-            # The HTTP path stays fail-fast because the caller explicitly
-            # opted out of a browser.
+        if kind != "html":
             if mode == "auto":
                 logger.info(
                     "HTTP returned %s; using browser for %s", content_type, url
                 )
-                await asyncio.sleep(random.uniform(0.5, 3.0))
-                return await self._fetch_browser(
+                return await self._escalate_to_browser(
                     url,
                     proxy,
                     status_code=response.status_code,
@@ -924,58 +824,37 @@ class PageFetch:
         report = analyze_html(html, soup=raw_soup)
         if mode == "auto" and report.score < self.config.confidence_threshold:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
-            # ── auto-mode double-hit softening ──
-            await asyncio.sleep(random.uniform(0.5, 3.0))
             try:
-                rendered = await self._fetch_browser(
+                rendered = await self._escalate_to_browser(
                     url,
                     proxy,
                     status_code=response.status_code,
                 )
             except TransportFailure:
-                available = self._result_from_html(
-                    original_url=url,
-                    final_url=response.url,
-                    status_code=response.status_code,
-                    html=html,
-                    content_type=content_type,
-                    encoding=response.encoding,
-                    proxy=proxy,
-                    method="http",
-                    response_headers=response.headers,
-                    soup=raw_soup,
-                    confidence=report,
+                return self._degraded_http_result(
+                    url,
+                    response,
+                    html,
+                    raw_soup,
+                    report,
+                    content_type,
+                    proxy,
+                    "Browser rendering failed; showing basic HTTP version instead.",
                 )
-                available.warnings.extend(
-                    [
-                        "Browser rendering failed; showing basic HTTP version instead.",
-                        "Content may be incomplete.",
-                    ]
-                )
-                return available
             if not rendered.success:
-                available = self._result_from_html(
-                    original_url=url,
-                    final_url=response.url,
-                    status_code=response.status_code,
-                    html=html,
-                    content_type=content_type,
-                    encoding=response.encoding,
-                    proxy=proxy,
-                    method="http",
-                    response_headers=response.headers,
-                    soup=raw_soup,
-                    confidence=report,
+                return self._degraded_http_result(
+                    url,
+                    response,
+                    html,
+                    raw_soup,
+                    report,
+                    content_type,
+                    proxy,
+                    "Browser rendered content was not usable; showing HTTP version instead.",
                 )
-                available.warnings.extend(
-                    [
-                        "Browser rendered content was not usable; showing HTTP version instead.",
-                        "Content may be incomplete.",
-                    ]
-                )
-                return available
             rendered.warnings.insert(0, "HTTP content confidence was low; browser fallback was used.")
             return rendered
+
         result = self._result_from_html(
             original_url=url,
             final_url=response.url,
@@ -1247,79 +1126,31 @@ class PageFetch:
         include_structure: bool = False,
         compact_structure: bool = False,
     ) -> FetchResult:
-        # Build the structural summary from the unmodified DOM before the
-        # processing pipeline mutates the soup. This avoids the cleaner
-        # dropping the very nodes the structural extractor needs to report
-        # without paying for an extra DOM copy.
-        structure_source = soup if soup is not None else html
-        limits = StructureLimits(compact=compact_structure) if compact_structure else None
-        structure = (
-            extract_structure(structure_source, final_url, limits=limits) if include_structure else None
-        )
-        try:
-            processed = process_html(
-                html,
-                final_url,
-                response_headers,
-                soup=soup,
-                confidence=confidence,
-                cleaning_level=self.config.cleaning_level,
-            )
-        except Exception as exc:
-            raise TransportFailure(
-                FetchErrorInfo("parse_error", "HTML content could not be processed", False, type(exc).__name__)
-            ) from exc
-        return FetchResult(
-            url=original_url,
+        return build_html_result(
+            original_url=original_url,
             final_url=final_url,
             status_code=status_code,
-            success=True,
+            html=html,
             content_type=content_type,
             encoding=encoding,
-            title=processed.title,
-            markdown=processed.markdown,
-            html=html,
-            text=processed.text,
-            metadata=processed.metadata,
-            links=processed.links,
-            images=processed.images,
-            structure=structure,
-            fetch_method=method,
-            proxy_provider=proxy,
-            content_confidence=processed.confidence.score,
-            fetched_at=datetime.now(UTC),
-            warnings=processed.warnings,
+            proxy=proxy,
+            method=method,
+            cleaning_level=self.config.cleaning_level,
+            response_headers=response_headers,
+            soup=soup,
+            confidence=confidence,
+            include_structure=include_structure,
+            compact_structure=compact_structure,
         )
 
     def _result_from_pdf(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
-        try:
-            doc = process_pdf(response.content)
-        except MissingOptionalDependency as exc:
-            raise TransportFailure(
-                FetchErrorInfo("missing_dependency", str(exc), False, type(exc).__name__)
-            ) from exc
-        except Exception as exc:
-            raise TransportFailure(FetchErrorInfo("pdf_parse_error", "PDF could not be parsed", False, type(exc).__name__)) from exc
-        return self._document_result(url, response, proxy, doc, "pdf", "application/pdf")
+        return build_pdf_result(url, response, proxy)
 
     def _result_from_xml(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
-        try:
-            doc = process_xml(response.content, response.encoding)
-        except Exception as exc:
-            raise TransportFailure(FetchErrorInfo("xml_parse_error", "XML could not be parsed", False, type(exc).__name__)) from exc
-        return self._document_result(
-            url,
-            response,
-            proxy,
-            doc,
-            "xml",
-            self._content_type(response.headers.get("Content-Type")),
-            raw_source=self._decode(response),
-        )
+        return build_xml_result(url, response, proxy)
 
     def _result_from_text(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
-        doc = process_text(response.content, response.encoding)
-        return self._document_result(url, response, proxy, doc, "text", self._content_type(response.headers.get("Content-Type")))
+        return build_text_result(url, response, proxy)
 
     @staticmethod
     def _document_result(
@@ -1332,69 +1163,34 @@ class PageFetch:
         *,
         raw_source: str | None = None,
     ) -> FetchResult:
-        doc.metadata["headers"] = {
-            key.lower(): value
-            for key, value in response.headers.items()
-            if key.lower() in SAFE_RESPONSE_HEADERS
-        }
-        return FetchResult(
-            url=url,
-            final_url=response.url,
-            status_code=response.status_code,
-            success=True,
-            content_type=content_type,
-            encoding=response.encoding,
-            title=doc.title,
-            markdown=doc.markdown,
-            html=raw_source,
-            text=doc.text,
-            metadata=doc.metadata,
-            fetch_method=method,
-            proxy_provider=proxy,
-            content_confidence=1.0,
-            fetched_at=datetime.now(UTC),
-            warnings=doc.warnings,
+        return build_document_result(
+            url, response, proxy, doc, method, content_type, raw_source=raw_source
         )
 
     @staticmethod
     def _decode(response: HTTPResponse) -> str:
-        encoding = response.encoding or "utf-8"
-        try:
-            return response.content.decode(encoding)
-        except (LookupError, UnicodeDecodeError):
-            return response.content.decode("utf-8", errors="replace")
+        return decode_response_body(response)
 
     @staticmethod
     def _content_type(header: str | None) -> str:
-        return (header or "application/octet-stream").split(";", 1)[0].strip().lower()
+        return parse_content_type(header)
 
     @staticmethod
     def _is_pdf(content_type: str, content: bytes) -> bool:
-        return content_type == "application/pdf" or content.startswith(b"%PDF-")
+        return is_pdf_content(content_type, content)
 
     @staticmethod
     def _is_xml(content_type: str) -> bool:
-        if content_type in ("application/xml", "text/xml"):
-            return True
-        # Match XML-based subtypes like application/atom+xml, image/svg+xml
-        # but NOT application/xhtml+xml (which is HTML5, not generic XML).
-        return "+xml" in content_type and content_type != "application/xhtml+xml"
+        return is_xml_content(content_type)
 
     @staticmethod
     def _is_html_like(content_type: str) -> bool:
-        """Return True when *content_type* should be processed as HTML."""
-        return content_type in ("text/html", "application/xhtml+xml")
+        return is_html_like(content_type)
 
     @staticmethod
     def _looks_like_html(content: bytes) -> bool:
-        """Heuristic HTML sniff for responses with ambiguous content types."""
-        stripped = content.lstrip()
-        if not stripped:
-            return False
-        return stripped.startswith(b"<") and any(
-            marker in stripped[:512].lower()
-            for marker in (b"<!doctype html", b"<html", b"<head", b"<body", b"<title", b"<meta", b"<div", b"<p", b"<a ")
-        )
+        return looks_like_html(content)
+
 
     # Sniff markers for "Under Attack Mode" / interstitial WAF challenges
     # that arrive with a 503 (or occasionally a 403) status.  Cheap substring

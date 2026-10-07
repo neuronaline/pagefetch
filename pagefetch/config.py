@@ -332,94 +332,25 @@ class PageFetchConfig:
         if block_images is _UNSET:
             block_images = stealth_level not in {"balanced", "max"}
 
-        if not isinstance(mode, str) or mode not in VALID_MODES:
-            raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
-        if not isinstance(proxy, str) or proxy not in VALID_PROXIES:
-            raise ValueError(f"proxy must be one of {sorted(VALID_PROXIES)}")
-        if not isinstance(cleaning_level, str) or cleaning_level not in VALID_CLEANING_LEVELS:
-            raise ValueError(f"cleaning_level must be one of {sorted(VALID_CLEANING_LEVELS)}")
-        for name, value in {
-            "http_concurrency": http_concurrency,
-            "browser_concurrency": browser_concurrency,
-            "max_redirects": max_redirects,
-            "max_content_size": max_content_size,
-        }.items():
-            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        for name, value in {"retries_http": retries_http, "retries_browser": retries_browser}.items():
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
-        for name, value in {"http_timeout": http_timeout, "browser_timeout": browser_timeout}.items():
-            if (
-                not isinstance(value, int | float)
-                or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(f"{name} must be a positive finite number")
-        if (
-            not isinstance(confidence_threshold, int | float)
-            or isinstance(confidence_threshold, bool)
-            or not math.isfinite(confidence_threshold)
-            or not 0 <= confidence_threshold <= 1
-        ):
-            raise ValueError("confidence_threshold must be between 0 and 1")
-        if not isinstance(cache_enabled, bool) or not isinstance(raise_on_error, bool) or not isinstance(humanize, bool):
-            raise ValueError("cache_enabled, humanize, and raise_on_error must be booleans")
-        if not isinstance(block_images, bool):
-            raise ValueError("block_images must be a boolean")
-        if not isinstance(block_level, str) or block_level not in VALID_BLOCK_LEVELS:
-            raise ValueError(f"block_level must be one of {sorted(VALID_BLOCK_LEVELS)}")
-        if not isinstance(accept_language, str) or not accept_language.strip():
-            raise ValueError("accept_language must be a non-empty string")
-        if not isinstance(session_rotation, str) or session_rotation not in VALID_SESSION_ROTATION:
-            raise ValueError(f"session_rotation must be one of {sorted(VALID_SESSION_ROTATION)}")
-        if session_duration is not None:
-            if (
-                isinstance(session_duration, bool)
-                or not isinstance(session_duration, (str, int))
-            ):
-                raise ValueError(
-                    "session_duration must be a duration string ('30m', '2h', '1d'), "
-                    "a positive integer (seconds), or None"
-                )
-            if isinstance(session_duration, int) and session_duration <= 0:
-                raise ValueError(
-                    "session_duration must be a positive integer (seconds) or None"
-                )
-        if (
-            not isinstance(request_pacing, int | float)
-            or isinstance(request_pacing, bool)
-            or not math.isfinite(request_pacing)
-            or request_pacing < 0
-        ):
-            raise ValueError("request_pacing must be a non-negative finite number")
-        if (
-            not isinstance(screenshot_max_bytes, int)
-            or isinstance(screenshot_max_bytes, bool)
-            or screenshot_max_bytes <= 0
-        ):
-            raise ValueError("screenshot_max_bytes must be a positive integer")
-        if (
-            not isinstance(browser_pre_check_byte_margin, int | float)
-            or isinstance(browser_pre_check_byte_margin, bool)
-            or not math.isfinite(browser_pre_check_byte_margin)
-            or browser_pre_check_byte_margin < 1.0
-        ):
-            raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
         ttl = parse_duration(cache_ttl)
-        path = Path(cache_path).expanduser() if cache_path is not None else user_cache_path("pagefetch") / "cache.sqlite3"
-        # ``session_duration`` accepts either a duration string (``"30m"``,
-        # ``"2h"``, ``"1d"``) or an integer-seconds value. ``None`` is
-        # preserved so the dataclass field can carry the documented
-        # "no TTL token" default.
+        path = (
+            Path(cache_path).expanduser()
+            if cache_path is not None
+            else user_cache_path("pagefetch") / "cache.sqlite3"
+        )
         session_duration_seconds: int | None
         if session_duration is None:
             session_duration_seconds = None
         elif isinstance(session_duration, str):
             session_duration_seconds = parse_duration(session_duration)
+        elif isinstance(session_duration, bool) or not isinstance(session_duration, int):
+            raise ValueError(
+                "session_duration must be a duration string ('30m', '2h', '1d'), "
+                "a positive integer (seconds), or None"
+            )
         else:
             session_duration_seconds = int(session_duration)
+
         return cls(
             mode=mode,
             proxy=proxy,
@@ -429,22 +360,22 @@ class PageFetchConfig:
             cache_enabled=cache_enabled,
             cache_ttl=ttl,
             cache_path=path,
-            http_timeout=float(http_timeout),
-            browser_timeout=float(browser_timeout),
+            http_timeout=http_timeout,
+            browser_timeout=browser_timeout,
             retries_http=retries_http,
             retries_browser=retries_browser,
             max_redirects=max_redirects,
             max_content_size=max_content_size,
-            confidence_threshold=float(confidence_threshold),
+            confidence_threshold=confidence_threshold,
             block_images=block_images,
             block_level=block_level,
-            accept_language=accept_language.strip(),
+            accept_language=accept_language,
             humanize=humanize,
             session_rotation=session_rotation,
             session_duration=session_duration_seconds,
-            request_pacing=float(request_pacing),
+            request_pacing=request_pacing,
             stealth_level=stealth_level,
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
-            browser_pre_check_byte_margin=float(browser_pre_check_byte_margin),
+            browser_pre_check_byte_margin=browser_pre_check_byte_margin,
         )

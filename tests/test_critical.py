@@ -1492,3 +1492,19 @@ def test_maximum_cleaning_preserves_links_and_images_for_page_graph():
     )
 
 
+def test_stealth_preset_and_cli_override_honors_block_images_default():
+    """Stealth levels balanced and max must default block_images to False unless overridden."""
+    client_preset = PageFetch(stealth_level="balanced")
+    assert client_preset.config.block_images is False
+    client_explicit = PageFetch(stealth_level="balanced", block_images=True)
+    assert client_explicit.config.block_images is True
+
+    args_preset = build_parser().parse_args(["https://example.com", "--stealth-level", "balanced"])
+    assert _build_config(args_preset).block_images is False
+    args_explicit = build_parser().parse_args(
+        ["https://example.com", "--stealth-level", "balanced", "--block-images"]
+    )
+    assert _build_config(args_explicit).block_images is True
+
+
+

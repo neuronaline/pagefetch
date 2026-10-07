@@ -55,6 +55,34 @@ class StructureNode:
     path: str = ""
     unique_selector: str = ""
 
+    def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {"tag": self.tag}
+        if self.selector:
+            payload["selector"] = self.selector
+        if self.path:
+            payload["path"] = self.path
+        if not compact and self.unique_selector:
+            payload["unique_selector"] = self.unique_selector
+        if self.attrs:
+            payload["attrs"] = self.attrs
+        if self.text:
+            payload["text"] = self.text
+        if self.children:
+            payload["children"] = [child.to_dict(compact=compact) for child in self.children]
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StructureNode:
+        return cls(
+            tag=data["tag"],
+            selector=data.get("selector", data.get("path", "")),
+            attrs=dict(data.get("attrs", {})),
+            text=data.get("text", ""),
+            children=[cls.from_dict(child) for child in data.get("children", [])],
+            path=data.get("path", ""),
+            unique_selector=data.get("unique_selector", data.get("path", "")),
+        )
+
 
 @dataclass(slots=True)
 class StylesheetInfo:
@@ -112,6 +140,21 @@ class InlineScript:
     type: str | None = None
 
 
+def _compact_inline(item: InlineStylesheet | InlineScript) -> dict[str, Any]:
+    """Return a compact ``{length, preview, truncated?}`` view of inline content.
+
+    ``preview`` is bounded to :data:`_COMPACT_INLINE_PREVIEW` chars so the JSON
+    payload stays predictable even for huge inline ``<script>`` blocks.
+    """
+    content = item.content
+    truncated = bool(getattr(item, "truncated", False)) or len(content) > _COMPACT_INLINE_PREVIEW
+    preview = content[:_COMPACT_INLINE_PREVIEW]
+    payload: dict[str, Any] = {"length": len(content), "preview": preview}
+    if truncated:
+        payload["truncated"] = True
+    return payload
+
+
 @dataclass(slots=True)
 class PageStructure:
     """Static structure summary of a fetched HTML page.
@@ -128,6 +171,71 @@ class PageStructure:
     truncated: bool
     node_count: int
     max_depth: int
+
+    def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
+        """Serialize a PageStructure, mapping ``async_`` back to ``async``."""
+        def script_to_dict(item: ScriptInfo) -> dict[str, Any]:
+            payload: dict[str, Any] = {"url": item.url}
+            if compact:
+                return payload
+            payload["type"] = item.type
+            payload["async"] = item.async_
+            payload["defer"] = item.defer
+            if item.integrity:
+                payload["integrity"] = item.integrity
+            if item.crossorigin:
+                payload["crossorigin"] = item.crossorigin
+            return payload
+
+        if compact:
+            stylesheets = [{"url": item.url} for item in self.stylesheets]
+            inline_styles = [_compact_inline(item) for item in self.inline_styles]
+            inline_scripts = [_compact_inline(item) for item in self.inline_scripts]
+        else:
+            stylesheets = [asdict(item) for item in self.stylesheets]
+            inline_styles = [asdict(item) for item in self.inline_styles]
+            inline_scripts = [asdict(item) for item in self.inline_scripts]
+
+        return {
+            "schema": _COMPACT_STRUCTURE_SCHEMA if compact else "pagefetch.structure.v1",
+            "root": self.root.to_dict(compact=compact) if self.root is not None else None,
+            "stylesheets": stylesheets,
+            "inline_styles": inline_styles,
+            "scripts": [script_to_dict(item) for item in self.scripts],
+            "inline_scripts": inline_scripts,
+            "truncated": self.truncated,
+            "node_count": self.node_count,
+            "max_depth": self.max_depth,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PageStructure:
+        """Inverse of the lossless structure representation."""
+        if data.get("schema") == _COMPACT_STRUCTURE_SCHEMA:
+            raise ValueError(
+                "compact structure payloads are inspection-only and cannot be reconstructed"
+            )
+
+        def script_from_dict(item: dict[str, Any]) -> ScriptInfo:
+            return ScriptInfo(
+                url=item["url"],
+                type=item.get("type"),
+                async_=bool(item.get("async", item.get("async_", False))),
+                defer=bool(item.get("defer", False)),
+                integrity=item.get("integrity"),
+                crossorigin=item.get("crossorigin"),
+            )
+
+        return cls(
+            root=StructureNode.from_dict(data["root"]) if data.get("root") is not None else None,
+            stylesheets=[StylesheetInfo(**item) for item in data.get("stylesheets", [])],
+            inline_styles=[InlineStylesheet(**item) for item in data.get("inline_styles", [])],
+            scripts=[script_from_dict(item) for item in data.get("scripts", [])],
+            inline_scripts=[InlineScript(**item) for item in data.get("inline_scripts", [])],
+            truncated=bool(data.get("truncated", False)),
+            node_count=int(data.get("node_count", 0)),
+            max_depth=int(data.get("max_depth", 0)),
+        )
 
 
 @dataclass(slots=True)
@@ -223,7 +331,7 @@ class FetchResult:
             elif field.name == "error" and value is not None:
                 output[field.name] = asdict(value)
             elif field.name == "structure" and value is not None:
-                output[field.name] = _structure_to_dict(value, compact=compact_structure)
+                output[field.name] = value.to_dict(compact=compact_structure)
             elif field.name == "screenshot" and value is not None:
                 output[field.name] = base64.b64encode(value).decode("ascii")
             else:
@@ -265,7 +373,7 @@ class FetchResult:
         error = values.get("error")
         values["error"] = FetchErrorInfo(**error) if error else None
         structure = values.get("structure")
-        values["structure"] = _structure_from_dict(structure) if structure else None
+        values["structure"] = PageStructure.from_dict(structure) if structure else None
         screenshot = values.get("screenshot")
         if isinstance(screenshot, str):
             try:
@@ -291,128 +399,10 @@ class FetchResult:
 
 
 def _structure_to_dict(value: PageStructure, *, compact: bool = False) -> dict[str, Any]:
-    """Serialize a PageStructure, mapping ``async_`` back to ``async``.
-
-    When ``compact=True`` the payload is trimmed for LLM/developer use: empty
-    fields are omitted, stylesheets and scripts keep only ``url``, and inline
-    ``<style>``/``<script>`` blocks expose ``{length, preview}`` instead of the
-    full content. The verbose selector triples (``selector``/``path``/
-    ``unique_selector``) are intentionally kept in compact mode because they
-    are the most developer-actionable parts of the tree; callers that want
-    the raw tree can ignore them.
-    """
-
-    def node_to_dict(node: StructureNode) -> dict[str, Any]:
-        payload: dict[str, Any] = {"tag": node.tag}
-        if node.selector:
-            payload["selector"] = node.selector
-        if node.path:
-            payload["path"] = node.path
-        # ``unique_selector`` is verbose-mode-only: callers that opted out of
-        # the LLM-friendly variant rely on the field being present even when
-        # it duplicates ``selector``. In compact mode the ``path`` already
-        # uniquely addresses the node.
-        if not compact and node.unique_selector:
-            payload["unique_selector"] = node.unique_selector
-        if node.attrs:
-            payload["attrs"] = node.attrs
-        if node.text:
-            payload["text"] = node.text
-        if node.children:
-            payload["children"] = [node_to_dict(child) for child in node.children]
-        return payload
-
-    def script_to_dict(item: ScriptInfo) -> dict[str, Any]:
-        payload: dict[str, Any] = {"url": item.url}
-        if compact:
-            return payload
-        payload["type"] = item.type
-        payload["async"] = item.async_
-        payload["defer"] = item.defer
-        if item.integrity:
-            payload["integrity"] = item.integrity
-        if item.crossorigin:
-            payload["crossorigin"] = item.crossorigin
-        return payload
-
-    if compact:
-        stylesheets = [{"url": item.url} for item in value.stylesheets]
-        inline_styles = [_compact_inline(item) for item in value.inline_styles]
-        inline_scripts = [_compact_inline(item) for item in value.inline_scripts]
-    else:
-        stylesheets = [asdict(item) for item in value.stylesheets]
-        inline_styles = [asdict(item) for item in value.inline_styles]
-        inline_scripts = [asdict(item) for item in value.inline_scripts]
-
-    return {
-        "schema": _COMPACT_STRUCTURE_SCHEMA if compact else "pagefetch.structure.v1",
-        "root": node_to_dict(value.root) if value.root is not None else None,
-        "stylesheets": stylesheets,
-        "inline_styles": inline_styles,
-        "scripts": [script_to_dict(item) for item in value.scripts],
-        "inline_scripts": inline_scripts,
-        "truncated": value.truncated,
-        "node_count": value.node_count,
-        "max_depth": value.max_depth,
-    }
-
-
-def _compact_inline(item: InlineStylesheet | InlineScript) -> dict[str, Any]:
-    """Return a compact ``{length, preview, truncated?}`` view of inline content.
-
-    ``preview`` is bounded to :data:`_COMPACT_INLINE_PREVIEW` chars so the JSON
-    payload stays predictable even for huge inline ``<script>`` blocks.
-    """
-    content = item.content
-    truncated = bool(getattr(item, "truncated", False)) or len(content) > _COMPACT_INLINE_PREVIEW
-    preview = content[:_COMPACT_INLINE_PREVIEW]
-    payload: dict[str, Any] = {"length": len(content), "preview": preview}
-    if truncated:
-        payload["truncated"] = True
-    return payload
+    """Serialize a PageStructure, mapping ``async_`` back to ``async``."""
+    return value.to_dict(compact=compact)
 
 
 def _structure_from_dict(data: dict[str, Any]) -> PageStructure:
-    """Inverse of the lossless structure representation.
-
-    Compact structures carry the ``pagefetch.structure.compact.v1`` schema
-    marker and contain previews instead of inline source content; reconstructing
-    them would silently manufacture incomplete source. They are intentionally
-    inspection-only and must not enter cache deserialization.
-    """
-    if data.get("schema") == _COMPACT_STRUCTURE_SCHEMA:
-        raise ValueError(
-            "compact structure payloads are inspection-only and cannot be reconstructed"
-        )
-
-    def node_from_dict(item: dict[str, Any]) -> StructureNode:
-        return StructureNode(
-            tag=item["tag"],
-            selector=item.get("selector", item.get("path", "")),
-            attrs=dict(item.get("attrs", {})),
-            text=item.get("text", ""),
-            children=[node_from_dict(child) for child in item.get("children", [])],
-            path=item.get("path", ""),
-            unique_selector=item.get("unique_selector", item.get("path", "")),
-        )
-
-    def script_from_dict(item: dict[str, Any]) -> ScriptInfo:
-        return ScriptInfo(
-            url=item["url"],
-            type=item.get("type"),
-            async_=bool(item.get("async", False)),
-            defer=bool(item.get("defer", False)),
-            integrity=item.get("integrity"),
-            crossorigin=item.get("crossorigin"),
-        )
-
-    return PageStructure(
-        root=node_from_dict(data["root"]) if data.get("root") is not None else None,
-        stylesheets=[StylesheetInfo(**item) for item in data.get("stylesheets", [])],
-        inline_styles=[InlineStylesheet(**item) for item in data.get("inline_styles", [])],
-        scripts=[script_from_dict(item) for item in data.get("scripts", [])],
-        inline_scripts=[InlineScript(**item) for item in data.get("inline_scripts", [])],
-        truncated=bool(data.get("truncated", False)),
-        node_count=int(data.get("node_count", 0)),
-        max_depth=int(data.get("max_depth", 0)),
-    )
+    """Inverse of the lossless structure representation."""
+    return PageStructure.from_dict(data)

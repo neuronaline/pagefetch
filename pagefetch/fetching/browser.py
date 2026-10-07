@@ -124,6 +124,56 @@ class BrowserFetcher:
             return "linux"
         return None
 
+    def _build_camoufox_options(self, host_os: str | None, use_xvfb: bool) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "headless": not use_xvfb,
+            "humanize": self.humanize,
+            "enable_cache": True,
+            "block_webrtc": True,
+            "locale": "en-US",
+            "window": random.choice(_VIEWPORT_POOL),
+        }
+        if self.block_images:
+            options["block_images"] = True
+            # Suppress the Camoufox LeakWarning that fires when
+            # ``block_images`` is enabled.  The warning exists
+            # because image blocking creates CSS/Canvas/WebGL
+            # inconsistencies that bot-detection scripts look for;
+            # in ``off`` stealth mode this is acceptable, and the
+            # operator has explicitly opted in by setting
+            # ``block_images=True``.  The ``balanced``/``max``
+            # stealth presets default to ``False`` to keep
+            # browser fingerprints coherent — see
+            # ``config.build()``.
+            options["i_know_what_im_doing"] = True
+        if host_os is not None:
+            options["os"] = host_os
+        # Proxy is configured per-context in _fetch_page_once rather
+        # than browser-wide, ensuring clean per-request session isolation.
+        # Firefox user prefs for fetch-oriented performance.
+        # Disable cosmetic animations to reduce GPU/CPU overhead;
+        # keep disk and memory cache on for repeat visits.
+        options["firefox_user_prefs"] = {
+            "browser.cache.disk.enable": True,
+            "browser.cache.memory.enable": True,
+            "toolkit.cosmeticAnimations.enabled": False,
+        }
+        browser_env = dict(os.environ)
+        if use_xvfb and self._xvfb is not None:
+            browser_env["DISPLAY"] = self._xvfb.display
+            browser_env.pop("WAYLAND_DISPLAY", None)
+            browser_env.pop("X_PRIVILEGED_WAYLAND_SOCKET", None)
+            browser_env["GDK_BACKEND"] = "x11"
+            browser_env["MOZ_ENABLE_WAYLAND"] = "0"
+            options["virtual_display"] = self._xvfb.display
+        # ``options["env"]`` is a per-subprocess dict handed to the
+        # Camoufox/Playwright launch path, so the caller's
+        # ``os.environ`` is never mutated and no global launch lock
+        # is required to keep concurrent launches from racing on
+        # ``DISPLAY``.
+        options["env"] = browser_env
+        return options
+
     async def start(self) -> None:
         if self._browser is not None:
             return
@@ -195,57 +245,12 @@ class BrowserFetcher:
                             ) from exc
                         self._xvfb = xvfb
 
-                options: dict[str, Any] = {
-                    "headless": not use_xvfb,
-                    "humanize": self.humanize,
-                    "enable_cache": True,
-                    "block_webrtc": True,
-                    "locale": "en-US",
-                    "window": random.choice(_VIEWPORT_POOL),
-                }
-                if self.block_images:
-                    options["block_images"] = True
-                    # Suppress the Camoufox LeakWarning that fires when
-                    # ``block_images`` is enabled.  The warning exists
-                    # because image blocking creates CSS/Canvas/WebGL
-                    # inconsistencies that bot-detection scripts look for;
-                    # in ``off`` stealth mode this is acceptable, and the
-                    # operator has explicitly opted in by setting
-                    # ``block_images=True``.  The ``balanced``/``max``
-                    # stealth presets default to ``False`` to keep
-                    # browser fingerprints coherent — see
-                    # ``config.build()``.
-                    options["i_know_what_im_doing"] = True
-                if host_os is not None:
-                    options["os"] = host_os
-                # Proxy is configured per-context in _fetch_page_once rather
-                # than browser-wide, ensuring clean per-request session isolation.
-                # Firefox user prefs for fetch-oriented performance.
-                # Disable cosmetic animations to reduce GPU/CPU overhead;
-                # keep disk and memory cache on for repeat visits.
-                options["firefox_user_prefs"] = {
-                    "browser.cache.disk.enable": True,
-                    "browser.cache.memory.enable": True,
-                    "toolkit.cosmeticAnimations.enabled": False,
-                }
-                browser_env = dict(os.environ)
-                if use_xvfb:
-                    browser_env["DISPLAY"] = self._xvfb.display
-                    browser_env.pop("WAYLAND_DISPLAY", None)
-                    browser_env.pop("X_PRIVILEGED_WAYLAND_SOCKET", None)
-                    browser_env["GDK_BACKEND"] = "x11"
-                    browser_env["MOZ_ENABLE_WAYLAND"] = "0"
-                    options["virtual_display"] = self._xvfb.display
-                # ``options["env"]`` is a per-subprocess dict handed to the
-                # Camoufox/Playwright launch path, so the caller's
-                # ``os.environ`` is never mutated and no global launch lock
-                # is required to keep concurrent launches from racing on
-                # ``DISPLAY``.
-                options["env"] = browser_env
+                options = self._build_camoufox_options(host_os, use_xvfb)
                 self._manager = AsyncCamoufox(**options)
                 self._browser = await self._manager.__aenter__()
             except TransportFailure:
                 raise
+
             except Exception as exc:
                 if self._manager is not None:
                     try:
@@ -405,6 +410,155 @@ class BrowserFetcher:
                             pass
                         self._manager = None
 
+    async def _setup_interception(self, page: Any, target_url: str) -> dict[str, Any]:
+        network = {"active": 0, "last_activity": time.monotonic()}
+
+        def request_started(_request: Any) -> None:
+            network["active"] += 1
+            network["last_activity"] = time.monotonic()
+
+        def request_finished(_request: Any) -> None:
+            network["active"] = max(0, network["active"] - 1)
+            network["last_activity"] = time.monotonic()
+
+        page.on("request", request_started)
+        page.on("requestfinished", request_finished)
+        page.on("requestfailed", request_finished)
+
+        # Pre-compute the registrable host once so route_handler avoids
+        # the expensive tldextract call on every document-frame request.
+        _main_site = registrable_host(target_url)
+
+        async def route_handler(route: Any) -> None:
+            request = route.request
+            request_url = request.url
+            req_host = ""
+            if request_url.startswith(("http://", "https://", "ws://", "wss://")):
+                req_host = (urlsplit(request_url).hostname or "").lower()
+                if not is_safe_host(req_host):
+                    await route.abort()
+                    return
+
+            is_challenge_host = any(
+                req_host == d or req_host.endswith("." + d)
+                for d in _CHALLENGE_DOMAINS
+            )
+
+            external_frame = False
+            if request.resource_type == "document" and request.frame != page.main_frame:
+                if request_url.startswith(("http://", "https://")) and not is_challenge_host:
+                    external_frame = registrable_host(request_url) != _main_site
+
+            # Block non-essential resource types according to the
+            # configured block_level.  Image blocking via the route
+            # handler is defense-in-depth when Camoufox `block_images`
+            # is set; `ping`/`beacon` are pure overhead for content
+            # extraction.
+            blocked = BLOCK_LEVEL_SETS.get(
+                self.block_level, BLOCK_LEVEL_SETS["aggressive"]
+            )
+            if not self.block_images:
+                blocked = blocked - {"image"}
+
+            # Never block WebSockets or scripts essential for challenge verification
+            if is_challenge_host and request.resource_type in {"websocket", "script", "xhr", "fetch"}:
+                is_blocked_type = False
+            else:
+                is_blocked_type = request.resource_type in blocked
+
+            # Also block cross-site scripts, XHR, and fetch requests
+            # initiated inside child frames (unless it's an anti-bot challenge host).
+            external_script = False
+            _main_frame = getattr(page, "main_frame", None)
+            if request.resource_type in {"script", "xhr", "fetch"} and _main_frame is not None:
+                if getattr(request, "frame", None) != _main_frame and not is_challenge_host:
+                    if request_url.startswith(("http://", "https://")):
+                        external_script = registrable_host(request_url) != _main_site
+
+            if is_blocked_type or external_frame or external_script:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", route_handler)
+        return network
+
+    async def _ensure_page_readiness(
+        self,
+        page: Any,
+        network: dict[str, Any],
+        max_scrolls: int,
+        scroll_sleep_early: float,
+        scroll_sleep_late: float,
+        warnings: list[str],
+    ) -> bool:
+        # ── first stability wait (shorter cap) ──
+        first_stability_timeout = min(2.5, self.timeout / 4)
+        await wait_for_stability(
+            page,
+            timeout=first_stability_timeout,
+            network_activity=lambda: (network["active"], network["last_activity"]),
+        )
+
+        # ── early-exit probe ──
+        probe = await in_page_metrics(page)
+        skip_scroll = (
+            not probe["challenge"]
+            and (
+                probe["text"] >= 800
+                or probe["main_text"] >= 300
+            )
+        )
+
+        if skip_scroll:
+            # Page already has good content — skip scrolling.
+            await page.evaluate("() => window.scrollTo(0, 0)")
+        else:
+            limit_reached = await controlled_scroll(
+                page,
+                max_scrolls=max_scrolls,
+                sleep_early=scroll_sleep_early,
+                sleep_late=scroll_sleep_late,
+            )
+            await wait_for_stability(
+                page,
+                timeout=min(3.0, self.timeout / 4),
+                stable_rounds=2,
+                network_activity=lambda: (network["active"], network["last_activity"]),
+            )
+            if limit_reached:
+                warnings.append("Maximum controlled-scroll limit was reached.")
+
+        return skip_scroll
+
+    async def _capture_screenshot(
+        self,
+        page: Any,
+        screenshot: str,
+        screenshot_format: str,
+        screenshot_max_bytes: int,
+        warnings: list[str],
+    ) -> tuple[bytes | None, str | None]:
+        if screenshot == "none":
+            return None, None
+        try:
+            full_page = screenshot == "full"
+            # Playwright's type argument is "png" / "jpeg".
+            screenshot_bytes = await page.screenshot(
+                full_page=full_page,
+                type=screenshot_format,
+            )
+            if len(screenshot_bytes) > screenshot_max_bytes:
+                warnings.append("Screenshot exceeded max size; discarded.")
+                return None, None
+            return screenshot_bytes, screenshot_format
+        except Exception as exc:
+            logger.warning(
+                "screenshot capture failed: %s", exc, exc_info=True
+            )
+            warnings.append("Screenshot capture failed; continuing without it.")
+            return None, None
+
     async def _fetch_page_once(
         self,
         url: str,
@@ -440,118 +594,22 @@ class BrowserFetcher:
                     context_kwargs["proxy"] = browser_proxy
                 context = await self._browser.new_context(**context_kwargs)
                 page = await context.new_page()
-                network = {"active": 0, "last_activity": time.monotonic()}
 
-                def request_started(_request: Any) -> None:
-                    network["active"] += 1
-                    network["last_activity"] = time.monotonic()
-
-                def request_finished(_request: Any) -> None:
-                    network["active"] = max(0, network["active"] - 1)
-                    network["last_activity"] = time.monotonic()
-
-                page.on("request", request_started)
-                page.on("requestfinished", request_finished)
-                page.on("requestfailed", request_finished)
-
-                # Pre-compute the registrable host once so route_handler avoids
-                # the expensive tldextract call on every document-frame request.
-                _main_site = registrable_host(url)
-
-                async def route_handler(route: Any) -> None:
-                    request = route.request
-                    request_url = request.url
-                    req_host = ""
-                    if request_url.startswith(("http://", "https://", "ws://", "wss://")):
-                        req_host = (urlsplit(request_url).hostname or "").lower()
-                        if not is_safe_host(req_host):
-                            await route.abort()
-                            return
-
-                    is_challenge_host = any(
-                        req_host == d or req_host.endswith("." + d)
-                        for d in _CHALLENGE_DOMAINS
-                    )
-
-                    external_frame = False
-                    if request.resource_type == "document" and request.frame != page.main_frame:
-                        if request_url.startswith(("http://", "https://")) and not is_challenge_host:
-                            external_frame = registrable_host(request_url) != _main_site
-
-                    # Block non-essential resource types according to the
-                    # configured block_level.  Image blocking via the route
-                    # handler is defense-in-depth when Camoufox `block_images`
-                    # is set; `ping`/`beacon` are pure overhead for content
-                    # extraction.
-                    blocked = BLOCK_LEVEL_SETS.get(
-                        self.block_level, BLOCK_LEVEL_SETS["aggressive"]
-                    )
-                    if not self.block_images:
-                        blocked = blocked - {"image"}
-
-                    # Never block WebSockets or scripts essential for challenge verification
-                    if is_challenge_host and request.resource_type in {"websocket", "script", "xhr", "fetch"}:
-                        is_blocked_type = False
-                    else:
-                        is_blocked_type = request.resource_type in blocked
-
-                    # Also block cross-site scripts, XHR, and fetch requests
-                    # initiated inside child frames (unless it's an anti-bot challenge host).
-                    external_script = False
-                    _main_frame = getattr(page, "main_frame", None)
-                    if request.resource_type in {"script", "xhr", "fetch"} and _main_frame is not None:
-                        if getattr(request, "frame", None) != _main_frame and not is_challenge_host:
-                            if request_url.startswith(("http://", "https://")):
-                                external_script = registrable_host(request_url) != _main_site
-
-                    if is_blocked_type or external_frame or external_script:
-                        await route.abort()
-                    else:
-                        await route.continue_()
-
-                await page.route("**/*", route_handler)
+                network = await self._setup_interception(page, url)
                 response = await page.goto(
                     url,
                     wait_until="domcontentloaded",
                     timeout=int(self.timeout * 1000),
                 )
 
-                # ── first stability wait (shorter cap) ──
-                first_stability_timeout = min(2.5, self.timeout / 4)
-                await wait_for_stability(
+                skip_scroll = await self._ensure_page_readiness(
                     page,
-                    timeout=first_stability_timeout,
-                    network_activity=lambda: (network["active"], network["last_activity"]),
+                    network,
+                    max_scrolls=max_scrolls,
+                    scroll_sleep_early=scroll_sleep_early,
+                    scroll_sleep_late=scroll_sleep_late,
+                    warnings=warnings,
                 )
-
-                # ── early-exit probe ──
-                probe = await in_page_metrics(page)
-                skip_scroll = (
-                    not probe["challenge"]
-                    and (
-                        probe["text"] >= 800
-                        or probe["main_text"] >= 300
-                    )
-                )
-
-                if skip_scroll:
-                    # Page already has good content — skip scrolling.
-                    await page.evaluate("() => window.scrollTo(0, 0)")
-                else:
-                    limit_reached = await controlled_scroll(
-                        page,
-                        max_scrolls=max_scrolls,
-                        sleep_early=scroll_sleep_early,
-                        sleep_late=scroll_sleep_late,
-                    )
-                    await wait_for_stability(
-                        page,
-                        timeout=min(3.0, self.timeout / 4),
-                        stable_rounds=2,
-                        network_activity=lambda: (network["active"], network["last_activity"]),
-                    )
-                    if limit_reached:
-                        warnings.append("Maximum controlled-scroll limit was reached.")
 
                 # Fast size pre-check — character length is enough as a soft
                 # guard; avoids the cost of a TextEncoder byte-length encode.
@@ -581,7 +639,9 @@ class BrowserFetcher:
                     # Only merge iframes when the main document is weak.
                     html = await self._include_same_site_frames(page, html, page.url or url, warnings)
                 else:
-                    warnings.append("Same-domain iframe content was skipped because the main document is already content-rich.")
+                    warnings.append(
+                        "Same-domain iframe content was skipped because the main document is already content-rich."
+                    )
 
                 if len(html.encode("utf-8")) > self.max_content_size:
                     raise TransportFailure(
@@ -592,30 +652,13 @@ class BrowserFetcher:
                         )
                     )
 
-                # ── optional screenshot capture ──
-                screenshot_bytes: bytes | None = None
-                screenshot_ext: str | None = None
-                if screenshot != "none":
-                    try:
-                        full_page = screenshot == "full"
-                        # Playwright's type argument is "png" / "jpeg".
-                        screenshot_bytes = await page.screenshot(
-                            full_page=full_page,
-                            type=screenshot_format,
-                        )
-                        if len(screenshot_bytes) > screenshot_max_bytes:
-                            warnings.append("Screenshot exceeded max size; discarded.")
-                            screenshot_bytes = None
-                            screenshot_ext = None
-                        else:
-                            screenshot_ext = screenshot_format
-                    except Exception as exc:
-                        logger.warning(
-                            "screenshot capture failed: %s", exc, exc_info=True
-                        )
-                        warnings.append("Screenshot capture failed; continuing without it.")
-                        screenshot_bytes = None
-                        screenshot_ext = None
+                screenshot_bytes, screenshot_ext = await self._capture_screenshot(
+                    page,
+                    screenshot=screenshot,
+                    screenshot_format=screenshot_format,
+                    screenshot_max_bytes=screenshot_max_bytes,
+                    warnings=warnings,
+                )
 
                 return BrowserResponse(
                     url=page.url,
@@ -626,6 +669,7 @@ class BrowserFetcher:
                     screenshot=screenshot_bytes,
                     screenshot_format=screenshot_ext,
                 )
+
         except TransportFailure:
             raise
         except TimeoutError as exc:

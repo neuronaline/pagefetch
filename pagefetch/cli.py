@@ -21,6 +21,7 @@ from .config import (
     VALID_SCREENSHOT_MODES,
     VALID_SESSION_ROTATION,
     VALID_STEALTH_LEVELS,
+    _UNSET,
     PageFetchConfig,
 )
 from .models import FetchResult
@@ -158,113 +159,42 @@ parse_input_urls = _inputs
 
 
 
-def _render(
-    results: list[FetchResult],
-    output_format: str,
-    include_html: bool,
-    include_structure: bool = False,
-    compact_structure: bool = False,
-    include_screenshot: bool = False,
-) -> str:
-    return render_results(
-        results,
-        output_format,
-        include_html=include_html,
-        include_structure=include_structure,
-        compact_structure=compact_structure,
-        include_screenshot=include_screenshot,
-    )
-
-
 def _build_config(args: argparse.Namespace) -> PageFetchConfig:
     """Build configuration from YAML file (if provided) with CLI overrides."""
-    # Start from YAML if --config is given, otherwise use built-in defaults
-    if args.config:
-        config = PageFetchConfig.from_yaml(args.config)
-    else:
-        config = PageFetchConfig()
+    config = (
+        PageFetchConfig.from_yaml(args.config)
+        if getattr(args, "config", None)
+        else PageFetchConfig()
+    )
 
-    # CLI overrides — only apply when the user explicitly set the argument
-    overrides: dict[str, object] = {}
-    if hasattr(args, "mode"):
-        overrides["mode"] = args.mode
-    if hasattr(args, "proxy"):
-        overrides["proxy"] = args.proxy
-    if hasattr(args, "cache_ttl"):
-        overrides["cache_ttl"] = args.cache_ttl
-    if hasattr(args, "http_concurrency"):
-        overrides["http_concurrency"] = args.http_concurrency
-    if hasattr(args, "browser_concurrency"):
-        overrides["browser_concurrency"] = args.browser_concurrency
-    if hasattr(args, "timeout"):
-        overrides["http_timeout"] = args.timeout
-    if hasattr(args, "browser_timeout"):
-        overrides["browser_timeout"] = args.browser_timeout
-    if hasattr(args, "block_images"):
-        overrides["block_images"] = args.block_images
-    if hasattr(args, "block_level"):
-        overrides["block_level"] = args.block_level
-    if hasattr(args, "accept_language"):
-        overrides["accept_language"] = args.accept_language
-    if hasattr(args, "humanize"):
-        overrides["humanize"] = args.humanize
-    if hasattr(args, "session_rotation"):
-        overrides["session_rotation"] = args.session_rotation
-    if hasattr(args, "session_duration"):
-        overrides["session_duration"] = args.session_duration
-    if hasattr(args, "request_pacing"):
-        overrides["request_pacing"] = args.request_pacing
-    if hasattr(args, "stealth_level"):
-        overrides["stealth_level"] = args.stealth_level
-    if hasattr(args, "cleaning_level"):
-        overrides["cleaning_level"] = args.cleaning_level
+    known_fields = set(PageFetchConfig.__dataclass_fields__.keys())
+    cli_overrides = {
+        k: v for k, v in vars(args).items()
+        if k in known_fields and v is not None
+    }
+    if getattr(args, "timeout", None) is not None:
+        cli_overrides["http_timeout"] = args.timeout
+    if getattr(args, "no_cache", False):
+        cli_overrides["cache_enabled"] = False
 
-    if not overrides and not args.no_cache:
+    if not cli_overrides:
         return config
 
-    preset_override = "stealth_level" in overrides
+    preset_override = "stealth_level" in cli_overrides
+    preset_fields = {"block_level", "humanize", "session_rotation", "request_pacing"}
 
-    # Rebuild with overrides applied
-    return PageFetchConfig.build(
-        mode=str(overrides.get("mode", config.mode)),
-        proxy=str(overrides.get("proxy", config.proxy)),
-        http_concurrency=int(overrides.get("http_concurrency", config.http_concurrency)),
-        browser_concurrency=int(overrides.get("browser_concurrency", config.browser_concurrency)),
-        cache_enabled=not args.no_cache if args.no_cache else config.cache_enabled,
-        cache_ttl=overrides.get("cache_ttl", config.cache_ttl),
-        cache_path=config.cache_path,
-        http_timeout=float(overrides.get("http_timeout", config.http_timeout)),
-        browser_timeout=float(overrides.get("browser_timeout", config.browser_timeout)),
-        retries_http=config.retries_http,
-        retries_browser=config.retries_browser,
-        max_redirects=config.max_redirects,
-        max_content_size=config.max_content_size,
-        confidence_threshold=config.confidence_threshold,
-        block_images=bool(overrides.get("block_images", config.block_images)),
-        block_level=overrides.get(
-            "block_level",
-            None if preset_override else config.block_level,
-        ),
-        accept_language=overrides.get("accept_language", config.accept_language),
-        humanize=overrides.get(
-            "humanize",
-            None if preset_override else config.humanize,
-        ),
-        session_rotation=overrides.get(
-            "session_rotation",
-            None if preset_override else config.session_rotation,
-        ),
-        session_duration=overrides.get("session_duration", config.session_duration),
-        request_pacing=overrides.get(
-            "request_pacing",
-            None if preset_override else config.request_pacing,
-        ),
-        stealth_level=overrides.get("stealth_level", config.stealth_level),
-        cleaning_level=overrides.get("cleaning_level", config.cleaning_level),
-        raise_on_error=config.raise_on_error,
-        screenshot_max_bytes=config.screenshot_max_bytes,
-        browser_pre_check_byte_margin=config.browser_pre_check_byte_margin,
-    )
+    kwargs: dict[str, object] = {}
+    for field in known_fields:
+        if field in cli_overrides:
+            kwargs[field] = cli_overrides[field]
+        elif preset_override and field in preset_fields:
+            kwargs[field] = None
+        elif preset_override and field == "block_images":
+            kwargs[field] = _UNSET
+        else:
+            kwargs[field] = getattr(config, field)
+
+    return PageFetchConfig.build(**kwargs)
 
 
 async def run_batch(
@@ -328,10 +258,10 @@ async def run_batch(
                 )
         else:
             results = await client.fetch_many(urls)
-    rendered = _render(
+    rendered = render_results(
         results,
         output_format,
-        include_html,
+        include_html=include_html,
         include_structure=extract_structure,
         include_screenshot=include_screenshot,
     )
