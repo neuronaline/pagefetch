@@ -15,6 +15,9 @@ from .detector import ConfidenceReport
 from .html import process_html
 from .non_html import (
     MissingOptionalDependency,
+    process_csv,
+    process_docx,
+    process_json,
     process_pdf,
     process_text,
     process_xml,
@@ -36,16 +39,53 @@ def parse_content_type(header: str | None) -> str:
     return (header or "application/octet-stream").split(";", 1)[0].strip().lower()
 
 
-def is_pdf_content(content_type: str, content: bytes) -> bool:
-    """Check if content represents a PDF file by content-type or magic bytes."""
-    return content_type == "application/pdf" or content.startswith(b"%PDF-")
+def is_pdf_content(content_type: str, content: bytes, url: str | None = None) -> bool:
+    """Check if content represents a PDF file by content-type, magic bytes, or URL."""
+    if content_type == "application/pdf" or content.startswith(b"%PDF-"):
+        return True
+    return bool(url and url.lower().split("?", 1)[0].endswith(".pdf"))
 
 
-def is_xml_content(content_type: str) -> bool:
+def is_docx_content(content_type: str, content: bytes, url: str | None = None) -> bool:
+    """Check if content represents a DOCX file by content-type, magic bytes, or URL."""
+    if content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        return True
+    if url and url.lower().split("?", 1)[0].endswith(".docx"):
+        return True
+    return bool(
+        content.startswith(b"PK\x03\x04")
+        and (b"word/document.xml" in content[:65536] or b"word/" in content[:65536])
+    )
+
+
+def is_csv_content(content_type: str, url: str | None = None) -> bool:
+    """Check if content represents CSV data."""
+    if content_type in ("text/csv", "application/csv"):
+        return True
+    return bool(url and url.lower().split("?", 1)[0].endswith(".csv"))
+
+
+def is_tsv_content(content_type: str, url: str | None = None) -> bool:
+    """Check if content represents TSV data."""
+    if content_type in ("text/tab-separated-values", "text/tsv"):
+        return True
+    return bool(url and url.lower().split("?", 1)[0].endswith(".tsv"))
+
+
+def is_json_content(content_type: str, url: str | None = None) -> bool:
+    """Check if content represents JSON data."""
+    if content_type in ("application/json", "text/json") or content_type.endswith("+json"):
+        return True
+    return bool(url and url.lower().split("?", 1)[0].endswith(".json"))
+
+
+def is_xml_content(content_type: str, url: str | None = None) -> bool:
     """Check if content represents generic XML."""
     if content_type in ("application/xml", "text/xml"):
         return True
-    return "+xml" in content_type and content_type != "application/xhtml+xml"
+    if "+xml" in content_type and content_type != "application/xhtml+xml":
+        return True
+    return bool(url and url.lower().split("?", 1)[0].endswith(".xml"))
 
 
 def is_html_like(content_type: str) -> bool:
@@ -74,16 +114,23 @@ def looks_like_html(content: bytes) -> bool:
     )
 
 
-def detect_document_kind(content_type: str, content: bytes) -> str:
-    """Detect high-level document kind from content type and byte sniff."""
-    if is_pdf_content(content_type, content):
+def detect_document_kind(content_type: str, content: bytes, url: str | None = None) -> str:
+    """Detect high-level document kind from content type, byte sniff, and URL."""
+    if is_pdf_content(content_type, content, url=url):
         return "pdf"
-    if is_xml_content(content_type):
+    if is_docx_content(content_type, content, url=url):
+        return "docx"
+    if is_csv_content(content_type, url=url):
+        return "csv"
+    if is_tsv_content(content_type, url=url):
+        return "tsv"
+    if is_json_content(content_type, url=url):
+        return "json"
+    if is_xml_content(content_type, url=url):
         return "xml"
     if (
         content_type.startswith("text/plain")
-        or content_type == "application/json"
-        or content_type.endswith("+json")
+        or (url and url.lower().split("?", 1)[0].endswith((".txt", ".md")))
     ):
         return "text"
     if is_html_like(content_type) or looks_like_html(content):
@@ -212,6 +259,70 @@ def build_pdf_result(url: str, response: HTTPResponse, proxy: str) -> FetchResul
             )
         ) from exc
     return build_document_result(url, response, proxy, doc, "pdf", "application/pdf")
+
+
+def build_docx_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+    """Process a DOCX response and construct a FetchResult."""
+    try:
+        doc = process_docx(response.content)
+    except Exception as exc:
+        raise TransportFailure(
+            FetchErrorInfo(
+                "docx_parse_error",
+                f"DOCX could not be parsed: {exc}",
+                False,
+                type(exc).__name__,
+            )
+        ) from exc
+    return build_document_result(
+        url,
+        response,
+        proxy,
+        doc,
+        "docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+def build_csv_result(
+    url: str,
+    response: HTTPResponse,
+    proxy: str,
+    delimiter: str | None = None,
+) -> FetchResult:
+    """Process a CSV or TSV response and construct a FetchResult."""
+    try:
+        doc = process_csv(response.content, encoding=response.encoding, delimiter=delimiter)
+    except Exception as exc:
+        raise TransportFailure(
+            FetchErrorInfo(
+                "csv_parse_error",
+                f"CSV could not be parsed: {exc}",
+                False,
+                type(exc).__name__,
+            )
+        ) from exc
+    return build_document_result(
+        url,
+        response,
+        proxy,
+        doc,
+        "csv",
+        parse_content_type(response.headers.get("Content-Type")),
+    )
+
+
+def build_json_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+    """Process a JSON response and construct a FetchResult."""
+    doc = process_json(response.content, encoding=response.encoding)
+    return build_document_result(
+        url,
+        response,
+        proxy,
+        doc,
+        "json",
+        parse_content_type(response.headers.get("Content-Type")),
+    )
 
 
 def build_xml_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:

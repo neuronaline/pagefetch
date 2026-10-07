@@ -7,7 +7,16 @@ from .images import extract_images
 from .links import extract_links
 from .markdown import MarkdownConverter, html_to_markdown
 from .metadata import extract_metadata
-from .non_html import ProcessedDocument, process_pdf, process_text, process_xml
+from .non_html import (
+    ProcessedDocument,
+    extract_document,
+    process_csv,
+    process_docx,
+    process_json,
+    process_pdf,
+    process_text,
+    process_xml,
+)
 from .structure import StructureLimits, extract_structure
 
 __all__ = [
@@ -18,12 +27,16 @@ __all__ = [
     "StructureLimits",
     "analyze_html",
     "clean_html",
+    "extract_document",
     "extract_images",
     "extract_links",
     "extract_metadata",
     "extract_structure",
     "html_to_markdown",
+    "process_csv",
+    "process_docx",
     "process_html",
+    "process_json",
     "process_pdf",
     "process_text",
     "process_xml",

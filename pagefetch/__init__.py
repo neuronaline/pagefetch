@@ -43,7 +43,7 @@ from .models import (
     StructureNode,
     StylesheetInfo,
 )
-from .processing import StructureLimits, extract_structure
+from .processing import StructureLimits, extract_document, extract_structure
 from .proxy.providers import ProxyConfigurationError
 
 # Attach a NullHandler so library consumers that do not configure logging
@@ -65,7 +65,7 @@ except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
     # Mirrors the version declared in ``pyproject.toml`` so that
     # ``pagefetch.__version__`` is usable before the distribution metadata
     # is installed (editable checkouts, sdists).
-    __version__ = "0.9.4"
+    __version__ = "0.9.5"
 
 __all__ = [
     "FetchErrorInfo",
@@ -92,5 +92,6 @@ __all__ = [
     "VALID_STEALTH_LEVELS",
     "auto_bootstrap_browser",
     "ensure_runtime_requirements",
+    "extract_document",
     "extract_structure",
 ]

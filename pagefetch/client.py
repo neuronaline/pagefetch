@@ -31,8 +31,11 @@ from .fetching import BrowserFetcher, HTTPFetcher, HTTPResponse, TransportFailur
 from .models import FetchErrorInfo, FetchResult
 from .processing.detector import ConfidenceReport, analyze_html
 from .processing.pipeline import (
+    build_csv_result,
     build_document_result,
+    build_docx_result,
     build_html_result,
+    build_json_result,
     build_pdf_result,
     build_text_result,
     build_xml_result,
@@ -794,9 +797,17 @@ class PageFetch:
             )
 
         content_type = self._content_type(response.headers.get("Content-Type"))
-        kind = detect_document_kind(content_type, response.content)
+        kind = detect_document_kind(content_type, response.content, url=url)
         if kind == "pdf":
             return self._result_from_pdf(url, response, proxy)
+        if kind == "docx":
+            return self._result_from_docx(url, response, proxy)
+        if kind in ("csv", "tsv"):
+            return self._result_from_csv(
+                url, response, proxy, delimiter="\t" if kind == "tsv" else None
+            )
+        if kind == "json":
+            return self._result_from_json(url, response, proxy)
         if kind == "xml":
             return self._result_from_xml(url, response, proxy)
         if kind == "text":
@@ -1145,6 +1156,21 @@ class PageFetch:
 
     def _result_from_pdf(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
         return build_pdf_result(url, response, proxy)
+
+    def _result_from_docx(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+        return build_docx_result(url, response, proxy)
+
+    def _result_from_csv(
+        self,
+        url: str,
+        response: HTTPResponse,
+        proxy: str,
+        delimiter: str | None = None,
+    ) -> FetchResult:
+        return build_csv_result(url, response, proxy, delimiter=delimiter)
+
+    def _result_from_json(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+        return build_json_result(url, response, proxy)
 
     def _result_from_xml(self, url: str, response: HTTPResponse, proxy: str) -> FetchResult:
         return build_xml_result(url, response, proxy)

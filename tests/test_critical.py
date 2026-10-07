@@ -1507,4 +1507,217 @@ def test_stealth_preset_and_cli_override_honors_block_images_default():
     assert _build_config(args_explicit).block_images is True
 
 
+def test_csv_extraction_to_markdown_table():
+    """CSV extraction must convert rows to GFM tables, escape pipes, and handle delimiters."""
+    from pagefetch.processing.non_html import process_csv
 
+    # Comma-separated with pipes and newlines inside quotes
+    sample = (
+        'Product,Price,Details\n'
+        'Widget,"$10.00","High quality | durable"\n'
+        'Gadget,"$20.00","Multi-line\r\ndescription"\n'
+    ).encode("utf-8")
+
+    doc = process_csv(sample)
+    assert doc.metadata["row_count"] == 3
+    assert doc.metadata["column_count"] == 3
+    assert doc.metadata["delimiter"] == ","
+    assert "| Product | Price | Details |" in doc.markdown
+    assert "| --- | --- | --- |" in doc.markdown
+    assert r"High quality \| durable" in doc.markdown
+    assert "Multi-line<br>description" in doc.markdown
+
+    # TSV data
+    tsv_sample = b"ColA\tColB\nVal1\tVal2\n"
+    tsv_doc = process_csv(tsv_sample, delimiter="\t")
+    assert tsv_doc.metadata["delimiter"] == "\t"
+    assert "| ColA | ColB |" in tsv_doc.markdown
+
+    # Truncation limit check
+    many_rows = "h1,h2\n" + "\n".join(f"val{i},val{i}" for i in range(10))
+    trunc_doc = process_csv(many_rows.encode("utf-8"), max_table_rows=3)
+    assert "*Showing first 3 of 10 data rows" in trunc_doc.markdown
+    assert any("truncated to 3 rows" in w for w in trunc_doc.warnings)
+
+
+def test_docx_extraction_to_markdown():
+    """DOCX extraction must parse headings, styling, links, lists, tables, and metadata."""
+    import io
+    import zipfile
+    from pagefetch.processing.non_html import process_docx
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "word/document.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Project Alpha</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>Check out </w:t></w:r>
+      <w:hyperlink r:id="rId1">
+        <w:r><w:t>PageFetch</w:t></w:r>
+      </w:hyperlink>
+      <w:r><w:t> with </w:t></w:r>
+      <w:r><w:rPr><w:b/></w:rPr><w:t>bold</w:t></w:r>
+      <w:r><w:t> and </w:t></w:r>
+      <w:r><w:rPr><w:i/></w:rPr><w:t>italic</w:t></w:r>
+      <w:r><w:t> and </w:t></w:r>
+      <w:r><w:rPr><w:strike/></w:rPr><w:t>deleted</w:t></w:r>
+      <w:r><w:t>.</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>
+      <w:r><w:t>Bullet item</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Score</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Alice</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>100</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>""",
+        )
+        zf.writestr(
+            "word/_rels/document.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
+               Target="https://example.com/pagefetch" TargetMode="External"/>
+</Relationships>""",
+        )
+        zf.writestr(
+            "docProps/core.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+                   xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <dc:title>Project Alpha Document</dc:title>
+  <dc:creator>Test Contributor</dc:creator>
+</cp:coreProperties>""",
+        )
+
+    doc = process_docx(buf.getvalue())
+    assert doc.title == "Project Alpha Document"
+    assert doc.metadata["creator"] == "Test Contributor"
+    assert "# Project Alpha" in doc.markdown
+    assert "[PageFetch](https://example.com/pagefetch)" in doc.markdown
+    assert "**bold**" in doc.markdown
+    assert "*italic*" in doc.markdown
+    assert "~~deleted~~" in doc.markdown
+    assert "- Bullet item" in doc.markdown
+    assert "| Name | Score |" in doc.markdown
+    assert "| --- | --- |" in doc.markdown
+    assert "| Alice | 100 |" in doc.markdown
+
+
+def test_json_extraction_to_markdown():
+    """JSON extraction must format valid JSON into code fences and extract structural metadata."""
+    from pagefetch.processing.non_html import process_json
+
+    payload = b'{"name": "test-item", "count": 42, "items": ["a", "b"]}'
+    doc = process_json(payload)
+    assert doc.title == "test-item"
+    assert doc.metadata["type"] == "object"
+    assert doc.metadata["key_count"] == 3
+    assert "```json" in doc.markdown
+    assert '"name": "test-item"' in doc.markdown
+
+
+def test_detect_document_kind_and_routing():
+    """Kind detection must accurately detect PDF, DOCX, CSV, TSV, JSON, XML, HTML, and text."""
+    from pagefetch.processing.pipeline import detect_document_kind
+
+    # PDF detection
+    assert detect_document_kind("application/pdf", b"") == "pdf"
+    assert detect_document_kind("application/octet-stream", b"%PDF-1.4...") == "pdf"
+    assert detect_document_kind("application/octet-stream", b"", url="https://site.org/doc.pdf") == "pdf"
+
+    # DOCX detection
+    docx_ct = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    assert detect_document_kind(docx_ct, b"") == "docx"
+    assert detect_document_kind("application/octet-stream", b"PK\x03\x04...word/document.xml") == "docx"
+    assert detect_document_kind("application/octet-stream", b"", url="https://site.org/file.docx") == "docx"
+
+    # CSV / TSV detection
+    assert detect_document_kind("text/csv", b"") == "csv"
+    assert detect_document_kind("application/csv", b"") == "csv"
+    assert detect_document_kind("text/plain", b"", url="https://site.org/data.csv") == "csv"
+    assert detect_document_kind("text/tab-separated-values", b"") == "tsv"
+    assert detect_document_kind("text/plain", b"", url="https://site.org/data.tsv") == "tsv"
+
+    # JSON detection
+    assert detect_document_kind("application/json", b"") == "json"
+    assert detect_document_kind("application/problem+json", b"") == "json"
+    assert detect_document_kind("text/plain", b"", url="https://site.org/api.json") == "json"
+
+    # XML and HTML
+    assert detect_document_kind("application/xml", b"") == "xml"
+    assert detect_document_kind("text/html", b"") == "html"
+    assert detect_document_kind("text/plain", b"") == "text"
+
+
+def test_unified_extract_document_convenience():
+    """extract_document must seamlessly route bytes based on hints."""
+    from pagefetch.processing.non_html import extract_document
+
+    csv_bytes = b"k,v\n1,2"
+    doc_csv = extract_document(csv_bytes, url="test.csv")
+    assert "| k | v |" in doc_csv.markdown
+
+    json_bytes = b'{"status": "ok"}'
+    doc_json = extract_document(json_bytes, content_type="application/json")
+    assert "```json" in doc_json.markdown
+
+
+def test_pdf_extraction_normalization_and_dependency_error():
+    """process_pdf must raise MissingOptionalDependency without pypdf, and normalize text with pypdf."""
+    import sys
+    from unittest.mock import MagicMock
+    from pagefetch.processing.non_html import MissingOptionalDependency, process_pdf
+
+    # Test missing dependency when pypdf is not in sys.modules
+    old_mod = sys.modules.get("pypdf")
+    try:
+        sys.modules["pypdf"] = None  # force ImportError
+        try:
+            process_pdf(b"%PDF-1.4")
+            assert False, "Expected MissingOptionalDependency"
+        except MissingOptionalDependency as exc:
+            assert "pagefetch[pdf]" in str(exc)
+    finally:
+        if old_mod is not None:
+            sys.modules["pypdf"] = old_mod
+        else:
+            sys.modules.pop("pypdf", None)
+
+    # Test extraction with mock pypdf
+    mock_pypdf = MagicMock()
+    mock_reader = MagicMock()
+    mock_page = MagicMock()
+    mock_page.extract_text.return_value = "Quarterly Re-\nport 2026\nClean body line."
+    mock_reader.pages = [mock_page]
+    mock_reader.metadata = {"/Title": "Quarterly Report", "/Author": "PageFetch"}
+    mock_reader.is_encrypted = False
+    mock_pypdf.PdfReader.return_value = mock_reader
+
+    try:
+        sys.modules["pypdf"] = mock_pypdf
+        doc = process_pdf(b"%PDF-1.4...")
+        assert doc.title == "Quarterly Report"
+        assert doc.metadata["page_count"] == 1
+        assert "Quarterly Report 2026" in doc.markdown
+    finally:
+        if old_mod is not None:
+            sys.modules["pypdf"] = old_mod
+        else:
+            sys.modules.pop("pypdf", None)
