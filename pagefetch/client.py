@@ -412,6 +412,8 @@ class PageFetch:
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
         async def transport(normalized_url: str) -> FetchResult:
+            if is_pdf_content("", b"", url=normalized_url):
+                return await self._fetch_http_or_auto(normalized_url, "http", selected_proxy)
             if selected_mode == "browser":
                 return await self._fetch_browser(normalized_url, selected_proxy, status_code=None)
             return await self._fetch_http_or_auto(normalized_url, selected_mode, selected_proxy)
@@ -770,7 +772,16 @@ class PageFetch:
             retryable = response.status_code in RETRYABLE_STATUS_CODES
             # Only anti-bot / rate-limit responses benefit from a stealth browser.
             # 4xx like 404 and 5xx server errors should fail fast at the HTTP layer.
-            escalate_to_browser = mode == "auto" and response.status_code in BLOCKED_STATUS_CODES
+            is_pdf_target = is_pdf_content(
+                self._content_type(response.headers.get("Content-Type")),
+                response.content,
+                url=url,
+            )
+            escalate_to_browser = (
+                mode == "auto"
+                and not is_pdf_target
+                and response.status_code in BLOCKED_STATUS_CODES
+            )
             # Cloudflare "Under Attack Mode" returns HTTP 503 with a JavaScript
             # challenge body — that 503 is *not* a transient outage, it is an
             # anti-bot gate.  Detect it by sniffing the body for WAF markers and
@@ -778,6 +789,7 @@ class PageFetch:
             # outages still fail fast at the HTTP layer.
             if (
                 not escalate_to_browser
+                and not is_pdf_target
                 and mode == "auto"
                 and response.status_code == 503
                 and self._body_looks_like_waf_challenge(response.content)
@@ -833,7 +845,19 @@ class PageFetch:
         html = self._decode(response)
         raw_soup = BeautifulSoup(html, "lxml")
         report = analyze_html(html, soup=raw_soup)
-        if mode == "auto" and report.score < self.config.confidence_threshold:
+        low_content_reasons = {"very little visible text", "short visible text", "document is mostly navigation"}
+        should_escalate = (
+            mode == "auto"
+            and (
+                report.challenge
+                or report.javascript_shell
+                or (
+                    report.score < self.config.confidence_threshold
+                    and (bool(low_content_reasons.intersection(report.reasons)) or report.score < 0.40)
+                )
+            )
+        )
+        if should_escalate:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
             try:
                 rendered = await self._escalate_to_browser(
@@ -918,6 +942,36 @@ class PageFetch:
             )
         finally:
             await self._release_browser_fetcher(cache_key)
+
+        is_pdf_target = is_pdf_content("", b"", url=response.url or url)
+        is_pdf_viewer_dom = bool(
+            "sidebarContainer" in response.html
+            and "viewerContainer" in response.html
+            and ("findbar" in response.html or "secondaryToolbar" in response.html)
+        )
+        if is_pdf_target or is_pdf_viewer_dom:
+            try:
+                target_url = (
+                    response.url
+                    if response.url and not response.url.startswith(("chrome:", "resource:", "about:"))
+                    else url
+                )
+                http_fetcher = await self._http_fetcher(proxy)
+                per_request_proxy = self._resolve_proxy_url(proxy, target_url)
+                http_resp = await http_fetcher.fetch(
+                    target_url,
+                    proxy_url=per_request_proxy,
+                    headers=self._headers_for_url(target_url),
+                )
+                if is_pdf_content(http_resp.headers.get("Content-Type", ""), http_resp.content, url=target_url):
+                    pdf_result = self._result_from_pdf(url, http_resp, proxy)
+                    if response.screenshot:
+                        pdf_result.screenshot = response.screenshot
+                        pdf_result.screenshot_format = response.screenshot_format
+                    return pdf_result
+            except Exception as exc:
+                logger.warning("Failed to recover PDF via HTTP in browser fetch: %s", exc)
+
         raw_soup = BeautifulSoup(response.html, "lxml")
         result = self._result_from_html(
             original_url=url,

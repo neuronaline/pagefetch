@@ -14,11 +14,10 @@ Cleaning levels
 - ``minimal``  — only universally safe removals (tracking pixels,
   already-redundant ``<noscript>`` fallbacks, ``aria-hidden`` chrome,
   ``display:none`` blocks).
-- ``standard`` — adds cookie/consent banners, advertising slots, and
-  comment sections. This is the default and matches the historical
-  behavior.
-- ``maximum``  — additionally strips navigation, asides, site chrome,
-  and explicit comments / share / related-content blocks.
+- ``standard`` — strips cookie/consent banners, advertising slots,
+  navigation, sidebars, footers, and explicit comment/share sections.
+- ``maximum``  — strips all standard non-content chrome plus any
+  remaining auxiliary recommendation and related-content blocks.
 
 All levels are conservative: when in doubt, the tag is kept.
 """
@@ -32,10 +31,13 @@ from typing import Literal
 from bs4 import BeautifulSoup, Tag
 
 _NOISE_RE = re.compile(
-    r"(?:^|[-_\s])(cookie(?:[-_\s]?banner|[-_\s]?consent)?|advert(?:isement)?|ad-slot|"
+    r"(?:^|[-_\s])(cookie(?:[-_\s]?(?:banner|consent|notice|law|policy|bar|modal|popup))?|"
+    r"consent(?:[-_\s]?(?:banner|modal|popup|overlay|root|wrapper))?|"
+    r"advert(?:isement)?|ad-slot|ad-container|ad-wrapper|ad-banner|"
     r"tracking-pixel|modal-overlay|onetrust(?:-consent-sdk)?|cybotcookiebot|"
     r"cookiebot|didomi(?:-host)?|klaro|sp_message|qc-cmp\d?|usercentrics|"
-    r"trustarc|fc-consent-root|cookie-law-info|gdpr-banner|ccpa-banner)(?:$|[-_\s])",
+    r"trustarc|fc-consent-root|cookie-law-info|gdpr(?:-banner|-modal|-consent)?|"
+    r"ccpa-banner)(?:$|[-_\s])",
     re.IGNORECASE,
 )
 _MAX_BLOCK_RE = re.compile(
@@ -46,7 +48,8 @@ _MAX_BLOCK_RE = re.compile(
 )
 _CONTENT_CONTAINER_RE = re.compile(
     r"(?:^|[-_\s])(entry[-_]content|post[-_]content|article[-_]body|story[-_]content|"
-    r"article[-_]content|main[-_]content|post[-_]body)(?:$|[-_\s])",
+    r"article[-_]content|main[-_]content|post[-_]body|article[-_]text|news[-_]content|"
+    r"story[-_]body|page[-_]content|content[-_]area)(?:$|[-_\s])",
     re.IGNORECASE,
 )
 # Tightened pattern: only match explicit site/page chrome class names, not
@@ -148,33 +151,33 @@ def clean_html(
                 tag.decompose()
 
     for tag in list(soup.find_all(True)):
-        if not isinstance(tag, Tag) or tag.parent is None:
+        if not isinstance(tag, Tag) or tag.parent is None or tag.attrs is None:
             continue
         style = str(tag.get("style", "")).replace(" ", "").lower()
         hidden = tag.has_attr("hidden") or bool(_HIDDEN_STYLE_RE.search(style))
         tiny_image = tag.name == "img" and str(tag.get("width")) == "1" and str(tag.get("height")) == "1"
         common_noise = hidden or tiny_image
-        # text_length requires traversing the whole subtree, which makes the
-        # loop O(N * D) (effectively O(N^2) on nested trees).  Only run it
-        # when the tag actually looks suspicious: either it carries an
-        # aria-hidden hint or its class/id matches the noise regex.  Standard
-        # body tags without any of those signals skip the text scan entirely.
         aria_hidden_attr = str(tag.get("aria-hidden", "")).lower() == "true"
         classes = " ".join(_class_list(tag))
         identity = f"{tag.get('id', '')} {classes}"
         matches_noise = _NOISE_RE.search(identity) is not None
         standard_noise = False
-        if cleaning_level != "minimal" and (aria_hidden_attr or matches_noise):
-            text_length = len(tag.get_text(" ", strip=True))
+        if cleaning_level != "minimal":
             if aria_hidden_attr:
+                text_length = len(tag.get_text(" ", strip=True))
                 standard_noise = text_length < 200
-            else:
-                standard_noise = text_length < 500
+            elif matches_noise:
+                is_safe_container = (
+                    tag.name in {"html", "body", "main", "article"}
+                    or tag.find(["main", "article"]) is not None
+                    or _CONTENT_CONTAINER_RE.search(identity) is not None
+                )
+                standard_noise = not is_safe_container
         if common_noise or standard_noise:
             tag.decompose()
 
-    if cleaning_level == "maximum":
-        _remove_maximum_blocks(soup)
+    if cleaning_level in ("standard", "maximum"):
+        _remove_boilerplate(soup, is_maximum=(cleaning_level == "maximum"))
 
     return soup
 
@@ -196,16 +199,20 @@ def _inside_content(tag: Tag) -> bool:
     return False
 
 
-def _remove_maximum_blocks(soup: BeautifulSoup) -> None:
-    """Remove explicit page chrome and auxiliary content blocks."""
+def _remove_boilerplate(soup: BeautifulSoup, *, is_maximum: bool = False) -> None:
+    """Remove explicit page chrome, navigation, footers, sidebars, and auxiliary content blocks."""
     for tag in list(soup.find_all(True)):
-        if not isinstance(tag, Tag) or tag.parent is None:
+        if not isinstance(tag, Tag) or tag.parent is None or tag.attrs is None:
             continue
         classes = " ".join(_class_list(tag))
         identity = f"{tag.get('id', '')} {classes}"
         role = str(tag.get("role", "")).lower()
-        is_navigation = tag.name == "nav" or role in {"navigation", "complementary"}
-        is_sidebar = tag.name == "aside" or "sidebar" in classes.lower().split()
+        is_navigation = tag.name == "nav" or role in {"navigation", "menubar", "tablist"}
+        is_sidebar = (
+            tag.name == "aside"
+            or role == "complementary"
+            or "sidebar" in classes.lower().split()
+        ) and not _inside_content(tag)
         is_site_chrome = (
             role in {"banner", "contentinfo"}
             or (_SITE_CHROME_RE.search(identity) is not None and not _inside_content(tag))
@@ -218,7 +225,12 @@ def _remove_maximum_blocks(soup: BeautifulSoup) -> None:
             and not _inside_content(tag)
             and not has_primary_heading
         )
-        is_auxiliary_block = _MAX_BLOCK_RE.search(identity) is not None
+        is_safe_article = (
+            tag.name in {"html", "body", "main", "article"}
+            or tag.find(["main", "article"]) is not None
+            or _CONTENT_CONTAINER_RE.search(identity) is not None
+        )
+        is_auxiliary_block = is_maximum and _MAX_BLOCK_RE.search(identity) is not None and not is_safe_article
         if (
             is_navigation
             or is_sidebar
@@ -227,3 +239,6 @@ def _remove_maximum_blocks(soup: BeautifulSoup) -> None:
             or is_auxiliary_block
         ):
             tag.decompose()
+
+
+_remove_maximum_blocks = _remove_boilerplate

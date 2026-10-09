@@ -41,9 +41,14 @@ def parse_content_type(header: str | None) -> str:
 
 def is_pdf_content(content_type: str, content: bytes, url: str | None = None) -> bool:
     """Check if content represents a PDF file by content-type, magic bytes, or URL."""
-    if content_type == "application/pdf" or content.startswith(b"%PDF-"):
+    ct = parse_content_type(content_type)
+    if ct in ("application/pdf", "application/x-pdf") or (content and content.startswith(b"%PDF-")):
         return True
-    return bool(url and url.lower().split("?", 1)[0].endswith(".pdf"))
+    if url:
+        clean_url = url.lower().split("?", 1)[0].split("#", 1)[0]
+        if clean_url.endswith(".pdf"):
+            return True
+    return False
 
 
 def is_docx_content(content_type: str, content: bytes, url: str | None = None) -> bool:
