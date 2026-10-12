@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import re
+import sys
 import zipfile
 from dataclasses import dataclass
 from typing import Any
@@ -172,6 +173,8 @@ def process_docx(content: bytes) -> ProcessedDocument:
         txt_parts: list[str] = []
 
         for child in p_elem:
+            if not isinstance(child.tag, str):
+                continue
             tag = child.tag.split("}")[-1]
             if tag == "r":
                 bold = child.find(".//w:b", DOCX_NS) is not None
@@ -273,6 +276,8 @@ def process_docx(content: bytes) -> ProcessedDocument:
 
     if body is not None:
         for child in body:
+            if not isinstance(child.tag, str):
+                continue
             tag = child.tag.split("}")[-1]
             if tag == "p":
                 p_md, p_txt = _parse_p(child)
@@ -318,6 +323,11 @@ def process_csv(
             delim = dialect.delimiter
         except Exception:
             delim = "\t" if "\t" in sample and "," not in sample else ","
+
+    try:
+        csv.field_size_limit(sys.maxsize)
+    except OverflowError:
+        csv.field_size_limit(2147483647)
 
     reader = csv.reader(io.StringIO(decoded), delimiter=delim)
     try:

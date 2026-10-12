@@ -78,7 +78,12 @@ class MarkdownConverter:
             if not href:
                 return label
             target = urljoin(self.base_url, str(href))
-            safe_label = label.replace("[", r"\[").replace("]", r"\]")
+            # Preserve ![alt](url) image syntax; escape unescaped [ and ] elsewhere
+            safe_label = re.sub(
+                r"(!\[.*?\]\([^\)]*\))|([\[\]])",
+                lambda m: m.group(1) if m.group(1) else ("\\[" if m.group(2) == "[" else "\\]"),
+                label,
+            )
             return f"[{safe_label or target}]({target})"
         if name == "img":
             source = image_candidate(node)
@@ -203,11 +208,13 @@ class MarkdownConverter:
         rows = [row + [""] * (width - len(row)) for row in rows]
         # GFM tables treat the row immediately before the separator as the
         # header, and the separator is unconditionally inserted at position 1
-        # below.  When no <th> row exists, the first data row already
-        # occupies that slot, so no reordering is needed.  When a <th> row
-        # is found past index 0, hoist it to the top.
+        # below. When a <th> row is found past index 0, hoist it to the top.
+        # When no <th> row exists, synthesize a blank header row so data in row 0
+        # is not consumed as a header column.
         if header_index is not None and header_index != 0:
             rows.insert(0, rows.pop(header_index))
+        elif header_index is None:
+            rows.insert(0, [""] * width)
         output = ["| " + " | ".join(row) + " |" for row in rows]
         output.insert(1, "| " + " | ".join(["---"] * width) + " |")
         return "\n\n" + "\n".join(output) + "\n\n"
@@ -222,4 +229,4 @@ class MarkdownConverter:
 
 def html_to_markdown(soup: BeautifulSoup, base_url: str) -> str:
     """Convert a cleaned document to Markdown."""
-    return html_module.unescape(MarkdownConverter(base_url).convert(soup))
+    return MarkdownConverter(base_url).convert(soup)

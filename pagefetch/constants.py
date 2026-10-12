@@ -58,3 +58,28 @@ XML_TYPES = ("application/xml", "text/xml", "+xml")
 SAFE_RESPONSE_HEADERS = frozenset(
     {"cache-control", "content-language", "content-location", "date", "etag", "last-modified"}
 )
+
+WAF_CHALLENGE_MARKERS: tuple[bytes, ...] = (
+    b"cf-chl-bypass",
+    b"cf_chl_opt",
+    b"__cf_chl_jschl_tk__",
+    b"challenge-running",
+    b"checking your browser",
+    b"verify you are human",
+    b"just a moment",
+    b"attention required",
+    b"access denied",
+    b"akamai bot manager",
+    b"perimeterx",
+    b"datadome",
+    b"kasada",
+    b"px-captcha",
+)
+
+
+def looks_like_waf_challenge(content: bytes) -> bool:
+    """Return True when *content* carries WAF challenge markers in the first 4 KiB."""
+    if not content:
+        return False
+    head = content[:4096].lower()
+    return any(marker in head for marker in WAF_CHALLENGE_MARKERS)

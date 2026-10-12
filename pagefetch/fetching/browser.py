@@ -18,7 +18,7 @@ from ..config import VALID_SCREENSHOT_FORMATS, VALID_SCREENSHOT_MODES
 from ..models import FetchErrorInfo
 from ..processing.detector import ConfidenceReport, analyze_html
 from ..proxy.providers import ProxySettings
-from ..utils.urls import is_safe_host, registrable_host
+from ..utils.urls import async_is_safe_host, is_safe_host, registrable_host
 from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
@@ -26,12 +26,11 @@ from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
 logger = logging.getLogger("pagefetch.fetching.browser")
 
 # Resource-type blocking sets per stealth level.
-#   minimal:   only pure overhead (media, beacon) + websocket
-#   balanced:  also strip images and pings
+#   minimal:   only pure overhead (media, beacon)
+#   balanced:  also strip images, pings, and websockets
 #   aggressive: block everything non-essential including fonts
-#   'websocket' is always included — never needed for content extraction.
 BLOCK_LEVEL_SETS: dict[str, set[str]] = {
-    "minimal": {"media", "beacon", "websocket"},
+    "minimal": {"media", "beacon"},
     "balanced": {"media", "beacon", "ping", "image", "websocket"},
     "aggressive": {"media", "beacon", "ping", "image", "font", "websocket"},
 }
@@ -45,10 +44,15 @@ _CHALLENGE_DOMAINS: frozenset[str] = frozenset(
         "hcaptcha.com",
         "recaptcha.net",
         "gstatic.com",
+        "recaptcha.google.com",
         "arkoselabs.com",
         "datadome.co",
         "perimeterx.net",
         "kasada.io",
+        "geetest.com",
+        "imperva.com",
+        "incapsula.com",
+        "botguard.net",
     }
 )
 
@@ -91,6 +95,7 @@ class BrowserFetcher:
         block_images: bool = True,
         block_level: str = "aggressive",
         humanize: bool = False,
+        accept_language: str = "en-US,en;q=0.5",
     ) -> None:
         self.semaphore = semaphore
         self.timeout = timeout
@@ -102,6 +107,7 @@ class BrowserFetcher:
         self.block_images = block_images
         self.block_level = block_level
         self.humanize = humanize
+        self.accept_language = accept_language
         self._manager: Any = None
         self._browser: Any = None
         self._start_lock = asyncio.Lock()
@@ -125,12 +131,13 @@ class BrowserFetcher:
         return None
 
     def _build_camoufox_options(self, host_os: str | None, use_xvfb: bool) -> dict[str, Any]:
+        primary_locale = self.accept_language.split(",")[0].split(";")[0].strip() or "en-US"
         options: dict[str, Any] = {
             "headless": not use_xvfb,
             "humanize": self.humanize,
             "enable_cache": True,
             "block_webrtc": True,
-            "locale": "en-US",
+            "locale": primary_locale,
             "window": random.choice(_VIEWPORT_POOL),
         }
         if self.block_images:
@@ -411,7 +418,12 @@ class BrowserFetcher:
                             pass
                         self._manager = None
 
-    async def _setup_interception(self, page: Any, target_url: str) -> dict[str, Any]:
+    async def _setup_interception(
+        self,
+        page: Any,
+        target_url: str,
+        proxy: ProxySettings | None = None,
+    ) -> dict[str, Any]:
         network = {"active": 0, "last_activity": time.monotonic()}
 
         def request_started(_request: Any) -> None:
@@ -429,6 +441,8 @@ class BrowserFetcher:
         # Pre-compute the registrable host once so route_handler avoids
         # the expensive tldextract call on every document-frame request.
         _main_site = registrable_host(target_url)
+        active_proxy = proxy if proxy is not None else self.proxy
+        has_proxy = bool(active_proxy and active_proxy.url)
 
         async def route_handler(route: Any) -> None:
             request = route.request
@@ -436,9 +450,11 @@ class BrowserFetcher:
             req_host = ""
             if request_url.startswith(("http://", "https://", "ws://", "wss://")):
                 req_host = (urlsplit(request_url).hostname or "").lower()
-                if not is_safe_host(req_host):
-                    await route.abort()
-                    return
+                # Skip local DNS check when proxy is active to prevent DNS leaks and resolution failures
+                if not has_proxy:
+                    if not await async_is_safe_host(req_host):
+                        await route.abort()
+                        return
 
             is_challenge_host = any(
                 req_host == d or req_host.endswith("." + d)
@@ -591,7 +607,9 @@ class BrowserFetcher:
         warnings: list[str] = []
         try:
             async with asyncio.timeout(page_timeout):
-                context_kwargs: dict[str, Any] = {}
+                context_kwargs: dict[str, Any] = {
+                    "extra_http_headers": {"Accept-Language": self.accept_language}
+                }
                 effective_proxy = proxy if proxy is not None else self.proxy
                 browser_proxy = effective_proxy.browser_config() if effective_proxy else None
                 if browser_proxy:
@@ -599,7 +617,7 @@ class BrowserFetcher:
                 context = await self._browser.new_context(**context_kwargs)
                 page = await context.new_page()
 
-                network = await self._setup_interception(page, url)
+                network = await self._setup_interception(page, url, proxy=effective_proxy)
                 response = await page.goto(
                     url,
                     wait_until="domcontentloaded",
@@ -620,39 +638,29 @@ class BrowserFetcher:
                 pre_size = await page.evaluate(
                     "() => (document.documentElement?.outerHTML.length || 0)"
                 )
-                # Convert char length to approximate byte length using the
-                # configured margin over max_content_size. The default
-                # browser_pre_check_byte_margin is 1.5 (multi-byte UTF-8
-                # safety margin); lower values reject pages earlier and
-                # higher values are more permissive. Retrying this immutable
-                # fetcher cannot change its size limit, so this failure is
-                # terminal for the current operation.
                 margin = self.browser_pre_check_byte_margin
                 if pre_size > self.max_content_size * margin:
                     raise TransportFailure(
                         FetchErrorInfo(
                             "content_too_large",
                             "rendered content exceeds maximum size",
-                            False,
+                            True,
                         )
                     )
+
                 html = await page.content()
 
                 # ── gated iframe merge ──
                 if not skip_scroll:
                     # Only merge iframes when the main document is weak.
                     html = await self._include_same_site_frames(page, html, page.url or url, warnings)
-                else:
-                    warnings.append(
-                        "Same-domain iframe content was skipped because the main document is already content-rich."
-                    )
 
                 if len(html.encode("utf-8")) > self.max_content_size:
                     raise TransportFailure(
                         FetchErrorInfo(
                             "content_too_large",
                             "rendered content exceeds maximum size",
-                            False,
+                            True,
                         )
                     )
 

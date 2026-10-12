@@ -369,23 +369,6 @@ def _path_segment(tag: Tag, attrs: dict[str, str]) -> str:
     return segment
 
 
-def _unique_selector(tag: Tag, selector: str, path: str) -> str:
-    """Return the shortest generated selector that uniquely matches *tag*."""
-    soup = tag
-    while soup.parent is not None:
-        soup = soup.parent
-    select = getattr(soup, "select", None)
-    if not callable(select):
-        return path
-    for candidate in (selector, path):
-        try:
-            matches = select(candidate)
-        except Exception:
-            continue
-        if len(matches) == 1 and matches[0] is tag:
-            return candidate
-    return path
-
 
 def _css_escape(value: str) -> str:
     """Escape an identifier for safe use in a generated CSS selector."""

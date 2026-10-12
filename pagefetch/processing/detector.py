@@ -6,7 +6,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, Doctype
 
 STRONG_CHALLENGE_PATTERNS = (
     "checking your browser",
@@ -168,6 +168,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         value
         for node in text_root.find_all(string=True)
         if node.parent is not None
+        and not isinstance(node, (Comment, Doctype))
         and not _is_in_noise(node)
         and (value := str(node).strip())
     )

@@ -13,7 +13,11 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from ..constants import REDIRECT_STATUS_CODES, RETRYABLE_STATUS_CODES
+from ..constants import (
+    REDIRECT_STATUS_CODES,
+    RETRYABLE_STATUS_CODES,
+    looks_like_waf_challenge,
+)
 from ..models import FetchErrorInfo
 from ..utils.urls import validate_url
 
@@ -82,6 +86,7 @@ class HTTPFetcher:
         max_content_size: int,
         max_redirects: int = 10,
         proxy_client_provider: Callable[[str], Awaitable[httpx.AsyncClient]] | None = None,
+        proxy_client_releaser: Callable[[httpx.AsyncClient], None] | None = None,
     ) -> None:
         self.client = client
         self.semaphore = semaphore
@@ -89,6 +94,7 @@ class HTTPFetcher:
         self.max_content_size = max_content_size
         self.max_redirects = max_redirects
         self.proxy_client_provider = proxy_client_provider
+        self.proxy_client_releaser = proxy_client_releaser
 
     async def fetch(
         self,
@@ -107,12 +113,16 @@ class HTTPFetcher:
         if proxy_url is not None:
             if self.proxy_client_provider is not None:
                 client = await self.proxy_client_provider(proxy_url)
-                return await self._fetch_with_retries(
-                    url,
-                    client=client,
-                    headers=headers,
-                    retryable_status_codes=retryable_status_codes,
-                )
+                try:
+                    return await self._fetch_with_retries(
+                        url,
+                        client=client,
+                        headers=headers,
+                        retryable_status_codes=retryable_status_codes,
+                    )
+                finally:
+                    if self.proxy_client_releaser is not None:
+                        self.proxy_client_releaser(client)
             req_headers = headers if headers is not None else self.client.headers
             fallback_client = httpx.AsyncClient(
                 headers=req_headers,
@@ -153,6 +163,10 @@ class HTTPFetcher:
                 async with self.semaphore:
                     response = await self._request(url, client=client, headers=headers)
                 if response.status_code in retry_codes and attempt < self.retries:
+                    # Cloudflare Under Attack / WAF interstitial: backoff will not
+                    # resolve a JS bot gate, fast-track to allow caller escalation.
+                    if response.status_code == 503 and looks_like_waf_challenge(response.content):
+                        return response
                     await self._backoff(attempt, response.headers.get("Retry-After"))
                     continue
                 return response

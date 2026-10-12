@@ -25,6 +25,8 @@ from .constants import (
     BROWSER_HEADERS,
     RETRYABLE_STATUS_CODES,
     SAFE_RESPONSE_HEADERS,
+    WAF_CHALLENGE_MARKERS,
+    looks_like_waf_challenge,
 )
 from .exceptions import PageFetchError
 from .fetching import BrowserFetcher, HTTPFetcher, HTTPResponse, TransportFailure
@@ -1036,6 +1038,7 @@ class PageFetch:
                     max_content_size=self.config.max_content_size,
                     max_redirects=self.config.max_redirects,
                     proxy_client_provider=self._proxy_client_provider,
+                    proxy_client_releaser=self._proxy_http_clients.release,
                 )
         return self._http_fetchers[cache_key]
 
@@ -1054,26 +1057,25 @@ class PageFetch:
         eviction tasks scheduled by the LRU.
         """
         cached = self._proxy_http_clients.get(proxy_url)
-        if cached is not None:
-            return cached
-        async with self._http_init_lock:
-            cached = self._proxy_http_clients.get(proxy_url)
-            if cached is not None:
-                return cached
-            client = httpx.AsyncClient(
-                headers=BROWSER_HEADERS,
-                timeout=httpx.Timeout(self.config.http_timeout),
-                follow_redirects=False,
-                max_redirects=self.config.max_redirects,
-                http2=True,
-                proxy=proxy_url,
-                limits=httpx.Limits(
-                    max_connections=self.config.http_concurrency * 2,
-                    max_keepalive_connections=self.config.http_concurrency,
-                ),
-            )
-            self._proxy_http_clients.put(proxy_url, client)
-            return client
+        if cached is None:
+            async with self._http_init_lock:
+                cached = self._proxy_http_clients.get(proxy_url)
+                if cached is None:
+                    cached = httpx.AsyncClient(
+                        headers=BROWSER_HEADERS,
+                        timeout=httpx.Timeout(self.config.http_timeout),
+                        follow_redirects=False,
+                        max_redirects=self.config.max_redirects,
+                        http2=True,
+                        proxy=proxy_url,
+                        limits=httpx.Limits(
+                            max_connections=self.config.http_concurrency * 2,
+                            max_keepalive_connections=self.config.http_concurrency,
+                        ),
+                    )
+                    self._proxy_http_clients.put(proxy_url, cached)
+        self._proxy_http_clients.retain(cached)
+        return cached
 
     def _headers_for_url(self, url: str) -> dict[str, str]:
         headers = dict(BROWSER_HEADERS)
@@ -1136,6 +1138,7 @@ class PageFetch:
             block_images=self.config.block_images,
             block_level=self.config.block_level,
             humanize=self.config.humanize,
+            accept_language=self.config.accept_language,
         )
 
     async def _acquire_browser_fetcher(
@@ -1275,35 +1278,12 @@ class PageFetch:
     # Sniff markers for "Under Attack Mode" / interstitial WAF challenges
     # that arrive with a 503 (or occasionally a 403) status.  Cheap substring
     # checks against the first ~4 KiB — we never re-parse this body.
-    _WAF_CHALLENGE_MARKERS = (
-        b"cf-chl-bypass",
-        b"cf_chl_opt",
-        b"__cf_chl_jschl_tk__",
-        b"challenge-running",
-        b"checking your browser",
-        b"verify you are human",
-        b"just a moment",
-        b"attention required",
-        b"access denied",
-        b"akamai bot manager",
-        b"perimeterx",
-        b"datadome",
-        b"kasada",
-        b"px-captcha",
-    )
+    _WAF_CHALLENGE_MARKERS = WAF_CHALLENGE_MARKERS
 
     @classmethod
     def _body_looks_like_waf_challenge(cls, content: bytes) -> bool:
-        """Return True when *content* carries WAF challenge markers.
-
-        Only the first 4 KiB are scanned — challenge pages embed the marker
-        near the top, and the head bytes are already in memory after the
-        content-type / status decision.
-        """
-        if not content:
-            return False
-        head = content[:4096].lower()
-        return any(marker in head for marker in cls._WAF_CHALLENGE_MARKERS)
+        """Return True when *content* carries WAF challenge markers."""
+        return looks_like_waf_challenge(content)
 
     @staticmethod
     def _validate_fetch_options(mode: str, proxy: str) -> None:

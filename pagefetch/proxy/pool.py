@@ -23,12 +23,37 @@ class _ProxyClientPool:
     outer :meth:`PageFetch.close` so no socket or FD leaks past teardown.
     """
 
-    __slots__ = ("_max_size", "_clients", "_eviction_tasks")
+    __slots__ = ("_max_size", "_clients", "_eviction_tasks", "_in_flight", "_drain_events")
 
     def __init__(self, max_size: int = _MAX_PROXY_HTTP_CLIENTS) -> None:
         self._max_size = max_size
         self._clients: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
         self._eviction_tasks: set[asyncio.Task[None]] = set()
+        self._in_flight: dict[httpx.AsyncClient, int] = {}
+        self._drain_events: dict[httpx.AsyncClient, asyncio.Event] = {}
+
+    def retain(self, client: httpx.AsyncClient) -> None:
+        """Mark *client* as actively handling an in-flight request."""
+        count = self._in_flight.get(client, 0) + 1
+        self._in_flight[client] = count
+        event = self._drain_events.get(client)
+        if event is not None and count > 0:
+            event.clear()
+
+    def release(self, client: httpx.AsyncClient) -> None:
+        """Mark one in-flight request on *client* as completed."""
+        count = self._in_flight.get(client, 0) - 1
+        if count <= 0:
+            self._in_flight.pop(client, None)
+            event = self._drain_events.get(client)
+            if event is not None:
+                event.set()
+        else:
+            self._in_flight[client] = count
+
+    def in_flight(self, client: httpx.AsyncClient) -> int:
+        """Return the number of active in-flight requests on *client*."""
+        return self._in_flight.get(client, 0)
 
     def __contains__(self, key: str) -> bool:
         return key in self._clients
@@ -57,6 +82,8 @@ class _ProxyClientPool:
 
     def clear(self) -> None:
         self._clients.clear()
+        self._in_flight.clear()
+        self._drain_events.clear()
 
     def put(self, key: str, client: httpx.AsyncClient) -> None:
         """Insert *client* under *key*, evicting the oldest entry if needed.
@@ -88,8 +115,20 @@ class _ProxyClientPool:
         self._eviction_tasks.add(task)
         task.add_done_callback(self._eviction_tasks.discard)
 
-    @staticmethod
-    async def _safe_close(key: str, client: httpx.AsyncClient) -> Exception | None:
+    async def _safe_close(self, key: str, client: httpx.AsyncClient) -> Exception | None:
+        if self._in_flight.get(client, 0) > 0:
+            event = self._drain_events.setdefault(client, asyncio.Event())
+            try:
+                # Allow active requests to finish before closing connection pool
+                await asyncio.wait_for(event.wait(), timeout=5.0)
+            except TimeoutError:
+                logger.warning(
+                    "proxy client %s in-flight requests did not drain within 5s before close",
+                    key,
+                )
+            finally:
+                self._drain_events.pop(client, None)
+        self._in_flight.pop(client, None)
         try:
             await asyncio.wait_for(client.aclose(), timeout=_RESOURCE_CLOSE_TIMEOUT)
             return None

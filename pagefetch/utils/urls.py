@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import socket
 import threading
@@ -120,6 +121,25 @@ def is_safe_host(hostname: str) -> bool:
         # it is safe to dial.
         return False
     return not any(_ip_is_unsafe(ip) for ip in resolved)
+
+
+async def async_is_safe_host(hostname: str) -> bool:
+    """Non-blocking async variant of is_safe_host running DNS in a thread pool."""
+    host = hostname.strip().lower().rstrip(".")
+    if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        return False
+    clean_ip = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    try:
+        ipaddress.ip_address(clean_ip)
+        return not _ip_is_unsafe(clean_ip)
+    except ValueError:
+        pass
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        cached = _DNS_CACHE.get(host)
+        if cached is not None and now - cached[0] < _DNS_CACHE_TTL_SECONDS:
+            return not any(_ip_is_unsafe(ip) for ip in cached[1]) if cached[1] else False
+    return await asyncio.to_thread(is_safe_host, host)
 
 
 def validate_url(url: str) -> SplitResult:

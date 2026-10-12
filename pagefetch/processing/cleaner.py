@@ -52,6 +52,10 @@ _CONTENT_CONTAINER_RE = re.compile(
     r"story[-_]body|page[-_]content|content[-_]area)(?:$|[-_\s])",
     re.IGNORECASE,
 )
+_SIDEBAR_RE = re.compile(
+    r"(?:^|[-_\s])(sidebar|secondary|widget-area)(?:$|[-_\s])",
+    re.IGNORECASE,
+)
 # Tightened pattern: only match explicit site/page chrome class names, not
 # the bare words ``header``/``footer`` (which would silently nuke a
 # ``<div class="card-header">`` inside an article or product card).  We still
@@ -163,16 +167,16 @@ def clean_html(
         matches_noise = _NOISE_RE.search(identity) is not None
         standard_noise = False
         if cleaning_level != "minimal":
-            if aria_hidden_attr:
-                text_length = len(tag.get_text(" ", strip=True))
-                standard_noise = text_length < 200
-            elif matches_noise:
+            if matches_noise:
                 is_safe_container = (
                     tag.name in {"html", "body", "main", "article"}
-                    or tag.find(["main", "article"]) is not None
                     or _CONTENT_CONTAINER_RE.search(identity) is not None
+                    or tag.find(["main", "article"]) is not None
                 )
                 standard_noise = not is_safe_container
+            elif aria_hidden_attr:
+                text_length = len(tag.get_text(" ", strip=True))
+                standard_noise = text_length < 200
         if common_noise or standard_noise:
             tag.decompose()
 
@@ -211,7 +215,7 @@ def _remove_boilerplate(soup: BeautifulSoup, *, is_maximum: bool = False) -> Non
         is_sidebar = (
             tag.name == "aside"
             or role == "complementary"
-            or "sidebar" in classes.lower().split()
+            or _SIDEBAR_RE.search(identity) is not None
         ) and not _inside_content(tag)
         is_site_chrome = (
             role in {"banner", "contentinfo"}
@@ -225,12 +229,14 @@ def _remove_boilerplate(soup: BeautifulSoup, *, is_maximum: bool = False) -> Non
             and not _inside_content(tag)
             and not has_primary_heading
         )
-        is_safe_article = (
-            tag.name in {"html", "body", "main", "article"}
-            or tag.find(["main", "article"]) is not None
-            or _CONTENT_CONTAINER_RE.search(identity) is not None
-        )
-        is_auxiliary_block = is_maximum and _MAX_BLOCK_RE.search(identity) is not None and not is_safe_article
+        is_auxiliary_block = False
+        if is_maximum and _MAX_BLOCK_RE.search(identity) is not None:
+            is_safe_article = (
+                tag.name in {"html", "body", "main", "article"}
+                or _CONTENT_CONTAINER_RE.search(identity) is not None
+                or tag.find(["main", "article"]) is not None
+            )
+            is_auxiliary_block = not is_safe_article
         if (
             is_navigation
             or is_sidebar
