@@ -7,6 +7,7 @@ import asyncio
 import logging
 import random
 import sys
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -24,7 +25,8 @@ from .config import (
     _UNSET,
     PageFetchConfig,
 )
-from .models import FetchResult
+from .fetching.actions import normalize_actions
+from .models import FetchResult, PageAction
 from .utils.rendering import render_results
 from .utils.urls import read_urls_from_file
 
@@ -132,6 +134,60 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="How aggressively to strip non-content DOM (default: standard)",
     )
+    # HTTP and interaction extensions
+    parser.add_argument(
+        "-X",
+        "--method",
+        default=None,
+        help="HTTP request method: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS (default: GET, or POST if payload is given)",
+    )
+    parser.add_argument(
+        "-H",
+        "--header",
+        action="append",
+        dest="headers",
+        metavar="HEADER",
+        help="Custom HTTP header in 'Name: Value' format (repeatable)",
+    )
+    parser.add_argument(
+        "--cookie",
+        action="append",
+        dest="cookies",
+        metavar="COOKIE",
+        help="Custom cookie in 'name=value' format (repeatable)",
+    )
+    parser.add_argument(
+        "-d",
+        "--data",
+        metavar="DATA",
+        help="Request body payload for POST/PUT requests",
+    )
+    parser.add_argument(
+        "--json",
+        metavar="JSON",
+        help="JSON payload string for POST/PUT requests",
+    )
+    parser.add_argument(
+        "--action",
+        action="append",
+        dest="actions",
+        metavar="ACTION",
+        help=(
+            "In-page interaction action (repeatable). E.g. 'click:#btn', "
+            "'fill:#user:admin', 'wait:2000', 'scroll:bottom', or JSON string"
+        ),
+    )
+    parser.add_argument(
+        "--capture-xhr",
+        nargs="?",
+        const="*",
+        default=None,
+        metavar="PATTERN",
+        help=(
+            "Capture background XHR/Fetch API responses matching glob/URL pattern "
+            "(e.g. '*api*'). Omitting PATTERN captures all traffic."
+        ),
+    )
     return parser
 
 
@@ -197,6 +253,28 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
     return PageFetchConfig.build(**kwargs)
 
 
+def _parse_cli_headers(headers_list: list[str] | None) -> dict[str, str]:
+    if not headers_list:
+        return {}
+    res: dict[str, str] = {}
+    for h in headers_list:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            res[k.strip()] = v.strip()
+    return res
+
+
+def _parse_cli_cookies(cookies_list: list[str] | None) -> dict[str, str]:
+    if not cookies_list:
+        return {}
+    res: dict[str, str] = {}
+    for c in cookies_list:
+        if "=" in c:
+            k, v = c.split("=", 1)
+            res[k.strip()] = v.strip()
+    return res
+
+
 async def run_batch(
     config: PageFetchConfig,
     urls: list[str],
@@ -206,6 +284,14 @@ async def run_batch(
     screenshot: str = "none",
     screenshot_format: str = "png",
     output: Path | None = None,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    cookies: dict[str, str] | None = None,
+    content: bytes | str | None = None,
+    data: dict[str, Any] | None = None,
+    json_data: Any = None,
+    actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
+    capture_xhr: bool | str | Sequence[str] = False,
 ) -> int:
     """Run a fetch/extract batch using *config* and write results.
 
@@ -221,18 +307,12 @@ async def run_batch(
         raise ValueError("the input file does not contain any URLs")
     extract_structure = output_format in {"structure", "raw"}
     include_screenshot = screenshot != "none" and output_format in {"raw", "json"}
-    # Screenshot capture (and structure/raw output) requires the rendered DOM;
-    # auto-promote to browser mode so the call doesn't surface a
-    # ``ValueError`` from PageFetch.extract. When the user explicitly
-    # asked for ``http`` or ``auto`` we surface the override on stderr so
-    # the divergence between the requested and effective mode is visible
-    # in CI logs.
     use_extract = extract_structure or screenshot != "none"
-    effective_mode = "browser" if use_extract else config.mode
-    if use_extract and config.mode != "browser":
+    use_browser = use_extract or bool(actions) or bool(capture_xhr)
+    effective_mode = "browser" if use_browser else config.mode
+    if use_browser and config.mode != "browser":
         print(
-            f"pagefetch: --format {output_format}/--screenshot forced mode=browser "
-            f"(was {config.mode})",
+            f"pagefetch: forced mode=browser (was {config.mode})",
             file=sys.stderr,
         )
     if effective_mode != config.mode:
@@ -254,10 +334,24 @@ async def run_batch(
                         structure=extract_structure,
                         screenshot=screenshot,
                         screenshot_format=screenshot_format,
+                        headers=headers,
+                        cookies=cookies,
+                        actions=actions,
+                        capture_xhr=capture_xhr,
                     )
                 )
         else:
-            results = await client.fetch_many(urls)
+            results = await client.fetch_many(
+                urls,
+                method=method,
+                headers=headers,
+                cookies=cookies,
+                content=content,
+                data=data,
+                json=json_data,
+                actions=actions,
+                capture_xhr=capture_xhr,
+            )
     rendered = render_results(
         results,
         output_format,
@@ -290,6 +384,32 @@ async def _run(args: argparse.Namespace) -> int:
     screenshot = getattr(args, "screenshot", "none") or "none"
     screenshot_format = getattr(args, "screenshot_format", "png") or "png"
     config = _build_config(args)
+
+    headers = _parse_cli_headers(getattr(args, "headers", None)) or None
+    cookies = _parse_cli_cookies(getattr(args, "cookies", None)) or None
+    raw_actions = getattr(args, "actions", None)
+    actions = normalize_actions(raw_actions) if raw_actions else None
+
+    raw_xhr = getattr(args, "capture_xhr", None)
+    if raw_xhr is None:
+        capture_xhr: bool | str = False
+    elif raw_xhr == "*":
+        capture_xhr = True
+    else:
+        capture_xhr = raw_xhr
+
+    json_payload = None
+    if getattr(args, "json", None):
+        import json as _json
+        json_payload = _json.loads(args.json)
+
+    data_payload = getattr(args, "data", None)
+    method_arg = getattr(args, "method", None)
+    if method_arg is None:
+        method = "POST" if (data_payload is not None or json_payload is not None) else "GET"
+    else:
+        method = method_arg.upper()
+
     return await run_batch(
         config,
         urls,
@@ -298,6 +418,13 @@ async def _run(args: argparse.Namespace) -> int:
         screenshot=screenshot,
         screenshot_format=screenshot_format,
         output=args.output,
+        method=method,
+        headers=headers,
+        cookies=cookies,
+        content=data_payload,
+        json_data=json_payload,
+        actions=actions,
+        capture_xhr=capture_xhr,
     )
 
 

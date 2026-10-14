@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -43,6 +43,114 @@ class FetchErrorInfo:
     exception_type: str | None = None
 
 
+VALID_ACTION_TYPES: frozenset[str] = frozenset(
+    {
+        "click",
+        "fill",
+        "type",
+        "press",
+        "select",
+        "wait_for_selector",
+        "wait",
+        "scroll",
+        "hover",
+        "check",
+        "uncheck",
+        "evaluate",
+    }
+)
+
+
+@dataclass(slots=True, init=False)
+class PageAction:
+    type: str
+    selector: str | int | None
+    value: Any
+    timeout: float | None
+    optional: bool
+
+    def __init__(
+        self,
+        type: str,
+        selector: str | int | None = None,
+        value: Any = None,
+        timeout: float | None = None,
+        optional: bool = False,
+        *,
+        text: Any = None,
+        script: Any = None,
+        key: Any = None,
+        milliseconds: Any = None,
+        direction: Any = None,
+    ) -> None:
+        self.type = type
+        self.selector = selector
+        val = value
+        if val is None:
+            for candidate in (text, script, key, milliseconds, direction):
+                if candidate is not None:
+                    val = candidate
+                    break
+        self.value = val
+        self.timeout = timeout
+        self.optional = optional
+
+    @property
+    def text(self) -> Any:
+        return self.value
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"type": self.type}
+        if self.selector is not None:
+            data["selector"] = self.selector
+        if self.value is not None:
+            data["value"] = self.value
+        if self.timeout is not None:
+            data["timeout"] = self.timeout
+        if self.optional:
+            data["optional"] = True
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PageAction:
+        val = data.get("value")
+        if val is None:
+            for k in ("text", "script", "key", "milliseconds", "direction", "seconds"):
+                if data.get(k) is not None:
+                    val = data.get(k)
+                    break
+        return cls(
+            type=str(data.get("type", "")),
+            selector=data.get("selector"),
+            value=val,
+            timeout=float(data["timeout"]) if data.get("timeout") is not None else None,
+            optional=bool(data.get("optional", False)),
+        )
+
+
+@dataclass(slots=True)
+class ActionResult:
+    index: int
+    type: str
+    selector: str | None = None
+    success: bool = True
+    duration_ms: float = 0.0
+    error: str | None = None
+    result: Any = None
+
+
+@dataclass(slots=True)
+class CapturedXHR:
+    url: str
+    method: str
+    status_code: int
+    content_type: str | None = None
+    body: Any = None
+    truncated: bool = False
+    headers: dict[str, str] | None = None
+    duration_ms: float | None = None
+
+
 @dataclass(slots=True)
 class StructureNode:
     """A DOM node described with scraper-oriented selector paths."""
@@ -54,6 +162,8 @@ class StructureNode:
     children: list[StructureNode]
     path: str = ""
     unique_selector: str = ""
+    interactive: bool = False
+    action_id: int | None = None
 
     def to_dict(self, *, compact: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {"tag": self.tag}
@@ -61,12 +171,16 @@ class StructureNode:
             payload["selector"] = self.selector
         if self.path:
             payload["path"] = self.path
-        if not compact and self.unique_selector:
+        if (not compact or self.interactive) and self.unique_selector:
             payload["unique_selector"] = self.unique_selector
         if self.attrs:
             payload["attrs"] = self.attrs
         if self.text:
             payload["text"] = self.text
+        if self.interactive:
+            payload["interactive"] = True
+            if self.action_id is not None:
+                payload["action_id"] = self.action_id
         if self.children:
             payload["children"] = [child.to_dict(compact=compact) for child in self.children]
         return payload
@@ -81,6 +195,8 @@ class StructureNode:
             children=[cls.from_dict(child) for child in data.get("children", [])],
             path=data.get("path", ""),
             unique_selector=data.get("unique_selector", data.get("path", "")),
+            interactive=bool(data.get("interactive", False)),
+            action_id=data.get("action_id"),
         )
 
 
@@ -264,6 +380,8 @@ class FetchResult:
     fetched_at: datetime | None = None
     warnings: list[str] | None = None
     error: FetchErrorInfo | None = None
+    actions_executed: list[ActionResult] | None = None
+    xhr_responses: list[CapturedXHR] | None = None
 
     def __post_init__(self) -> None:
         self.metadata = {} if self.metadata is None else self.metadata
@@ -288,6 +406,8 @@ class FetchResult:
             links=list(self.links),
             images=list(self.images),
             warnings=list(self.warnings),
+            actions_executed=list(self.actions_executed) if self.actions_executed is not None else None,
+            xhr_responses=list(self.xhr_responses) if self.xhr_responses is not None else None,
         )
 
     def to_dict(
@@ -324,10 +444,18 @@ class FetchResult:
             if field.name == "screenshot" and not include_screenshot:
                 continue
             value = getattr(self, field.name)
+            if field.name == "actions_executed" and not value:
+                continue
+            if field.name == "xhr_responses" and not value:
+                continue
             if isinstance(value, datetime):
                 output[field.name] = value.isoformat()
             elif field.name in {"links", "images"}:
                 output[field.name] = [asdict(item) for item in value]
+            elif field.name == "actions_executed" and value is not None:
+                output[field.name] = [asdict(item) if is_dataclass(item) else dict(item) for item in value]
+            elif field.name == "xhr_responses" and value is not None:
+                output[field.name] = [asdict(item) if is_dataclass(item) else dict(item) for item in value]
             elif field.name == "error" and value is not None:
                 output[field.name] = asdict(value)
             elif field.name == "structure" and value is not None:
@@ -374,6 +502,16 @@ class FetchResult:
         values["error"] = FetchErrorInfo(**error) if error else None
         structure = values.get("structure")
         values["structure"] = PageStructure.from_dict(structure) if structure else None
+        if values.get("actions_executed"):
+            values["actions_executed"] = [
+                ActionResult(**item) if isinstance(item, dict) else item
+                for item in values["actions_executed"]
+            ]
+        if values.get("xhr_responses"):
+            values["xhr_responses"] = [
+                CapturedXHR(**item) if isinstance(item, dict) else item
+                for item in values["xhr_responses"]
+            ]
         screenshot = values.get("screenshot")
         if isinstance(screenshot, str):
             try:

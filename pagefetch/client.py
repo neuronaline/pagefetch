@@ -7,12 +7,18 @@ import logging
 import random
 import sys
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import UTC, datetime
-from hashlib import md5
+from hashlib import md5, sha256
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
+
+
+def _mapping_cache_token(mapping: dict[str, str], *, lower_keys: bool = False) -> str:
+    parts = sorted((k.lower(), v) if lower_keys else (k, v) for k, v in mapping.items())
+    token_str = "&".join(f"{k}={v}" for k, v in parts)
+    return sha256(token_str.encode()).hexdigest()[:16]
 
 import httpx
 from bs4 import BeautifulSoup
@@ -25,12 +31,14 @@ from .constants import (
     BROWSER_HEADERS,
     RETRYABLE_STATUS_CODES,
     SAFE_RESPONSE_HEADERS,
+    VALID_HTTP_METHODS,
     WAF_CHALLENGE_MARKERS,
     looks_like_waf_challenge,
 )
 from .exceptions import PageFetchError
 from .fetching import BrowserFetcher, HTTPFetcher, HTTPResponse, TransportFailure
-from .models import FetchErrorInfo, FetchResult
+from .fetching.actions import normalize_actions
+from .models import FetchErrorInfo, FetchResult, PageAction
 from .processing.detector import ConfidenceReport, analyze_html
 from .processing.pipeline import (
     build_csv_result,
@@ -149,6 +157,8 @@ class PageFetch:
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
         browser_pre_check_byte_margin: float = 1.5,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
     ) -> None:
         if config is not None:
             if not isinstance(config, PageFetchConfig):
@@ -182,6 +192,8 @@ class PageFetch:
                 raise_on_error=raise_on_error,
                 screenshot_max_bytes=screenshot_max_bytes,
                 browser_pre_check_byte_margin=browser_pre_check_byte_margin,
+                headers=headers,
+                cookies=cookies,
             )
         self._http_semaphore = asyncio.Semaphore(self.config.http_concurrency)
         self._browser_semaphore = asyncio.Semaphore(self.config.browser_concurrency)
@@ -222,6 +234,41 @@ class PageFetch:
         # wait when no fetches are in flight.
         self._drain_event = asyncio.Event()
         self._drain_event.set()
+        self._host_escalations: dict[str, list[float]] = {}
+        self._host_memory: dict[str, float] = {}
+
+    def _record_host_escalation(self, url: str) -> None:
+        """Record an escalation to browser mode for adaptive host memory."""
+        host = (urlsplit(url).hostname or url).lower()
+        now = time.monotonic()
+        history = [t for t in self._host_escalations.get(host, []) if now - t <= 300.0]
+        history.append(now)
+        self._host_escalations[host] = history
+        if len(history) >= 2:
+            self._host_memory[host] = now + 600.0
+            logger.info("Host %s remembered for browser mode (10m TTL)", host)
+
+        if len(self._host_memory) > 1000:
+            self._host_memory = {h: exp for h, exp in self._host_memory.items() if now < exp}
+            while len(self._host_memory) > 1000:
+                self._host_memory.pop(next(iter(self._host_memory)))
+        if len(self._host_escalations) > 1000:
+            self._host_escalations = {
+                h: hist for h, hist in self._host_escalations.items() if hist and now - hist[-1] <= 300.0
+            }
+            while len(self._host_escalations) > 1000:
+                self._host_escalations.pop(next(iter(self._host_escalations)))
+
+    def _is_host_remembered(self, url: str) -> bool:
+        """Return True if host is cached as requiring browser mode."""
+        host = (urlsplit(url).hostname or url).lower()
+        expiry = self._host_memory.get(host)
+        if expiry is None:
+            return False
+        if time.monotonic() < expiry:
+            return True
+        self._host_memory.pop(host, None)
+        return False
 
     @classmethod
     def from_config(cls, config: PageFetchConfig) -> PageFetch:
@@ -333,6 +380,8 @@ class PageFetch:
                 self._http_fetchers.clear()
                 self._http_clients.clear()
                 self._proxy_http_clients.clear()
+                self._host_escalations.clear()
+                self._host_memory.clear()
                 self._closed = True
                 self._closing = False
         except asyncio.CancelledError:
@@ -381,7 +430,14 @@ class PageFetch:
         *,
         mode: Literal["auto", "http", "browser"] | None = None,
         proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
-
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
+        json: Any = None,
+        actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -396,6 +452,22 @@ class PageFetch:
             Override the default fetch mode (``'auto'``, ``'http'``, or ``'browser'``).
         proxy : str | None
             Override the default proxy provider.
+        method : str
+            HTTP method (default ``'GET'``).
+        headers : dict[str, str] | None
+            Custom request headers.
+        cookies : dict[str, str] | None
+            Custom request cookies.
+        content : bytes | str | None
+            Raw request body payload.
+        data : dict[str, Any] | None
+            Form data payload.
+        json : Any
+            JSON serializable payload.
+        actions : Sequence[PageAction | dict[str, Any] | str] | None
+            In-page interaction actions executed before capturing the result.
+        capture_xhr : bool | str | Sequence[str]
+            Capture background XHR/Fetch API responses matching glob/URL patterns.
         use_cache : bool
             Whether to attempt reading from and writing to the cache (default ``True``).
         cache_ttl : str | int | None
@@ -410,24 +482,88 @@ class PageFetch:
         FetchResult
             Structured result with success status, content, and metadata.
         """
+        normalized_method = method.upper()
+        if normalized_method not in VALID_HTTP_METHODS:
+            raise ValueError(f"method must be one of {sorted(VALID_HTTP_METHODS)}")
+
+        normalized_actions = normalize_actions(actions) if actions else None
+
         selected_mode = mode or self.config.mode
+        if normalized_actions or capture_xhr:
+            if mode == "http":
+                raise ValueError("actions and capture_xhr cannot be executed in http mode; browser mode is required")
+            selected_mode = "browser"
+
+        if selected_mode == "browser" and normalized_method != "GET":
+            raise ValueError("browser mode does not support non-GET HTTP methods")
+
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
+
+        bypass_cache = (
+            not use_cache
+            or normalized_method not in {"GET", "HEAD"}
+            or data is not None
+            or json is not None
+            or content is not None
+            or bool(normalized_actions)
+        )
+
+        op_cache_settings: dict[str, Any] = {"method": normalized_method}
+        if headers:
+            op_cache_settings["req_headers"] = _mapping_cache_token(headers, lower_keys=True)
+        if cookies:
+            op_cache_settings["req_cookies"] = _mapping_cache_token(cookies)
+        if capture_xhr:
+            op_cache_settings["capture_xhr"] = repr(capture_xhr)
+
         async def transport(normalized_url: str) -> FetchResult:
-            if is_pdf_content("", b"", url=normalized_url):
-                return await self._fetch_http_or_auto(normalized_url, "http", selected_proxy)
-            if selected_mode == "browser":
-                return await self._fetch_browser(normalized_url, selected_proxy, status_code=None)
-            return await self._fetch_http_or_auto(normalized_url, selected_mode, selected_proxy)
+            if is_pdf_content("", b"", url=normalized_url) and not normalized_actions:
+                return await self._fetch_http_or_auto(
+                    normalized_url,
+                    "http",
+                    selected_proxy,
+                    method=normalized_method,
+                    headers=headers,
+                    cookies=cookies,
+                    content=content,
+                    data=data,
+                    json_data=json,
+                )
+            effective_mode = selected_mode
+            if effective_mode == "auto" and self._is_host_remembered(normalized_url):
+                logger.debug("Host %s remembered in browser memory; bypassing HTTP", normalized_url)
+                effective_mode = "browser"
+            if effective_mode == "browser":
+                return await self._fetch_browser(
+                    normalized_url,
+                    selected_proxy,
+                    status_code=None,
+                    actions=normalized_actions,
+                    capture_xhr=capture_xhr,
+                    headers=headers,
+                    cookies=cookies,
+                )
+            return await self._fetch_http_or_auto(
+                normalized_url,
+                effective_mode,
+                selected_proxy,
+                method=normalized_method,
+                headers=headers,
+                cookies=cookies,
+                content=content,
+                data=data,
+                json_data=json,
+            )
 
         return await self._run_operation(
             url=url,
             mode=selected_mode,
             proxy=selected_proxy,
-            use_cache=use_cache,
+            use_cache=not bypass_cache,
             cache_ttl=cache_ttl,
             should_raise=should_raise,
-            cache_settings=self._cache_settings(),
+            cache_settings=self._cache_settings(**op_cache_settings),
             error_context="fetching the page",
             transport=transport,
         )
@@ -438,7 +574,14 @@ class PageFetch:
         *,
         mode: Literal["auto", "http", "browser"] | None = None,
         proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
-
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
+        json: Any = None,
+        actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -453,6 +596,22 @@ class PageFetch:
             Override the default fetch mode.
         proxy : str | None
             Override the default proxy provider.
+        method : str
+            HTTP method (default ``'GET'``).
+        headers : dict[str, str] | None
+            Custom request headers.
+        cookies : dict[str, str] | None
+            Custom request cookies.
+        content : bytes | str | None
+            Raw request body payload.
+        data : dict[str, Any] | None
+            Form data payload.
+        json : Any
+            JSON serializable payload.
+        actions : Sequence[PageAction | dict[str, Any]] | None
+            In-page interaction actions executed before capturing the result.
+        capture_xhr : bool | str | Sequence[str]
+            Capture background XHR/Fetch API responses matching glob/URL patterns.
         use_cache : bool
             Whether to use the cache (default ``True``).
         cache_ttl : str | int | None
@@ -503,6 +662,14 @@ class PageFetch:
                         item,
                         mode=mode,
                         proxy=proxy,
+                        method=method,
+                        headers=headers,
+                        cookies=cookies,
+                        content=content,
+                        data=data,
+                        json=json,
+                        actions=actions,
+                        capture_xhr=capture_xhr,
                         use_cache=use_cache,
                         cache_ttl=cache_ttl,
                         raise_on_error=raise_on_error,
@@ -548,7 +715,10 @@ class PageFetch:
         screenshot: Literal["none", "viewport", "full"] = "none",
         screenshot_format: Literal["png", "jpeg"] = "png",
         proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
-
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
         use_cache: bool = True,
         cache_ttl: str | int | None = None,
         raise_on_error: bool | None = None,
@@ -561,13 +731,33 @@ class PageFetch:
         article-shaped extraction. The :meth:`fetch` coroutine remains the
         right tool for the information layer (markdown, metadata, links).
         """
+        normalized_actions = normalize_actions(actions) if actions else None
+        bypass_cache = not use_cache or bool(normalized_actions)
         selected_proxy = proxy or self.config.proxy
         should_raise = self.config.raise_on_error if raise_on_error is None else raise_on_error
+
+        op_cache_settings: dict[str, Any] = {
+            "compact_structure": compact_structure,
+            "screenshot": screenshot,
+            "screenshot_format": screenshot_format,
+            "structure": structure,
+        }
+        if headers:
+            op_cache_settings["req_headers"] = _mapping_cache_token(headers, lower_keys=True)
+        if cookies:
+            op_cache_settings["req_cookies"] = _mapping_cache_token(cookies)
+        if capture_xhr:
+            op_cache_settings["capture_xhr"] = repr(capture_xhr)
+
         async def transport(normalized_url: str) -> FetchResult:
             return await self._fetch_browser(
                 normalized_url,
                 selected_proxy,
                 status_code=None,
+                actions=normalized_actions,
+                capture_xhr=capture_xhr,
+                headers=headers,
+                cookies=cookies,
                 structure=structure,
                 compact_structure=compact_structure,
                 screenshot=screenshot,
@@ -578,15 +768,10 @@ class PageFetch:
             url=url,
             mode="browser",
             proxy=selected_proxy,
-            use_cache=use_cache,
+            use_cache=not bypass_cache,
             cache_ttl=cache_ttl,
             should_raise=should_raise,
-            cache_settings=self._cache_settings(
-                compact_structure=compact_structure,
-                screenshot=screenshot,
-                screenshot_format=screenshot_format,
-                structure=structure,
-            ),
+            cache_settings=self._cache_settings(**op_cache_settings),
             requested_screenshot=screenshot != "none",
             error_context="extracting the page",
             transport=transport,
@@ -611,6 +796,10 @@ class PageFetch:
             # the existing ``session_rotation`` treatment above.
             "session_duration": self.config.session_duration,
         }
+        if self.config.headers:
+            settings["cfg_headers"] = _mapping_cache_token(self.config.headers, lower_keys=True)
+        if self.config.cookies:
+            settings["cfg_cookies"] = _mapping_cache_token(self.config.cookies)
         settings.update(operation_settings)
         return settings
 
@@ -681,6 +870,8 @@ class PageFetch:
                     status_code=getattr(exc, "status_code", None),
                     started_at=started_at, should_raise=should_raise,
                 )
+                if getattr(exc, "actions_executed", None) is not None:
+                    result.actions_executed = exc.actions_executed
             except Exception as exc:
                 result = self._finish_error(
                     url=normalized_url, proxy=proxy,
@@ -713,10 +904,27 @@ class PageFetch:
         url: str,
         proxy: str,
         status_code: int | None = None,
+        is_bot_escalation: bool = False,
+        retry_after: str | None = None,
+        proxy_salt: str = "",
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
     ) -> FetchResult:
-        # Auto-mode double-hit softening delay
-        await asyncio.sleep(random.uniform(0.5, 3.0))
-        return await self._fetch_browser(url, proxy, status_code=status_code)
+        if is_bot_escalation or (status_code is not None and status_code in {403, 429, 503}):
+            if retry_after:
+                seconds = HTTPFetcher._parse_retry_after(retry_after)
+                delay = min(seconds, 5.0) if seconds is not None else random.uniform(0.5, 2.5)
+            else:
+                delay = random.uniform(0.5, 2.5)
+            await asyncio.sleep(delay)
+        return await self._fetch_browser(
+            url,
+            proxy,
+            status_code=status_code,
+            proxy_salt=proxy_salt,
+            headers=headers,
+            cookies=cookies,
+        )
 
     def _degraded_http_result(
         self,
@@ -750,6 +958,13 @@ class PageFetch:
         url: str,
         mode: Literal["auto", "http", "browser"],
         proxy: str,
+        *,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
+        json_data: Any = None,
     ) -> FetchResult:
         try:
             fetcher = await self._http_fetcher(proxy)
@@ -759,10 +974,18 @@ class PageFetch:
                 if mode == "auto"
                 else RETRYABLE_STATUS_CODES
             )
+            merged_cookies = dict(self.config.cookies)
+            if cookies:
+                merged_cookies.update(cookies)
             response = await fetcher.fetch(
                 url,
+                method=method,
                 proxy_url=per_request_proxy,
-                headers=self._headers_for_url(url),
+                headers=self._headers_for_url(url, extra_headers=headers),
+                cookies=merged_cookies if merged_cookies else None,
+                content=content,
+                data=data,
+                json_data=json_data,
                 retryable_status_codes=retry_codes,
             )
         except TransportFailure:
@@ -772,37 +995,42 @@ class PageFetch:
             raise
         if response.status_code >= 400:
             retryable = response.status_code in RETRYABLE_STATUS_CODES
-            # Only anti-bot / rate-limit responses benefit from a stealth browser.
-            # 4xx like 404 and 5xx server errors should fail fast at the HTTP layer.
-            is_pdf_target = is_pdf_content(
-                self._content_type(response.headers.get("Content-Type")),
-                response.content,
-                url=url,
+            content_type = self._content_type(response.headers.get("Content-Type"))
+            is_waf = self._body_looks_like_waf_challenge(response.content)
+            kind = detect_document_kind(content_type, response.content, url=url)
+
+            # Fail-fast for non-HTML/structured formats or API responses unless explicit WAF challenge markers exist
+            non_html = kind in ("pdf", "docx", "csv", "tsv", "json", "xml") or any(
+                t in content_type for t in ("json", "xml")
             )
+            if non_html and not is_waf:
+                code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
+                raise TransportFailure(
+                    FetchErrorInfo(code, f"HTTP request returned status {response.status_code}", retryable),
+                    status_code=response.status_code,
+                )
+
             escalate_to_browser = (
                 mode == "auto"
-                and not is_pdf_target
-                and response.status_code in BLOCKED_STATUS_CODES
+                and method.upper() == "GET"
+                and (
+                    response.status_code in BLOCKED_STATUS_CODES
+                    or (response.status_code == 503 and is_waf)
+                    or is_waf
+                )
             )
-            # Cloudflare "Under Attack Mode" returns HTTP 503 with a JavaScript
-            # challenge body — that 503 is *not* a transient outage, it is an
-            # anti-bot gate.  Detect it by sniffing the body for WAF markers and
-            # escalate only when those markers are present, so genuine 503
-            # outages still fail fast at the HTTP layer.
-            if (
-                not escalate_to_browser
-                and not is_pdf_target
-                and mode == "auto"
-                and response.status_code == 503
-                and self._body_looks_like_waf_challenge(response.content)
-            ):
-                escalate_to_browser = True
             if escalate_to_browser:
                 logger.info("HTTP %s; using browser for %s", response.status_code, url)
+                self._record_host_escalation(url)
                 return await self._escalate_to_browser(
                     url,
                     proxy,
                     status_code=response.status_code,
+                    is_bot_escalation=True,
+                    retry_after=response.headers.get("Retry-After"),
+                    proxy_salt="fallback",
+                    headers=headers,
+                    cookies=cookies,
                 )
             code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
             raise TransportFailure(
@@ -827,7 +1055,7 @@ class PageFetch:
         if kind == "text":
             return self._result_from_text(url, response, proxy)
         if kind != "html":
-            if mode == "auto":
+            if mode == "auto" and method.upper() == "GET":
                 logger.info(
                     "HTTP returned %s; using browser for %s", content_type, url
                 )
@@ -835,6 +1063,9 @@ class PageFetch:
                     url,
                     proxy,
                     status_code=response.status_code,
+                    is_bot_escalation=False,
+                    headers=headers,
+                    cookies=cookies,
                 )
             raise TransportFailure(
                 FetchErrorInfo(
@@ -850,6 +1081,7 @@ class PageFetch:
         low_content_reasons = {"very little visible text", "short visible text", "document is mostly navigation"}
         should_escalate = (
             mode == "auto"
+            and method.upper() == "GET"
             and (
                 report.challenge
                 or report.javascript_shell
@@ -861,11 +1093,18 @@ class PageFetch:
         )
         if should_escalate:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
+            if report.challenge or report.javascript_shell:
+                self._record_host_escalation(url)
             try:
                 rendered = await self._escalate_to_browser(
                     url,
                     proxy,
                     status_code=response.status_code,
+                    is_bot_escalation=report.challenge,
+                    retry_after=response.headers.get("Retry-After"),
+                    proxy_salt="fallback" if report.challenge else "",
+                    headers=headers,
+                    cookies=cookies,
                 )
             except TransportFailure:
                 return self._degraded_http_result(
@@ -915,6 +1154,11 @@ class PageFetch:
         proxy: str,
         status_code: int | None,
         *,
+        proxy_salt: str = "",
+        actions: Sequence[PageAction] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         structure: bool = False,
         compact_structure: bool = False,
         screenshot: str = "none",
@@ -933,11 +1177,23 @@ class PageFetch:
         acquisition/release, and error-handling branches in a single place so
         they cannot drift apart.
         """
-        cache_key, proxy_settings, fetcher = await self._acquire_browser_fetcher(proxy, url)
+        cache_key, proxy_settings, fetcher = await self._acquire_browser_fetcher(
+            proxy, url, salt=proxy_salt
+        )
+        merged_headers = dict(self.config.headers)
+        if headers:
+            merged_headers.update(headers)
+        merged_cookies = dict(self.config.cookies)
+        if cookies:
+            merged_cookies.update(cookies)
         try:
             response = await fetcher.fetch(
                 url,
                 proxy=proxy_settings,
+                actions=actions,
+                capture_xhr=capture_xhr,
+                headers=merged_headers if merged_headers else None,
+                cookies=merged_cookies if merged_cookies else None,
                 screenshot=screenshot,
                 screenshot_format=screenshot_format,
                 screenshot_max_bytes=self.config.screenshot_max_bytes,
@@ -963,18 +1219,22 @@ class PageFetch:
                 http_resp = await http_fetcher.fetch(
                     target_url,
                     proxy_url=per_request_proxy,
-                    headers=self._headers_for_url(target_url),
+                    headers=self._headers_for_url(target_url, extra_headers=headers),
+                    cookies=merged_cookies if merged_cookies else None,
                 )
                 if is_pdf_content(http_resp.headers.get("Content-Type", ""), http_resp.content, url=target_url):
                     pdf_result = self._result_from_pdf(url, http_resp, proxy)
                     if response.screenshot:
                         pdf_result.screenshot = response.screenshot
                         pdf_result.screenshot_format = response.screenshot_format
+                    pdf_result.actions_executed = response.actions_executed
+                    pdf_result.xhr_responses = response.xhr_responses
                     return pdf_result
             except Exception as exc:
                 logger.warning("Failed to recover PDF via HTTP in browser fetch: %s", exc)
 
         raw_soup = BeautifulSoup(response.html, "lxml")
+        report = analyze_html(response.html, soup=raw_soup)
         result = self._result_from_html(
             original_url=url,
             final_url=response.url,
@@ -985,25 +1245,37 @@ class PageFetch:
             proxy=proxy,
             method="browser",
             soup=raw_soup,
-            confidence=response.confidence,
+            confidence=report,
             include_structure=structure,
             compact_structure=compact_structure,
         )
         result.screenshot = response.screenshot
         result.screenshot_format = response.screenshot_format
+        result.actions_executed = response.actions_executed
+        result.xhr_responses = response.xhr_responses
         result.warnings.extend(response.warnings)
-        report = response.confidence
-        if response.status_code is not None and response.status_code >= 400:
-            result.success = False
-            code = "blocked" if response.status_code in BLOCKED_STATUS_CODES else "http_error"
-            result.error = FetchErrorInfo(
-                code,
-                f"browser navigation returned status {response.status_code}",
-                response.status_code in RETRYABLE_STATUS_CODES,
-            )
-        elif report.challenge:
+        effective_status = result.status_code
+        if report.challenge:
             result.success = False
             result.error = FetchErrorInfo("captcha_detected", "challenge page remained after browser retries", False)
+        elif effective_status is not None and effective_status >= 400:
+            if (
+                effective_status in (BLOCKED_STATUS_CODES | {503})
+                and not report.challenge
+                and report.score >= self.config.confidence_threshold
+            ):
+                result.status_code = 200
+                result.warnings.append(
+                    f"Initial navigation returned status {effective_status}, but challenge solved successfully."
+                )
+            else:
+                result.success = False
+                code = "blocked" if effective_status in BLOCKED_STATUS_CODES else "http_error"
+                result.error = FetchErrorInfo(
+                    code,
+                    f"browser navigation returned status {effective_status}",
+                    effective_status in RETRYABLE_STATUS_CODES,
+                )
         elif report.score < self.config.confidence_threshold:
             result.warnings.append("Rendered content may still be incomplete.")
         return result
@@ -1077,7 +1349,7 @@ class PageFetch:
         self._proxy_http_clients.retain(cached)
         return cached
 
-    def _headers_for_url(self, url: str) -> dict[str, str]:
+    def _headers_for_url(self, url: str, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
         headers = dict(BROWSER_HEADERS)
         domain = urlsplit(url).hostname or url
         # Pick the User-Agent from the pool matching the host OS so outgoing
@@ -1087,22 +1359,38 @@ class PageFetch:
         pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(pool)
         headers["User-Agent"] = pool[pool_idx]
         headers["Accept-Language"] = self.config.accept_language
+        if self.config.headers:
+            for k, v in self.config.headers.items():
+                lower_k = k.lower()
+                for existing_k in list(headers):
+                    if existing_k.lower() == lower_k:
+                        del headers[existing_k]
+                headers[k] = v
+        if extra_headers:
+            for k, v in extra_headers.items():
+                lower_k = k.lower()
+                for existing_k in list(headers):
+                    if existing_k.lower() == lower_k:
+                        del headers[existing_k]
+                headers[k] = v
         return headers
 
-    def _resolve_proxy_url(self, provider: str, url: str) -> str | None:
+    def _resolve_proxy_url(self, provider: str, url: str, salt: str = "") -> str | None:
         """Return the per-request proxy URL for *provider* under the current rotation policy.
 
         - ``none`` returns ``None`` (no proxy).
         - ``custom`` and residential providers in ``rotate`` mode return the
-          configured URL verbatim — self-hosted proxies have no concept of
-          session affinity, and residential gateways rotate the egress IP on
-          every request when no session token is appended.
+        configured URL verbatim — self-hosted proxies have no concept of
+        session affinity, and residential gateways rotate the egress IP on
+        every request when no session token is appended.
         - Residential providers in ``sticky`` mode get a domain-stable
-          session ID embedded in the username so the same exit is reused
-          across requests for the same site.  When the config carries a
-          ``session_duration``, the matching documented TTL token is also
-          appended (``-sessionduration-<minutes>`` for Decodo,
-          ``_ttl_<n><unit>`` for Byteful — DECODO_DOCS §4, BYTEFUL_DOCS §4).
+        session ID embedded in the username so the same exit is reused
+        across requests for the same site.  When the config carries a
+        ``session_duration``, the matching documented TTL token is also
+        appended (``-sessionduration-<minutes>`` for Decodo,
+        ``_ttl_<n><unit>`` for Byteful — DECODO_DOCS §4, BYTEFUL_DOCS §4).
+        - Optional *salt* generates a distinct sticky session token for the
+        same domain (used on browser fallback after an HTTP block).
 
         Used by both the HTTP and browser transports so the two paths cannot
         drift on rotation semantics.
@@ -1118,12 +1406,12 @@ class PageFetch:
         return inject_session_id_for(
             provider,
             settings.url,
-            make_domain_session(domain),
+            make_domain_session(domain, salt=salt),
             session_duration_seconds=self.config.session_duration,
         )
 
-    def _browser_pool_target(self, provider: str, url: str) -> tuple[str, ProxySettings]:
-        proxy_url = self._resolve_proxy_url(provider, url)
+    def _browser_pool_target(self, provider: str, url: str, salt: str = "") -> tuple[str, ProxySettings]:
+        proxy_url = self._resolve_proxy_url(provider, url, salt=salt)
         return provider, ProxySettings(provider=provider, url=proxy_url)
 
     def _new_browser_fetcher(self, proxy: ProxySettings) -> BrowserFetcher:
@@ -1139,12 +1427,14 @@ class PageFetch:
             block_level=self.config.block_level,
             humanize=self.config.humanize,
             accept_language=self.config.accept_language,
+            max_browser_requests=self.config.max_browser_requests,
         )
 
     async def _acquire_browser_fetcher(
         self,
         provider: str,
         url: str,
+        salt: str = "",
     ) -> tuple[str, ProxySettings, BrowserFetcher]:
         """Return a long-lived :class:`BrowserFetcher` for *provider*.
 
@@ -1153,7 +1443,7 @@ class PageFetch:
         ``self._browser_semaphore``; this method only guarantees that two
         coroutines racing for the same key do not double-spawn a browser.
         """
-        cache_key, proxy = self._browser_pool_target(provider, url)
+        cache_key, proxy = self._browser_pool_target(provider, url, salt=salt)
         fetcher = self._browser_fetchers.get(cache_key)
         if fetcher is not None:
             return cache_key, proxy, fetcher

@@ -262,14 +262,17 @@ def inject_session_id_for(
     )
 
 
-def make_domain_session(domain: str) -> str:
+def make_domain_session(domain: str, salt: str = "") -> str:
     """Return a stable session ID for *domain* (sticky: one exit per domain).
 
     Hex strings are a safe subset of the alphanumeric session-ID grammar
     documented for both DECODO (DECODO_DOCS §4) and Byteful (BYTEFUL_DOCS
-    §4: "random alphanumeric").
+    §4: "random alphanumeric"). An optional *salt* can be provided to obtain
+    a fresh exit node for the same domain (e.g. on browser fallback after an
+    HTTP block).
     """
-    return hashlib.sha256(domain.encode()).hexdigest()[:12]
+    token = f"{domain}:{salt}" if salt else domain
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
 
 
 def resolve_proxy(provider: str) -> ProxySettings:

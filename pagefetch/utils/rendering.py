@@ -76,6 +76,20 @@ def _render_structure(result: FetchResult) -> str:
         f"- Max depth: {structure.max_depth}",
         "",
     ]
+    if result.actions_executed:
+        lines.append("## Actions executed")
+        lines.append("")
+        for act in result.actions_executed:
+            status = "✓" if act.success else f"✗ ({act.error})"
+            sel_part = f" on `{act.selector}`" if act.selector else ""
+            lines.append(f"- #{act.index} `{act.type}`{sel_part}: {status} ({act.duration_ms}ms)")
+        lines.append("")
+    if result.xhr_responses:
+        lines.append("## Captured XHR")
+        lines.append("")
+        for xhr in result.xhr_responses:
+            lines.append(f"- `{xhr.method} {xhr.url}` → {xhr.status_code} ({xhr.content_type or 'unknown'})")
+        lines.append("")
     if structure.stylesheets:
         lines.append("## Stylesheets")
         lines.append("")
@@ -128,7 +142,8 @@ def _render_structure(result: FetchResult) -> str:
 def _render_node(node, indent: int = 0) -> list[str]:
     """Render a DOM node tree with copyable, unique CSS selectors."""
     selector = node.unique_selector or node.path or node.selector
-    bullet = "  " * indent + f"- `{selector}`"
+    badge = f"[#{node.action_id}] " if getattr(node, "interactive", False) and getattr(node, "action_id", None) is not None else ""
+    bullet = "  " * indent + f"- {badge}`{selector}`"
     if node.text:
         bullet += f": {node.text}"
     lines = [bullet]

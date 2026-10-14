@@ -30,19 +30,25 @@ from .config import (
     VALID_STEALTH_LEVELS,
     PageFetchConfig,
 )
+from .constants import VALID_HTTP_METHODS
 from .exceptions import PageFetchError
 from .models import (
+    ActionResult,
+    CapturedXHR,
     FetchErrorInfo,
     FetchResult,
     ImageInfo,
     InlineScript,
     InlineStylesheet,
     LinkInfo,
+    PageAction,
     PageStructure,
     ScriptInfo,
     StructureNode,
     StylesheetInfo,
+    VALID_ACTION_TYPES,
 )
+from .fetching.actions import normalize_actions, parse_action
 from .processing import StructureLimits, extract_document, extract_structure
 from .proxy.providers import ProxyConfigurationError
 
@@ -65,15 +71,18 @@ except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
     # Mirrors the version declared in ``pyproject.toml`` so that
     # ``pagefetch.__version__`` is usable before the distribution metadata
     # is installed (editable checkouts, sdists).
-    __version__ = "0.9.8"
+    __version__ = "0.9.9"
 
 __all__ = [
+    "ActionResult",
+    "CapturedXHR",
     "FetchErrorInfo",
     "FetchResult",
     "ImageInfo",
     "InlineScript",
     "InlineStylesheet",
     "LinkInfo",
+    "PageAction",
     "PageFetch",
     "PageFetchConfig",
     "PageFetchError",
@@ -84,8 +93,10 @@ __all__ = [
     "StructureLimits",
     "StructureNode",
     "StylesheetInfo",
+    "VALID_ACTION_TYPES",
     "VALID_BLOCK_LEVELS",
     "VALID_CLEANING_LEVELS",
+    "VALID_HTTP_METHODS",
     "VALID_MODES",
     "VALID_PROXIES",
     "VALID_SESSION_ROTATION",
@@ -94,4 +105,6 @@ __all__ = [
     "ensure_runtime_requirements",
     "extract_document",
     "extract_structure",
+    "normalize_actions",
+    "parse_action",
 ]

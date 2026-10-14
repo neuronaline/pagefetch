@@ -74,6 +74,27 @@ class TransportFailure(Exception):
         super().__init__(error.message)
 
 
+class _SharedClientTransport(httpx.AsyncBaseTransport):
+    """Transport adapter delegating to a client's pooled transport while isolating cookies.
+
+    httpx.AsyncClient accumulates cookies in `client.cookies` across all requests.
+    Wrapping the client's underlying transport in an ephemeral per-fetch `AsyncClient`
+    gives each fetch operation an isolated cookie jar (so Set-Cookie headers survive
+    redirect hops within the operation) without leaking cookies across distinct fetches
+    or concurrent requests, and without closing the shared connection pool on exit.
+    """
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self._client = client
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        transport = self._client._transport_for_url(request.url)
+        return await transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        pass
+
+
 class HTTPFetcher:
     """Fetch through one or more shared ``httpx.AsyncClient`` instances."""
 
@@ -100,78 +121,109 @@ class HTTPFetcher:
         self,
         url: str,
         *,
+        method: str = "GET",
         proxy_url: str | None = None,
         headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
+        json_data: Any = None,
         retryable_status_codes: frozenset[int] | None = None,
     ) -> HTTPResponse:
-        # Reuse a single pooled ``httpx.AsyncClient`` per proxy URL when a
-        # provider callback is supplied. The caller owns the lifecycle
-        # (``PageFetch._teardown`` closes every client handed out by the
-        # provider). If no provider is available (e.g. standalone fetcher),
-        # fall back to a dedicated per-request client so ``proxy_url`` is
-        # never silently ignored.
-        if proxy_url is not None:
-            if self.proxy_client_provider is not None:
-                client = await self.proxy_client_provider(proxy_url)
-                try:
-                    return await self._fetch_with_retries(
-                        url,
-                        client=client,
-                        headers=headers,
-                        retryable_status_codes=retryable_status_codes,
+        fallback_client: httpx.AsyncClient | None = None
+        base_client: httpx.AsyncClient | None = None
+        try:
+            if proxy_url is not None:
+                if self.proxy_client_provider is not None:
+                    base_client = await self.proxy_client_provider(proxy_url)
+                else:
+                    req_headers = headers if headers is not None else self.client.headers
+                    fallback_client = httpx.AsyncClient(
+                        headers=req_headers,
+                        timeout=self.client.timeout,
+                        follow_redirects=False,
+                        max_redirects=self.max_redirects,
+                        http2=True,
+                        proxy=proxy_url,
+                        limits=httpx.Limits(
+                            max_connections=self.retries + 1,
+                            max_keepalive_connections=1,
+                        ),
                     )
-                finally:
-                    if self.proxy_client_releaser is not None:
-                        self.proxy_client_releaser(client)
-            req_headers = headers if headers is not None else self.client.headers
-            fallback_client = httpx.AsyncClient(
-                headers=req_headers,
-                timeout=self.client.timeout,
+                    base_client = fallback_client
+            else:
+                base_client = self.client
+
+            # Do not inject client-level headers into op_client so that _strip_credentials
+            # during cross-origin redirects is not subverted by httpx client-level header merging.
+            op_client = httpx.AsyncClient(
+                transport=_SharedClientTransport(base_client),
+                timeout=base_client.timeout,
                 follow_redirects=False,
                 max_redirects=self.max_redirects,
-                http2=True,
-                proxy=proxy_url,
-                limits=httpx.Limits(
-                    max_connections=self.retries + 1,
-                    max_keepalive_connections=1,
-                ),
             )
             try:
                 return await self._fetch_with_retries(
                     url,
-                    client=fallback_client,
+                    method=method,
+                    client=op_client,
                     headers=headers,
+                    cookies=cookies,
+                    content=content,
+                    data=data,
+                    json_data=json_data,
                     retryable_status_codes=retryable_status_codes,
                 )
             finally:
-                await fallback_client.aclose()
-        return await self._fetch_with_retries(
-            url, client=None, headers=headers, retryable_status_codes=retryable_status_codes
-        )
+                await op_client.aclose()
+        finally:
+            if proxy_url is not None and base_client is not None:
+                if fallback_client is not None:
+                    await fallback_client.aclose()
+                elif self.proxy_client_releaser is not None:
+                    self.proxy_client_releaser(base_client)
 
     async def _fetch_with_retries(
         self,
         url: str,
         *,
+        method: str = "GET",
         client: httpx.AsyncClient | None = None,
         headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
+        json_data: Any = None,
         retryable_status_codes: frozenset[int] | None = None,
     ) -> HTTPResponse:
         retry_codes = retryable_status_codes if retryable_status_codes is not None else RETRYABLE_STATUS_CODES
         for attempt in range(self.retries + 1):
             try:
                 async with self.semaphore:
-                    response = await self._request(url, client=client, headers=headers)
+                    response = await self._request(
+                        url,
+                        method=method,
+                        client=client,
+                        headers=headers,
+                        cookies=cookies,
+                        content=content,
+                        data=data,
+                        json_data=json_data,
+                    )
+                is_idempotent = method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
                 if response.status_code in retry_codes and attempt < self.retries:
                     # Cloudflare Under Attack / WAF interstitial: backoff will not
                     # resolve a JS bot gate, fast-track to allow caller escalation.
                     if response.status_code == 503 and looks_like_waf_challenge(response.content):
                         return response
+                    if not is_idempotent and response.status_code != 429:
+                        return response
                     await self._backoff(attempt, response.headers.get("Retry-After"))
                     continue
                 return response
             except TransportFailure as exc:
-                if not exc.error.retryable or attempt >= self.retries:
+                is_idempotent = method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+                if not exc.error.retryable or attempt >= self.retries or not is_idempotent:
                     raise
                 await self._backoff(attempt)
         # Unreachable: every loop iteration either ``continue``-s, ``return``-s,
@@ -183,19 +235,40 @@ class HTTPFetcher:
         self,
         url: str,
         *,
+        method: str = "GET",
         client: httpx.AsyncClient | None = None,
         headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        content: bytes | str | None = None,
+        data: dict[str, Any] | None = None,
+        json_data: Any = None,
     ) -> HTTPResponse:
         client = client or self.client
         current_url = url
+        current_method = method.upper()
+        current_content = content
+        current_data = data
+        current_json = json_data
+        current_cookies: dict[str, str] | None = dict(cookies) if cookies else None
         # Operate on a working copy so the caller's dict is never mutated.
-        # The same-origin/cross-origin decision below needs to mutate this
-        # without affecting ``headers`` references the caller still holds.
-        current_headers: dict[str, str] | None = dict(headers) if headers else None
+        # Initialize from headers or self.client.headers so all required request headers
+        # are present while allowing _strip_credentials to cleanly remove credentials
+        # on cross-origin redirects without interference from client-level headers.
+        current_headers: dict[str, str] = dict(
+            headers if headers is not None else self.client.headers
+        )
         redirect_count = 0
         while True:
             try:
-                async with client.stream("GET", current_url, headers=current_headers) as response:
+                async with client.stream(
+                    current_method,
+                    current_url,
+                    headers=current_headers,
+                    cookies=current_cookies,
+                    content=current_content,
+                    data=current_data,
+                    json=current_json,
+                ) as response:
                     # Pre-flight redirect handling. ``follow_redirects`` is
                     # forced off on every httpx client (see ``HTTPFetcher.fetch``
                     # and ``PageFetch._http_fetcher``) so the SSRF guard has
@@ -239,14 +312,31 @@ class HTTPFetcher:
                                 ),
                                 status_code=response.status_code,
                             ) from exc
-                        # Strip credential-bearing headers when the redirect
+                        # RFC 9110 § 15.4: 303 always converts to GET.
+                        # 301/302 from POST also conventionally convert to GET.
+                        if response.status_code == 303 or (
+                            response.status_code in {301, 302} and current_method == "POST"
+                        ):
+                            current_method = "GET"
+                            current_content = None
+                            current_data = None
+                            current_json = None
+                            if current_headers is not None:
+                                current_headers = {
+                                    k: v
+                                    for k, v in current_headers.items()
+                                    if k.lower() not in {"content-type", "content-length"}
+                                }
+                        # Strip credential-bearing headers and cookies when the redirect
                         # crosses an origin boundary — otherwise an attacker
                         # who controls the redirect target can harvest the
                         # caller's ``Authorization``/``Cookie``/proxy auth
                         # in plaintext. Same-origin redirects keep the full
                         # header set so internal app routing still works.
-                        if current_headers is not None and _is_cross_origin(current_url, next_url):
-                            current_headers = _strip_credentials(current_headers)
+                        if _is_cross_origin(current_url, next_url):
+                            if current_headers is not None:
+                                current_headers = _strip_credentials(current_headers)
+                            current_cookies = None
                         current_url = next_url
                         redirect_count += 1
                         continue

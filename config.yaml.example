@@ -41,13 +41,16 @@ retries_browser: 2
 # Multiplicative byte margin over max_content_size for browser-mode pre-render checks
 # browser_pre_check_byte_margin: 1.5
 
+# Number of requests served by a browser process before recycling (default: 50)
+# max_browser_requests: 50
+
 # ── Stealth & Anti-Detection ────────────────────────────────
 # Anti-detection preset: off | balanced | max
 #   off      — humanize=false, block_level=aggressive, request_pacing=0.0, session_rotation=sticky
-#   balanced — humanize=true,  block_level=balanced,   request_pacing=0.5, session_rotation=rotate
+#   balanced — humanize=true,  block_level=balanced,   request_pacing=0.5, session_rotation=rotate (recommended)
 #   max      — humanize=true,  block_level=minimal,    request_pacing=2.0, session_rotation=rotate
 # Explicitly set options below override the preset values.
-stealth_level: off
+stealth_level: balanced
 
 # Add small randomized delays to mimic human interaction
 humanize: false
@@ -104,6 +107,14 @@ session_rotation: sticky
 cache_enabled: true
 cache_ttl: 24h               # s, m, h, d  suffixes accepted
 # cache_path: ./pagefetch-cache.sqlite3  # default uses the native user cache directory
+
+# ── Custom Headers & Cookies ────────────────────────────────
+# Default headers and cookies applied to all requests.
+# headers:
+#   Authorization: "Bearer ${API_TOKEN}"
+#   X-Custom-Client: "pagefetch-app"
+# cookies:
+#   session_token: "example_token_value"
 
 # ── Error handling ──────────────────────────────────────────
 raise_on_error: false

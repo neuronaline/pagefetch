@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -105,6 +105,8 @@ class PageFetchConfig:
     stealth_level: Literal["off", "balanced", "max"] = "off"
     raise_on_error: bool = False
     screenshot_max_bytes: int = 50 * 1024 * 1024
+    # Number of requests served by a browser process before recycling.
+    max_browser_requests: int = 50
     # Browser-mode renders the page first and then measures the resulting DOM.
     # The char-length pre-check uses a multiplicative byte margin over the
     # configured max_content_size to account for multi-byte UTF-8. The
@@ -112,9 +114,17 @@ class PageFetchConfig:
     # pages earlier (saving render time) at the cost of more frequent
     # content_too_large errors on legitimate pages.
     browser_pre_check_byte_margin: float = 1.5
+    headers: dict[str, str] = field(default_factory=dict)
+    cookies: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate direct construction and normalize its public inputs."""
+        if not isinstance(self.headers, dict):
+            raise ValueError("headers must be a dictionary")
+        if not isinstance(self.cookies, dict):
+            raise ValueError("cookies must be a dictionary")
+        object.__setattr__(self, "headers", {str(k).strip(): str(v).strip() for k, v in self.headers.items()})
+        object.__setattr__(self, "cookies", {str(k).strip(): str(v).strip() for k, v in self.cookies.items()})
         if not isinstance(self.mode, str) or self.mode not in VALID_MODES:
             raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
         if not isinstance(self.proxy, str) or self.proxy not in VALID_PROXIES:
@@ -136,6 +146,7 @@ class PageFetchConfig:
             "max_redirects": self.max_redirects,
             "max_content_size": self.max_content_size,
             "screenshot_max_bytes": self.screenshot_max_bytes,
+            "max_browser_requests": self.max_browser_requests,
         }.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
@@ -280,7 +291,10 @@ class PageFetchConfig:
             stealth_level=flat.get("stealth_level", "off"),
             raise_on_error=flat.get("raise_on_error", False),
             screenshot_max_bytes=flat.get("screenshot_max_bytes", 50 * 1024 * 1024),
+            max_browser_requests=flat.get("max_browser_requests", 50),
             browser_pre_check_byte_margin=flat.get("browser_pre_check_byte_margin", 1.5),
+            headers=flat.get("headers"),
+            cookies=flat.get("cookies"),
         )
 
     @classmethod
@@ -312,7 +326,10 @@ class PageFetchConfig:
         stealth_level: Literal["off", "balanced", "max"] = "off",
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
+        max_browser_requests: int = 50,
         browser_pre_check_byte_margin: float = 1.5,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
     ) -> PageFetchConfig:
         if not isinstance(stealth_level, str) or stealth_level not in VALID_STEALTH_LEVELS:
             raise ValueError(f"stealth_level must be one of {sorted(VALID_STEALTH_LEVELS)}")
@@ -377,5 +394,26 @@ class PageFetchConfig:
             stealth_level=stealth_level,
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
+            max_browser_requests=max_browser_requests,
             browser_pre_check_byte_margin=browser_pre_check_byte_margin,
+            headers=(
+                {str(k).strip(): str(v).strip() for k, v in headers.items()}
+                if isinstance(headers, dict)
+                else {
+                    k.strip(): v.strip()
+                    for h in (headers or [])
+                    if ":" in h
+                    for k, v in [h.split(":", 1)]
+                }
+            ),
+            cookies=(
+                {str(k).strip(): str(v).strip() for k, v in cookies.items()}
+                if isinstance(cookies, dict)
+                else {
+                    k.strip(): v.strip()
+                    for c in (cookies or [])
+                    if "=" in c
+                    for k, v in [c.split("=", 1)]
+                }
+            ),
         )

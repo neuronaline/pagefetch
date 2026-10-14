@@ -133,6 +133,7 @@ def extract_structure(
     base_url: str | None = None,
     *,
     limits: StructureLimits | None = None,
+    compact: bool | None = None,
 ) -> PageStructure:
     """Return a bounded :class:`PageStructure` summary of the supplied HTML.
 
@@ -142,7 +143,18 @@ def extract_structure(
     rely on the caller's choice in :meth:`PageFetch.fetch`) to receive the
     smaller, LLM-friendly variant.
     """
-    limits = limits or StructureLimits()
+    if limits is None:
+        limits = StructureLimits(compact=bool(compact)) if compact is not None else StructureLimits()
+    elif compact is not None:
+        limits = StructureLimits(
+            max_depth=limits.max_depth,
+            max_nodes=limits.max_nodes,
+            text_preview=limits.text_preview,
+            inline_source_limit=limits.inline_source_limit,
+            max_asset_items=limits.max_asset_items,
+            max_asset_bytes=limits.max_asset_bytes,
+            compact=compact,
+        )
     soup = (
         html_or_soup
         if isinstance(html_or_soup, BeautifulSoup)
@@ -171,15 +183,63 @@ def extract_structure(
     )
 
 
+_INTERACTIVE_TAGS = frozenset({"button", "select", "textarea", "summary", "option"})
+_INTERACTIVE_ROLES = frozenset(
+    {
+        "button",
+        "link",
+        "textbox",
+        "searchbox",
+        "combobox",
+        "checkbox",
+        "radio",
+        "switch",
+        "menuitem",
+        "tab",
+        "option",
+    }
+)
+
+
+def _is_interactive(tag: Tag, attrs: dict[str, str]) -> bool:
+    if "disabled" in attrs or "hidden" in attrs:
+        return False
+    if attrs.get("aria-hidden") == "true":
+        return False
+    tag_name = tag.name.lower()
+    if tag_name in _INTERACTIVE_TAGS:
+        return True
+    if tag_name == "a" and bool(attrs.get("href")):
+        return True
+    if tag_name == "input":
+        inp_type = attrs.get("type", "text").lower()
+        return inp_type != "hidden"
+    role = attrs.get("role", "").lower()
+    if role in _INTERACTIVE_ROLES:
+        return True
+    if attrs.get("contenteditable") in {"", "true"}:
+        return True
+    tabindex = attrs.get("tabindex")
+    if tabindex is not None:
+        try:
+            if int(tabindex) >= 0:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
 def _walk(
     soup: BeautifulSoup,
     *,
     limits: StructureLimits,
     depth: int = 0,
     counters: list[int] | None = None,
+    action_counters: list[int] | None = None,
 ) -> tuple[StructureNode | None, int, bool]:
     """Build the bounded DOM tree starting at the document root."""
     counters = counters if counters is not None else [0]
+    action_counters = action_counters if action_counters is not None else [0]
     root_tag = _first_element(soup)
     if root_tag is None:
         return None, 0, False
@@ -196,6 +256,7 @@ def _walk(
         root_tag,
         depth=depth,
         counters=counters,
+        action_counters=action_counters,
         limits=limits,
         id_counts=id_counts,
         tag_counts=tag_counts,
@@ -223,6 +284,7 @@ def _describe(
     *,
     depth: int,
     counters: list[int],
+    action_counters: list[int],
     limits: StructureLimits,
     parent_path: str = "",
     id_counts: dict[str, int] | None = None,
@@ -236,18 +298,25 @@ def _describe(
     selector = _build_selector(tag, attrs)
     segment = _path_segment(tag, attrs)
     path = f"{parent_path} > {segment}" if parent_path else segment
-    # In compact mode unique_selector is skipped. In normal mode, derive it in O(1)
-    # using precomputed single-pass counts instead of O(N^2) full-document CSS queries.
-    if limits.compact:
-        unique_selector = ""
+
+    is_interactive = _is_interactive(tag, attrs)
+    action_id: int | None = None
+    if is_interactive:
+        action_counters[0] += 1
+        action_id = action_counters[0]
+
+    # In compact mode unique_selector is skipped unless the node is interactive.
+    # In normal mode, derive it in O(1) using precomputed single-pass counts.
+    ident = attrs.get("id")
+    if ident and id_counts and id_counts.get(ident, 0) == 1:
+        computed_unique = f"#{_css_escape(ident)}"
+    elif tag_counts and tag_counts.get(tag.name, 0) == 1:
+        computed_unique = tag.name
     else:
-        ident = attrs.get("id")
-        if ident and id_counts and id_counts.get(ident, 0) == 1:
-            unique_selector = f"#{_css_escape(ident)}"
-        elif tag_counts and tag_counts.get(tag.name, 0) == 1:
-            unique_selector = tag.name
-        else:
-            unique_selector = path
+        computed_unique = path
+
+    unique_selector = "" if limits.compact and not is_interactive else computed_unique
+
     children: list[StructureNode] = []
     has_element_children = any(isinstance(child, Tag) for child in tag.children)
     if depth + 1 < limits.max_depth and counters[0] < limits.max_nodes:
@@ -258,6 +327,7 @@ def _describe(
                 child,
                 depth=depth + 1,
                 counters=counters,
+                action_counters=action_counters,
                 limits=limits,
                 parent_path=path,
                 id_counts=id_counts,
@@ -277,6 +347,8 @@ def _describe(
         children=children,
         path=path,
         unique_selector=unique_selector,
+        interactive=is_interactive,
+        action_id=action_id,
     )
     if depth + 1 >= limits.max_depth and has_element_children:
         truncated = True

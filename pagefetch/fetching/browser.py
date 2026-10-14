@@ -15,10 +15,11 @@ from urllib.parse import urldefrag, urljoin, urlsplit
 from bs4 import BeautifulSoup
 
 from ..config import VALID_SCREENSHOT_FORMATS, VALID_SCREENSHOT_MODES
-from ..models import FetchErrorInfo
+from ..models import ActionResult, CapturedXHR, FetchErrorInfo, PageAction
 from ..processing.detector import ConfidenceReport, analyze_html
 from ..proxy.providers import ProxySettings
 from ..utils.urls import async_is_safe_host, is_safe_host, registrable_host
+from .actions import matches_xhr_pattern
 from .http import TransportFailure
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
@@ -77,6 +78,8 @@ class BrowserResponse:
     confidence: ConfidenceReport
     screenshot: bytes | None = None
     screenshot_format: str | None = None
+    actions_executed: list[ActionResult] | None = None
+    xhr_responses: list[CapturedXHR] | None = None
 
 
 class BrowserFetcher:
@@ -96,6 +99,7 @@ class BrowserFetcher:
         block_level: str = "aggressive",
         humanize: bool = False,
         accept_language: str = "en-US,en;q=0.5",
+        max_browser_requests: int = 50,
     ) -> None:
         self.semaphore = semaphore
         self.timeout = timeout
@@ -108,6 +112,8 @@ class BrowserFetcher:
         self.block_level = block_level
         self.humanize = humanize
         self.accept_language = accept_language
+        self.max_browser_requests = max_browser_requests
+        self._request_count = 0
         self._manager: Any = None
         self._browser: Any = None
         self._start_lock = asyncio.Lock()
@@ -140,6 +146,8 @@ class BrowserFetcher:
             "locale": primary_locale,
             "window": random.choice(_VIEWPORT_POOL),
         }
+        if bool(self.proxy and self.proxy.url):
+            options["geoip"] = True
         if self.block_images:
             options["block_images"] = True
             # Suppress the Camoufox LeakWarning that fires when
@@ -305,6 +313,10 @@ class BrowserFetcher:
         url: str,
         *,
         proxy: ProxySettings | None = None,
+        actions: Sequence[PageAction] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         screenshot: str = "none",
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
@@ -339,6 +351,9 @@ class BrowserFetcher:
 
         async with self._active_lock:
             self._active_count += 1
+            self._request_count += 1
+            if self.max_browser_requests > 0 and self._request_count >= self.max_browser_requests:
+                self._needs_reset = True
         try:
             for attempt in range(self.retries + 1):
                 try:
@@ -354,6 +369,10 @@ class BrowserFetcher:
                         result = await self._fetch_page_once(
                             url,
                             proxy=proxy,
+                            actions=actions,
+                            capture_xhr=capture_xhr,
+                            headers=headers,
+                            cookies=cookies,
                             max_scrolls=max_scrolls,
                             scroll_sleep_early=scroll_sleep_early,
                             scroll_sleep_late=scroll_sleep_late,
@@ -407,24 +426,31 @@ class BrowserFetcher:
                 f"browser retry loop exited without terminating: last_failure={last_failure!r}"
             )
         finally:
+            should_reset = False
             async with self._active_lock:
                 self._active_count -= 1
                 if self._active_count == 0 and self._needs_reset:
                     self._needs_reset = False
-                    if self._browser is None and self._manager is not None:
-                        try:
-                            await self._manager.__aexit__(None, None, None)
-                        except Exception:
-                            pass
-                        self._manager = None
+                    self._request_count = 0
+                    should_reset = True
+            if should_reset:
+                await self.close()
 
     async def _setup_interception(
         self,
         page: Any,
         target_url: str,
         proxy: ProxySettings | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
     ) -> dict[str, Any]:
-        network = {"active": 0, "last_activity": time.monotonic()}
+        network: dict[str, Any] = {
+            "active": 0,
+            "last_activity": time.monotonic(),
+            "last_document_status": None,
+            "captured_xhr": [],
+            "pending_xhr_tasks": set(),
+        }
+        total_xhr_bytes = [0]
 
         def request_started(_request: Any) -> None:
             network["active"] += 1
@@ -434,9 +460,67 @@ class BrowserFetcher:
             network["active"] = max(0, network["active"] - 1)
             network["last_activity"] = time.monotonic()
 
+        async def _capture_xhr_body(resp: Any, req_method: str) -> None:
+            try:
+                ct = (resp.headers.get("content-type") or "").lower()
+                resp_headers = dict(resp.headers) if hasattr(resp, "headers") else None
+                body_bytes = await resp.body()
+                size = len(body_bytes)
+                total_xhr_bytes[0] += size
+                truncated = False
+                if size > 512 * 1024:
+                    body_bytes = body_bytes[: 512 * 1024]
+                    truncated = True
+                body_val: Any = None
+                if "application/json" in ct or "+json" in ct:
+                    try:
+                        import json
+
+                        body_val = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                    except Exception:
+                        body_val = body_bytes.decode("utf-8", errors="replace")
+                else:
+                    body_val = body_bytes.decode("utf-8", errors="replace")
+                network["captured_xhr"].append(
+                    CapturedXHR(
+                        url=resp.url,
+                        method=req_method,
+                        status_code=resp.status,
+                        content_type=ct or None,
+                        body=body_val,
+                        truncated=truncated,
+                        headers=resp_headers,
+                    )
+                )
+            except Exception:
+                pass
+
+        def on_document_response(resp: Any) -> None:
+            try:
+                req = getattr(resp, "request", None)
+                if req and req.resource_type == "document":
+                    frame = getattr(resp, "frame", None)
+                    if frame == page.main_frame:
+                        network["last_document_status"] = resp.status
+                if capture_xhr and req and req.resource_type in {"xhr", "fetch"}:
+                    if matches_xhr_pattern(resp.url, capture_xhr):
+                        pending_count = len(network["pending_xhr_tasks"])
+                        captured_count = len(network["captured_xhr"])
+                        if pending_count + captured_count < 50 and total_xhr_bytes[0] < 4 * 1024 * 1024:
+                            try:
+                                loop = asyncio.get_running_loop()
+                                t = loop.create_task(_capture_xhr_body(resp, req.method))
+                                network["pending_xhr_tasks"].add(t)
+                                t.add_done_callback(network["pending_xhr_tasks"].discard)
+                            except RuntimeError:
+                                pass
+            except Exception:
+                pass
+
         page.on("request", request_started)
         page.on("requestfinished", request_finished)
         page.on("requestfailed", request_finished)
+        page.on("response", on_document_response)
 
         # Pre-compute the registrable host once so route_handler avoids
         # the expensive tldextract call on every document-frame request.
@@ -522,12 +606,29 @@ class BrowserFetcher:
 
         # ── early-exit probe ──
         probe = await in_page_metrics(page)
-        skip_scroll = (
-            not probe["challenge"]
-            and (
-                probe["text"] >= 800
-                or probe["main_text"] >= 300
+        if probe["challenge"]:
+            # Challenge page detected (e.g. Cloudflare Turnstile / Just a moment).
+            # Avoid scrolling which can interrupt solving, and poll until resolved.
+            challenge_timeout = min(8.0, self.timeout / 2)
+            challenge_deadline = time.monotonic() + challenge_timeout
+            while time.monotonic() < challenge_deadline:
+                await asyncio.sleep(0.25)
+                probe = await in_page_metrics(page)
+                if not probe["challenge"]:
+                    break
+            await wait_for_stability(
+                page,
+                timeout=min(2.0, self.timeout / 4),
+                stable_rounds=2,
+                network_activity=lambda: (network["active"], network["last_activity"]),
             )
+            probe = await in_page_metrics(page)
+            if probe["challenge"]:
+                return True
+
+        skip_scroll = (
+            probe["text"] >= 800
+            or probe["main_text"] >= 300
         )
 
         if skip_scroll:
@@ -584,6 +685,10 @@ class BrowserFetcher:
         url: str,
         *,
         proxy: ProxySettings | None = None,
+        actions: Sequence[PageAction] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
         max_scrolls: int = 6,
         scroll_sleep_early: float = 0.10,
         scroll_sleep_late: float = 0.15,
@@ -592,7 +697,7 @@ class BrowserFetcher:
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
     ) -> BrowserResponse:
-        """Navigate, wait for stability, optionally scroll, and return raw HTML.
+        """Navigate, wait for stability, optionally scroll, execute actions, and return raw HTML.
 
         Uses an adaptive early-exit probe: if the page is already complete
         after the first stability wait, scrolling and the second wait are
@@ -604,20 +709,43 @@ class BrowserFetcher:
         """
         page: Any = None
         context: Any = None
+        network: dict[str, Any] = {}
         warnings: list[str] = []
         try:
             async with asyncio.timeout(page_timeout):
+                context_headers = {"Accept-Language": self.accept_language}
+                if headers:
+                    context_headers.update(headers)
                 context_kwargs: dict[str, Any] = {
-                    "extra_http_headers": {"Accept-Language": self.accept_language}
+                    "extra_http_headers": context_headers
                 }
                 effective_proxy = proxy if proxy is not None else self.proxy
                 browser_proxy = effective_proxy.browser_config() if effective_proxy else None
                 if browser_proxy:
                     context_kwargs["proxy"] = browser_proxy
                 context = await self._browser.new_context(**context_kwargs)
+                if cookies:
+                    cookie_list = [
+                        {"name": k, "value": v, "url": url}
+                        for k, v in cookies.items()
+                    ]
+                    try:
+                        await context.add_cookies(cookie_list)
+                    except Exception:
+                        target_host = urlsplit(url).hostname or "localhost"
+                        try:
+                            await context.add_cookies([
+                                {"name": k, "value": v, "domain": target_host, "path": "/"}
+                                for k, v in cookies.items()
+                            ])
+                        except Exception as exc:
+                            logger.debug("Failed to set cookies on browser context: %s", exc)
+
                 page = await context.new_page()
 
-                network = await self._setup_interception(page, url, proxy=effective_proxy)
+                network = await self._setup_interception(
+                    page, url, proxy=effective_proxy, capture_xhr=capture_xhr
+                )
                 response = await page.goto(
                     url,
                     wait_until="domcontentloaded",
@@ -632,6 +760,19 @@ class BrowserFetcher:
                     scroll_sleep_late=scroll_sleep_late,
                     warnings=warnings,
                 )
+
+                actions_executed = None
+                if actions:
+                    from .actions import execute_page_actions, normalize_actions
+
+                    normalized_actions = normalize_actions(actions)
+                    actions_executed = await execute_page_actions(
+                        page,
+                        normalized_actions,
+                        humanize=self.humanize,
+                        default_timeout=min(15.0, self.timeout),
+                        warnings=warnings,
+                    )
 
                 # Fast size pre-check — character length is enough as a soft
                 # guard; avoids the cost of a TextEncoder byte-length encode.
@@ -672,14 +813,23 @@ class BrowserFetcher:
                     warnings=warnings,
                 )
 
+                pending_xhr = network.get("pending_xhr_tasks")
+                if pending_xhr:
+                    await asyncio.gather(*list(pending_xhr), return_exceptions=True)
+
+                doc_status = network.get("last_document_status")
+                final_status = doc_status if doc_status is not None else (response.status if response else None)
+
                 return BrowserResponse(
                     url=page.url,
-                    status_code=response.status if response else None,
+                    status_code=final_status,
                     html=html,
                     warnings=warnings,
                     confidence=ConfidenceReport(1.0, ()),
                     screenshot=screenshot_bytes,
                     screenshot_format=screenshot_ext,
+                    actions_executed=actions_executed,
+                    xhr_responses=network.get("captured_xhr") or None,
                 )
 
         except TransportFailure:
@@ -702,6 +852,10 @@ class BrowserFetcher:
                 FetchErrorInfo(code, public_message, True, type(exc).__name__)
             ) from exc
         finally:
+            if isinstance(network, dict) and network.get("pending_xhr_tasks"):
+                for t in list(network["pending_xhr_tasks"]):
+                    if not t.done():
+                        t.cancel()
             if page is not None:
                 try:
                     # Stop route interception before closing so Playwright can
@@ -781,19 +935,20 @@ class BrowserFetcher:
         return str(soup)
 
     async def close(self) -> None:
-        if self._manager is not None:
-            try:
-                await self._manager.__aexit__(None, None, None)
-            finally:
-                self._manager = None
+        async with self._start_lock:
+            if self._manager is not None:
+                try:
+                    await self._manager.__aexit__(None, None, None)
+                finally:
+                    self._manager = None
+                    self._browser = None
+            elif self._browser is not None:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
                 self._browser = None
-        elif self._browser is not None:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        xvfb = self._xvfb
-        self._xvfb = None
-        if xvfb is not None:
-            await asyncio.to_thread(xvfb.stop)
+            xvfb = self._xvfb
+            self._xvfb = None
+            if xvfb is not None:
+                await asyncio.to_thread(xvfb.stop)
