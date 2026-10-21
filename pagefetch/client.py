@@ -64,7 +64,7 @@ from .proxy.providers import (
     make_domain_session,
 )
 from .utils.durations import parse_duration
-from .utils.urls import normalize_url, registrable_host, validate_url
+from .utils.urls import async_is_safe_host, normalize_url, registrable_host, validate_url
 
 logger = logging.getLogger("pagefetch")
 
@@ -298,6 +298,10 @@ class PageFetch:
                 try:
                     await self._cache.start()
                 except Exception as exc:
+                    try:
+                        await self._cache.close()
+                    except Exception:
+                        pass
                     self._cache = None
                     self._startup_warnings.append("Cache initialization failed; caching is disabled.")
                     logger.warning("cache initialization failed: %s", type(exc).__name__)
@@ -531,7 +535,8 @@ class PageFetch:
                     json_data=json,
                 )
             effective_mode = selected_mode
-            if effective_mode == "auto" and self._is_host_remembered(normalized_url):
+            is_remembered = self._is_host_remembered(normalized_url)
+            if effective_mode == "auto" and is_remembered:
                 logger.debug("Host %s remembered in browser memory; bypassing HTTP", normalized_url)
                 effective_mode = "browser"
             if effective_mode == "browser":
@@ -539,6 +544,7 @@ class PageFetch:
                     normalized_url,
                     selected_proxy,
                     status_code=None,
+                    proxy_salt="fallback" if is_remembered else "",
                     actions=normalized_actions,
                     capture_xhr=capture_xhr,
                     headers=headers,
@@ -654,9 +660,9 @@ class PageFetch:
             pacer = _AsyncPacer(self.config.request_pacing)
 
         async def run_one(item: str) -> FetchResult:
-            if pacer is not None:
-                await pacer.acquire()
             async with fanout_sem:
+                if pacer is not None:
+                    await pacer.acquire()
                 try:
                     return await self.fetch(
                         item,
@@ -821,8 +827,12 @@ class PageFetch:
         started_at = time.perf_counter()
         try:
             self._validate_fetch_options(mode, proxy)
-            validate_url(url)
+            has_proxy = bool(proxy or self.config.proxy)
+            parsed = validate_url(url, check_ssrf=False)
             normalized_url = normalize_url(url)
+            if parsed.hostname:
+                if not await async_is_safe_host(parsed.hostname, resolve_dns=not has_proxy):
+                    raise ValueError("URL points to a restricted local or private network address (SSRF protection)")
         except (TypeError, ValueError) as exc:
             code = "unsupported_scheme" if "scheme" in str(exc) else "invalid_url"
             return self._finish_error(
@@ -993,11 +1003,12 @@ class PageFetch:
             # fixed by rendering in a browser — surface them immediately instead of
             # waiting on an expensive Camoufox navigation that will fail the same way.
             raise
+        final_url = str(response.url)
+        content_type = self._content_type(response.headers.get("Content-Type"))
         if response.status_code >= 400:
             retryable = response.status_code in RETRYABLE_STATUS_CODES
-            content_type = self._content_type(response.headers.get("Content-Type"))
             is_waf = self._body_looks_like_waf_challenge(response.content)
-            kind = detect_document_kind(content_type, response.content, url=url)
+            kind = detect_document_kind(content_type, response.content, url=final_url)
 
             # Fail-fast for non-HTML/structured formats or API responses unless explicit WAF challenge markers exist
             non_html = kind in ("pdf", "docx", "csv", "tsv", "json", "xml") or any(
@@ -1038,8 +1049,7 @@ class PageFetch:
                 status_code=response.status_code,
             )
 
-        content_type = self._content_type(response.headers.get("Content-Type"))
-        kind = detect_document_kind(content_type, response.content, url=url)
+        kind = detect_document_kind(content_type, response.content, url=final_url)
         if kind == "pdf":
             return self._result_from_pdf(url, response, proxy)
         if kind == "docx":
@@ -1055,18 +1065,6 @@ class PageFetch:
         if kind == "text":
             return self._result_from_text(url, response, proxy)
         if kind != "html":
-            if mode == "auto" and method.upper() == "GET":
-                logger.info(
-                    "HTTP returned %s; using browser for %s", content_type, url
-                )
-                return await self._escalate_to_browser(
-                    url,
-                    proxy,
-                    status_code=response.status_code,
-                    is_bot_escalation=False,
-                    headers=headers,
-                    cookies=cookies,
-                )
             raise TransportFailure(
                 FetchErrorInfo(
                     "unsupported_content_type",
@@ -1234,7 +1232,7 @@ class PageFetch:
                 logger.warning("Failed to recover PDF via HTTP in browser fetch: %s", exc)
 
         raw_soup = BeautifulSoup(response.html, "lxml")
-        report = analyze_html(response.html, soup=raw_soup)
+        report = response.confidence if response.confidence is not None else analyze_html(response.html, soup=raw_soup)
         result = self._result_from_html(
             original_url=url,
             final_url=response.url,

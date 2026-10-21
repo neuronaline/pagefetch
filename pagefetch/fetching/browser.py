@@ -57,6 +57,30 @@ _CHALLENGE_DOMAINS: frozenset[str] = frozenset(
     }
 )
 
+# Common third-party tracking, ads, and analytics domains to block from all frames
+_TRACKER_DOMAINS: frozenset[str] = frozenset(
+    {
+        "google-analytics.com",
+        "googletagmanager.com",
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "hotjar.com",
+        "clarity.ms",
+        "criteo.com",
+        "criteo.net",
+        "outbrain.com",
+        "taboola.com",
+        "scorecardresearch.com",
+        "segment.io",
+        "segment.com",
+        "amplitude.com",
+        "mixpanel.com",
+        "connect.facebook.net",
+        "facebook.net",
+    }
+)
+
 # Common desktop viewport pool — avoids a single fixed fingerprint
 # while staying within realistic bounds for content extraction.
 _VIEWPORT_POOL: list[tuple[int, int]] = [
@@ -120,6 +144,8 @@ class BrowserFetcher:
         self._active_count = 0
         self._active_lock = asyncio.Lock()
         self._needs_reset = False
+        self._context_pools: dict[str, list[Any]] = {}
+        self._context_lock = asyncio.Lock()
         # Linux runs the browser headed against an in-process Xvfb to avoid
         # the fingerprinting tells of Firefox's native headless mode. On
         # Windows/macOS we stay on native headless — no display server is
@@ -148,6 +174,11 @@ class BrowserFetcher:
         }
         if bool(self.proxy and self.proxy.url):
             options["geoip"] = True
+            browser_proxy = self.proxy.browser_config()
+            if browser_proxy:
+                options["proxy"] = browser_proxy
+        else:
+            options["geoip"] = False
         if self.block_images:
             options["block_images"] = True
             # Suppress the Camoufox LeakWarning that fires when
@@ -163,15 +194,18 @@ class BrowserFetcher:
             options["i_know_what_im_doing"] = True
         if host_os is not None:
             options["os"] = host_os
-        # Proxy is configured per-context in _fetch_page_once rather
-        # than browser-wide, ensuring clean per-request session isolation.
         # Firefox user prefs for fetch-oriented performance.
-        # Disable cosmetic animations to reduce GPU/CPU overhead;
+        # Disable cosmetic animations, speculative connections, and service workers;
         # keep disk and memory cache on for repeat visits.
         options["firefox_user_prefs"] = {
             "browser.cache.disk.enable": True,
             "browser.cache.memory.enable": True,
             "toolkit.cosmeticAnimations.enabled": False,
+            "network.prefetch-next": False,
+            "network.dns.disablePrefetch": True,
+            "network.predictor.enabled": False,
+            "network.http.speculative-parallel-limit": 0,
+            "dom.serviceWorkers.enabled": False,
         }
         browser_env = dict(os.environ)
         if use_xvfb and self._xvfb is not None:
@@ -415,7 +449,6 @@ class BrowserFetcher:
                     if not exc.error.retryable or attempt >= self.retries:
                         raise
                     if exc.error.code in {"browser_launch_error", "browser_navigation_error"}:
-                        self._browser = None
                         self._needs_reset = True
                     if not await self._backoff_before_deadline(attempt, total_deadline):
                         raise self._timeout_failure() from exc
@@ -442,6 +475,7 @@ class BrowserFetcher:
         target_url: str,
         proxy: ProxySettings | None = None,
         capture_xhr: bool | str | Sequence[str] = False,
+        screenshot: bool = False,
     ) -> dict[str, Any]:
         network: dict[str, Any] = {
             "active": 0,
@@ -531,56 +565,63 @@ class BrowserFetcher:
         async def route_handler(route: Any) -> None:
             request = route.request
             request_url = request.url
+            res_type = request.resource_type
             req_host = ""
             if request_url.startswith(("http://", "https://", "ws://", "wss://")):
                 req_host = (urlsplit(request_url).hostname or "").lower()
-                # Skip local DNS check when proxy is active to prevent DNS leaks and resolution failures
-                if not has_proxy:
-                    if not await async_is_safe_host(req_host):
-                        await route.abort()
-                        return
 
             is_challenge_host = any(
                 req_host == d or req_host.endswith("." + d)
                 for d in _CHALLENGE_DOMAINS
             )
 
-            external_frame = False
-            if request.resource_type == "document" and request.frame != page.main_frame:
-                if request_url.startswith(("http://", "https://")) and not is_challenge_host:
-                    external_frame = registrable_host(request_url) != _main_site
-
-            # Block non-essential resource types according to the
-            # configured block_level.  Image blocking via the route
-            # handler is defense-in-depth when Camoufox `block_images`
-            # is set; `ping`/`beacon` are pure overhead for content
-            # extraction.
-            blocked = BLOCK_LEVEL_SETS.get(
-                self.block_level, BLOCK_LEVEL_SETS["aggressive"]
+            # Block non-essential resource types according to the configured block_level.
+            blocked = set(
+                BLOCK_LEVEL_SETS.get(self.block_level, BLOCK_LEVEL_SETS["aggressive"])
             )
             if not self.block_images:
-                blocked = blocked - {"image"}
+                blocked.discard("image")
+            if self.block_level == "aggressive" and not screenshot:
+                blocked.update({"stylesheet", "eventsource", "manifest", "other"})
 
             # Never block WebSockets or scripts essential for challenge verification
-            if is_challenge_host and request.resource_type in {"websocket", "script", "xhr", "fetch"}:
+            if is_challenge_host and res_type in {"websocket", "script", "xhr", "fetch"}:
                 is_blocked_type = False
             else:
-                is_blocked_type = request.resource_type in blocked
+                is_blocked_type = res_type in blocked
+
+            # Block 3rd-party trackers, ads, and session recorders from all frames
+            is_tracker = False
+            if not is_challenge_host and req_host:
+                if any(req_host == d or req_host.endswith("." + d) for d in _TRACKER_DOMAINS):
+                    is_tracker = True
+
+            external_frame = False
+            if res_type == "document" and request.frame != page.main_frame:
+                if request_url.startswith(("http://", "https://")) and not is_challenge_host:
+                    external_frame = registrable_host(request_url) != _main_site
 
             # Also block cross-site scripts, XHR, and fetch requests
             # initiated inside child frames (unless it's an anti-bot challenge host).
             external_script = False
             _main_frame = getattr(page, "main_frame", None)
-            if request.resource_type in {"script", "xhr", "fetch"} and _main_frame is not None:
+            if res_type in {"script", "xhr", "fetch"} and _main_frame is not None:
                 if getattr(request, "frame", None) != _main_frame and not is_challenge_host:
                     if request_url.startswith(("http://", "https://")):
                         external_script = registrable_host(request_url) != _main_site
 
             try:
-                if is_blocked_type or external_frame or external_script:
+                if is_blocked_type or is_tracker or external_frame or external_script:
                     await route.abort()
-                else:
-                    await route.continue_()
+                    return
+
+                # Check host safety for allowed requests (skipping local DNS when proxy is active)
+                if req_host:
+                    if not await async_is_safe_host(req_host, resolve_dns=not has_proxy):
+                        await route.abort()
+                        return
+
+                await route.continue_()
             except Exception:
                 pass
 
@@ -711,19 +752,43 @@ class BrowserFetcher:
         context: Any = None
         network: dict[str, Any] = {}
         warnings: list[str] = []
+        fetch_succeeded = False
+        effective_proxy = proxy if proxy is not None else self.proxy
+        proxy_key = effective_proxy.url if effective_proxy and effective_proxy.url else ""
         try:
             async with asyncio.timeout(page_timeout):
                 context_headers = {"Accept-Language": self.accept_language}
                 if headers:
                     context_headers.update(headers)
-                context_kwargs: dict[str, Any] = {
-                    "extra_http_headers": context_headers
-                }
-                effective_proxy = proxy if proxy is not None else self.proxy
-                browser_proxy = effective_proxy.browser_config() if effective_proxy else None
-                if browser_proxy:
-                    context_kwargs["proxy"] = browser_proxy
-                context = await self._browser.new_context(**context_kwargs)
+
+                # Acquire reusable context from pool to preserve disk and memory HTTP cache
+                async with self._context_lock:
+                    pool = self._context_pools.setdefault(proxy_key, [])
+                    while pool:
+                        candidate = pool.pop()
+                        is_closed = getattr(candidate, "is_closed", None)
+                        if callable(is_closed) and is_closed():
+                            continue
+                        try:
+                            _ = candidate.pages
+                            context = candidate
+                            break
+                        except Exception:
+                            pass
+
+                if context is None:
+                    context_kwargs: dict[str, Any] = {
+                        "bypass_csp": False,
+                        "ignore_https_errors": True,
+                        "java_script_enabled": True,
+                        "accept_downloads": False,
+                        "service_workers": "block",
+                    }
+                    browser_proxy = effective_proxy.browser_config() if effective_proxy else None
+                    if browser_proxy:
+                        context_kwargs["proxy"] = browser_proxy
+                    context = await self._browser.new_context(**context_kwargs)
+
                 if cookies:
                     cookie_list = [
                         {"name": k, "value": v, "url": url}
@@ -742,9 +807,17 @@ class BrowserFetcher:
                             logger.debug("Failed to set cookies on browser context: %s", exc)
 
                 page = await context.new_page()
+                try:
+                    await page.set_extra_http_headers(context_headers)
+                except Exception:
+                    pass
 
                 network = await self._setup_interception(
-                    page, url, proxy=effective_proxy, capture_xhr=capture_xhr
+                    page,
+                    url,
+                    proxy=effective_proxy,
+                    capture_xhr=capture_xhr,
+                    screenshot=screenshot != "none",
                 )
                 response = await page.goto(
                     url,
@@ -772,6 +845,7 @@ class BrowserFetcher:
                         humanize=self.humanize,
                         default_timeout=min(15.0, self.timeout),
                         warnings=warnings,
+                        network_activity=lambda: (network.get("active", 0), network.get("last_activity", 0.0)),
                     )
 
                 # Fast size pre-check — character length is enough as a soft
@@ -820,6 +894,7 @@ class BrowserFetcher:
                 doc_status = network.get("last_document_status")
                 final_status = doc_status if doc_status is not None else (response.status if response else None)
 
+                fetch_succeeded = True
                 return BrowserResponse(
                     url=page.url,
                     status_code=final_status,
@@ -874,14 +949,33 @@ class BrowserFetcher:
                 except Exception:
                     pass
             if context is not None:
+                max_pool_size = max(2, self.browser_concurrency)
                 try:
-                    await context.close()
+                    await context.clear_cookies()
+                    async with self._context_lock:
+                        pool = self._context_pools.setdefault(proxy_key, [])
+                        if (
+                            fetch_succeeded
+                            and not self._needs_reset
+                            and self._browser is not None
+                            and getattr(self._browser, "is_connected", lambda: True)()
+                            and len(pool) < max_pool_size
+                        ):
+                            pool.append(context)
+                            context = None
                 except Exception:
                     pass
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
 
     async def _include_same_site_frames(
         self, page: Any, html: str, main_url: str, warnings: list[str]
     ) -> str:
+        if len(page.frames) <= 1:
+            return html
         soup = BeautifulSoup(html, "lxml")
         main_site = registrable_host(main_url)
         matched_iframes: set[int] = set()
@@ -935,6 +1029,14 @@ class BrowserFetcher:
         return str(soup)
 
     async def close(self) -> None:
+        async with self._context_lock:
+            for pool in self._context_pools.values():
+                for ctx in pool:
+                    try:
+                        await ctx.close()
+                    except Exception:
+                        pass
+            self._context_pools.clear()
         async with self._start_lock:
             if self._manager is not None:
                 try:

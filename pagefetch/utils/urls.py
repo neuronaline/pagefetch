@@ -71,14 +71,15 @@ def _default_resolve_host_ips(hostname: str) -> list[str]:
         resolved: tuple[str, ...] = ()
     else:
         resolved = tuple(dict.fromkeys(info[4][0] for info in infos if info and info[4]))
-    with _DNS_CACHE_LOCK:
-        if len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
-            expired = [k for k, v in _DNS_CACHE.items() if now - v[0] >= _DNS_CACHE_TTL_SECONDS]
-            for k in expired:
-                del _DNS_CACHE[k]
-            while len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
-                _DNS_CACHE.pop(next(iter(_DNS_CACHE)))
-        _DNS_CACHE[hostname] = (now, resolved)
+    if resolved:
+        with _DNS_CACHE_LOCK:
+            if len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
+                expired = [k for k, v in _DNS_CACHE.items() if now - v[0] >= _DNS_CACHE_TTL_SECONDS]
+                for k in expired:
+                    del _DNS_CACHE[k]
+                while len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
+                    _DNS_CACHE.pop(next(iter(_DNS_CACHE)))
+            _DNS_CACHE[hostname] = (now, resolved)
     return list(resolved)
 
 
@@ -91,16 +92,17 @@ def resolve_host_ips(hostname: str) -> list[str]:
     return _default_resolve_host_ips(hostname)
 
 
-def is_safe_host(hostname: str) -> bool:
+def is_safe_host(hostname: str, *, resolve_dns: bool = True) -> bool:
     """Return False if hostname resolves to a restricted network address.
 
     Textual filters catch the obvious cases (``localhost``, ``.local``).
-    Literal IP literals are inspected directly. Any other hostname is
-    resolved through the system resolver and rejected if **any** of the
-    returned addresses falls inside a private, loopback, link-local,
-    multicast, reserved, or unspecified range. Cloud metadata endpoints
-    (``169.254.169.254``, the IPv6 ULA block) are covered by the same
-    ranges. This closes the DNS-rebinding / wildcard-hostname (e.g.
+    Literal IP literals are inspected directly. When ``resolve_dns`` is True,
+    any other hostname is resolved through the system resolver and rejected
+    if **any** of the returned addresses falls inside a private, loopback,
+    link-local, multicast, reserved, or unspecified range. When ``resolve_dns``
+    is False (e.g. when an outbound proxy is used), DNS lookups are skipped
+    to prevent DNS leaks, but localhost and private literal IPs are still blocked.
+    This closes the DNS-rebinding / wildcard-hostname (e.g.
     ``127.0.0.1.nip.io``) SSRF bypass that the previous textual-only
     implementation allowed through ``except ValueError: pass``.
     """
@@ -114,16 +116,19 @@ def is_safe_host(hostname: str) -> bool:
         return not _ip_is_unsafe(clean_ip)
     except ValueError:
         pass
+    if not resolve_dns:
+        return True
     # Domain name — resolve and check every returned address.
     resolved = resolve_host_ips(host)
     if not resolved:
-        # Fail closed: if we cannot resolve the hostname we cannot prove
-        # it is safe to dial.
-        return False
+        # If DNS cannot resolve the host, return True so the transport layer
+        # (httpx/browser) can attempt connection and classify/retry transient
+        # DNS errors as dns_error rather than SSRF violations.
+        return True
     return not any(_ip_is_unsafe(ip) for ip in resolved)
 
 
-async def async_is_safe_host(hostname: str) -> bool:
+async def async_is_safe_host(hostname: str, *, resolve_dns: bool = True) -> bool:
     """Non-blocking async variant of is_safe_host running DNS in a thread pool."""
     host = hostname.strip().lower().rstrip(".")
     if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
@@ -134,15 +139,17 @@ async def async_is_safe_host(hostname: str) -> bool:
         return not _ip_is_unsafe(clean_ip)
     except ValueError:
         pass
+    if not resolve_dns:
+        return True
     now = time.monotonic()
     with _DNS_CACHE_LOCK:
         cached = _DNS_CACHE.get(host)
         if cached is not None and now - cached[0] < _DNS_CACHE_TTL_SECONDS:
-            return not any(_ip_is_unsafe(ip) for ip in cached[1]) if cached[1] else False
-    return await asyncio.to_thread(is_safe_host, host)
+            return not any(_ip_is_unsafe(ip) for ip in cached[1]) if cached[1] else True
+    return await asyncio.to_thread(is_safe_host, host, resolve_dns=True)
 
 
-def validate_url(url: str) -> SplitResult:
+def validate_url(url: str, *, check_ssrf: bool = True, resolve_dns: bool = True) -> SplitResult:
     """Validate that *url* is an absolute HTTP(S) URL.
 
     Returns the parsed ``SplitResult`` on success so callers can
@@ -155,8 +162,9 @@ def validate_url(url: str) -> SplitResult:
         raise ValueError("only http and https URL schemes are supported")
     if not parsed.hostname:
         raise ValueError("URL must include a hostname")
-    if not is_safe_host(parsed.hostname):
-        raise ValueError("URL points to a restricted local or private network address (SSRF protection)")
+    if check_ssrf:
+        if not is_safe_host(parsed.hostname, resolve_dns=resolve_dns):
+            raise ValueError("URL points to a restricted local or private network address (SSRF protection)")
     try:
         _ = parsed.port
     except ValueError as exc:
@@ -166,7 +174,7 @@ def validate_url(url: str) -> SplitResult:
 
 def normalize_url(url: str) -> str:
     """Normalize an HTTP URL without changing query semantics."""
-    parsed = validate_url(url)
+    parsed = validate_url(url, check_ssrf=False)
     scheme = parsed.scheme.lower()
     hostname = (parsed.hostname or "").lower().rstrip(".")
     try:

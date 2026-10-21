@@ -132,56 +132,57 @@ class HTTPFetcher:
     ) -> HTTPResponse:
         fallback_client: httpx.AsyncClient | None = None
         base_client: httpx.AsyncClient | None = None
-        try:
-            if proxy_url is not None:
-                if self.proxy_client_provider is not None:
-                    base_client = await self.proxy_client_provider(proxy_url)
-                else:
-                    req_headers = headers if headers is not None else self.client.headers
-                    fallback_client = httpx.AsyncClient(
-                        headers=req_headers,
-                        timeout=self.client.timeout,
-                        follow_redirects=False,
-                        max_redirects=self.max_redirects,
-                        http2=True,
-                        proxy=proxy_url,
-                        limits=httpx.Limits(
-                            max_connections=self.retries + 1,
-                            max_keepalive_connections=1,
-                        ),
-                    )
-                    base_client = fallback_client
-            else:
-                base_client = self.client
-
-            # Do not inject client-level headers into op_client so that _strip_credentials
-            # during cross-origin redirects is not subverted by httpx client-level header merging.
-            op_client = httpx.AsyncClient(
-                transport=_SharedClientTransport(base_client),
-                timeout=base_client.timeout,
-                follow_redirects=False,
-                max_redirects=self.max_redirects,
-            )
+        async with self.semaphore:
             try:
-                return await self._fetch_with_retries(
-                    url,
-                    method=method,
-                    client=op_client,
-                    headers=headers,
-                    cookies=cookies,
-                    content=content,
-                    data=data,
-                    json_data=json_data,
-                    retryable_status_codes=retryable_status_codes,
+                if proxy_url is not None:
+                    if self.proxy_client_provider is not None:
+                        base_client = await self.proxy_client_provider(proxy_url)
+                    else:
+                        req_headers = headers if headers is not None else self.client.headers
+                        fallback_client = httpx.AsyncClient(
+                            headers=req_headers,
+                            timeout=self.client.timeout,
+                            follow_redirects=False,
+                            max_redirects=self.max_redirects,
+                            http2=True,
+                            proxy=proxy_url,
+                            limits=httpx.Limits(
+                                max_connections=self.retries + 1,
+                                max_keepalive_connections=1,
+                            ),
+                        )
+                        base_client = fallback_client
+                else:
+                    base_client = self.client
+
+                # Do not inject client-level headers into op_client so that _strip_credentials
+                # during cross-origin redirects is not subverted by httpx client-level header merging.
+                op_client = httpx.AsyncClient(
+                    transport=_SharedClientTransport(base_client),
+                    timeout=base_client.timeout,
+                    follow_redirects=False,
+                    max_redirects=self.max_redirects,
                 )
+                try:
+                    return await self._fetch_with_retries(
+                        url,
+                        method=method,
+                        client=op_client,
+                        headers=headers,
+                        cookies=cookies,
+                        content=content,
+                        data=data,
+                        json_data=json_data,
+                        retryable_status_codes=retryable_status_codes,
+                    )
+                finally:
+                    await op_client.aclose()
             finally:
-                await op_client.aclose()
-        finally:
-            if proxy_url is not None and base_client is not None:
-                if fallback_client is not None:
-                    await fallback_client.aclose()
-                elif self.proxy_client_releaser is not None:
-                    self.proxy_client_releaser(base_client)
+                if proxy_url is not None and base_client is not None:
+                    if fallback_client is not None:
+                        await fallback_client.aclose()
+                    elif self.proxy_client_releaser is not None:
+                        self.proxy_client_releaser(base_client)
 
     async def _fetch_with_retries(
         self,
@@ -199,17 +200,16 @@ class HTTPFetcher:
         retry_codes = retryable_status_codes if retryable_status_codes is not None else RETRYABLE_STATUS_CODES
         for attempt in range(self.retries + 1):
             try:
-                async with self.semaphore:
-                    response = await self._request(
-                        url,
-                        method=method,
-                        client=client,
-                        headers=headers,
-                        cookies=cookies,
-                        content=content,
-                        data=data,
-                        json_data=json_data,
-                    )
+                response = await self._request(
+                    url,
+                    method=method,
+                    client=client,
+                    headers=headers,
+                    cookies=cookies,
+                    content=content,
+                    data=data,
+                    json_data=json_data,
+                )
                 is_idempotent = method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
                 if response.status_code in retry_codes and attempt < self.retries:
                     # Cloudflare Under Attack / WAF interstitial: backoff will not
@@ -302,7 +302,8 @@ class HTTPFetcher:
                         await response.aclose()
                         next_url = urljoin(current_url, location)
                         try:
-                            validate_url(next_url)
+                            # Skip local DNS check when proxy is active to prevent DNS leaks, but still block private literal IPs
+                            validate_url(next_url, check_ssrf=True, resolve_dns=not bool(proxy_url))
                         except ValueError as exc:
                             raise TransportFailure(
                                 FetchErrorInfo(
@@ -341,16 +342,43 @@ class HTTPFetcher:
                         redirect_count += 1
                         continue
                     declared = response.headers.get("Content-Length")
-                    if declared and declared.isdigit() and int(declared) > self.max_content_size:
+                    if response.status_code < 400 and declared and declared.isdigit() and int(declared) > self.max_content_size:
                         raise TransportFailure(
                             FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
                             status_code=response.status_code,
                         )
+                    # Early check for unsupported binary types to avoid downloading large bodies
+                    ct_header = response.headers.get("Content-Type", "")
+                    normalized_ct = ct_header.split(";")[0].strip().lower()
+                    clean_path = urlsplit(str(response.url)).path.lower()
+                    cd_header = response.headers.get("Content-Disposition", "").lower()
+                    doc_extensions = (".pdf", ".docx", ".csv", ".tsv", ".json", ".xml", ".txt", ".md", ".html", ".htm")
+                    is_doc_ext = clean_path.endswith(doc_extensions) or any(ext in cd_header for ext in doc_extensions)
+                    unsupported_binary = (
+                        normalized_ct.startswith(("video/", "audio/"))
+                        or (normalized_ct.startswith("image/") and normalized_ct != "image/svg+xml")
+                        or (normalized_ct in {"application/zip", "application/x-zip-compressed", "application/x-rar-compressed", "application/x-7z-compressed", "application/gzip", "application/x-tar"} and not is_doc_ext)
+                    )
+                    if unsupported_binary and response.status_code < 400:
+                        raise TransportFailure(
+                            FetchErrorInfo(
+                                "unsupported_content_type",
+                                f"Content type {normalized_ct!r} is an unsupported binary format",
+                                False,
+                            ),
+                            status_code=response.status_code,
+                        )
                     chunks: list[bytes] = []
                     size = 0
+                    max_read_size = 4096 if response.status_code >= 400 else self.max_content_size
                     async for chunk in response.aiter_bytes():
                         size += len(chunk)
-                        if size > self.max_content_size:
+                        if size > max_read_size:
+                            if response.status_code >= 400:
+                                remaining = max_read_size - (size - len(chunk))
+                                if remaining > 0:
+                                    chunks.append(chunk[:remaining])
+                                break
                             raise TransportFailure(
                                 FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
                                 status_code=response.status_code,

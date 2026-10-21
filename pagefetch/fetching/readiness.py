@@ -21,30 +21,35 @@ async def in_page_metrics(page: Any) -> PageMetrics:
     whether the DOM is already "good enough" before paying for scrolls
     and a second stability wait.
     """
-    result: dict[str, Any] = await page.evaluate(
-        """() => {
-            const body = document.body;
-            const bodyText = (body?.innerText || '').length;
-            const mains = document.querySelectorAll('main, article, [role="main"]');
-            let mainText = 0;
-            for (const el of mains) {
-                mainText += (el.innerText?.length || 0);
-            }
-            const lowered = (body?.innerText || '').toLowerCase();
-            const title = (document.title || '').toLowerCase();
-            const patterns = [
-                'checking your browser', 'verify you are human', 'attention required',
-                'just a moment', 'security check', 'robot olmadığınızı', 'erişim engellendi',
-                'güvenlik kontrolü', 'проверка вашего браузера', 'подтвердите, что вы не робот',
-                'wir überprüfen ihren browser', 'bitte bestätigen sie', 'nous vérifions votre navigateur',
-                'vérifiez que vous êtes humain', 'verificando tu navegador', 'verifica que no eres un robot',
-                'cf-chl-', 'cf-turnstile', 'challenge-form'
-            ];
-            const hasChallengeText = patterns.some(p => lowered.includes(p) || title.includes(p));
-            const challenge = (hasChallengeText || title.includes('challenge')) && bodyText < 500;
-            return {text: bodyText, mainText, challenge};
-        }"""
-    )
+    try:
+        result: dict[str, Any] = await page.evaluate(
+            """() => {
+                const body = document.body;
+                const bodyText = (body?.innerText || '').length;
+                const mains = document.querySelectorAll('main, article, [role="main"]');
+                let mainText = 0;
+                for (const el of mains) {
+                    mainText += (el.innerText?.length || 0);
+                }
+                const lowered = (body?.innerText || '').toLowerCase();
+                const title = (document.title || '').toLowerCase();
+                const patterns = [
+                    'checking your browser', 'verify you are human', 'attention required',
+                    'just a moment', 'security check', 'robot olmadığınızı', 'erişim engellendi',
+                    'güvenlik kontrolü', 'проверка вашего браузера', 'подтвердите, что вы не робот',
+                    'wir überprüfen ihren browser', 'bitte bestätigen sie', 'nous vérifions votre navigateur',
+                    'vérifiez que vous êtes humain', 'verificando tu navegador', 'verifica que no eres un robot',
+                    'cf-chl-', 'cf-turnstile', 'challenge-form'
+                ];
+                const hasChallengeText = patterns.some(p => lowered.includes(p) || title.includes(p));
+                const challenge = (hasChallengeText || title.includes('challenge')) && bodyText < 500;
+                return {text: bodyText, mainText, challenge};
+            }"""
+        )
+    except Exception:
+        return PageMetrics(text=0, main_text=0, challenge=False)
+    if not isinstance(result, dict):
+        result = {}
     return PageMetrics(
         text=int(result.get("text", 0)),
         main_text=int(result.get("mainText", 0)),
@@ -121,17 +126,25 @@ async def controlled_scroll(
     previous_height = 0
     for index in range(max_scrolls):
         # Single evaluate: capture pre-scroll metrics *then* scroll, saving one IPC roundtrip.
-        metrics = await page.evaluate(
-            """() => {
-                const h = document.documentElement.scrollHeight;
-                const vp = window.innerHeight;
-                window.scrollBy(0, Math.max(vp * 0.9, 400));
-                return {height: h, y: window.scrollY, viewport: vp};
-            }"""
-        )
+        try:
+            metrics = await page.evaluate(
+                """() => {
+                    const h = document.documentElement.scrollHeight;
+                    const vp = window.innerHeight;
+                    window.scrollBy(0, Math.max(vp * 0.9, 400));
+                    return {height: h, y: window.scrollY, viewport: vp};
+                }"""
+            )
+        except Exception:
+            break
+        if not isinstance(metrics, dict):
+            break
         height = int(metrics.get("height", 0))
         if height > max_height:
-            await page.evaluate("() => window.scrollTo(0, 0)")
+            try:
+                await page.evaluate("() => window.scrollTo(0, 0)")
+            except Exception:
+                pass
             return True
         if index < 3:
             await asyncio.sleep(sleep_early)
@@ -143,10 +156,16 @@ async def controlled_scroll(
         ):
             unchanged += 1
             if unchanged >= 2:
-                await page.evaluate("() => window.scrollTo(0, 0)")
+                try:
+                    await page.evaluate("() => window.scrollTo(0, 0)")
+                except Exception:
+                    pass
                 return False
         else:
             unchanged = 0
         previous_height = height
-    await page.evaluate("() => window.scrollTo(0, 0)")
+    try:
+        await page.evaluate("() => window.scrollTo(0, 0)")
+    except Exception:
+        pass
     return True

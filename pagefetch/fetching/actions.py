@@ -38,13 +38,28 @@ _JS_TAG_INTERACTIVE_ELEMENTS = """() => {
         if (ti !== null && !isNaN(parseInt(ti, 10)) && parseInt(ti, 10) >= 0) return true;
         return false;
     };
-    const all = document.querySelectorAll('*');
     let count = 0;
-    for (const el of all) {
-        if (isInteractive(el)) {
-            count += 1;
-            el.setAttribute('data-pf-action-id', String(count));
+    let nodeCount = 0;
+    const maxDepth = 12;
+    const maxNodes = 800;
+
+    function walk(node, depth) {
+        if (!node || node.nodeType !== 1) return;
+        nodeCount++;
+        if (isInteractive(node)) {
+            count++;
+            node.setAttribute('data-pf-action-id', String(count));
         }
+        if (depth + 1 < maxDepth && nodeCount < maxNodes) {
+            for (let child = node.firstElementChild; child; child = child.nextElementSibling) {
+                walk(child, depth + 1);
+                if (nodeCount >= maxNodes) break;
+            }
+        }
+    }
+    const root = document.documentElement || document.body;
+    if (root) {
+        walk(root, 0);
     }
     return count;
 }"""
@@ -163,6 +178,7 @@ async def execute_page_actions(
     humanize: bool = False,
     default_timeout: float = 10.0,
     warnings: list[str] | None = None,
+    network_activity: Callable[[], tuple[int, float]] | None = None,
 ) -> list[ActionResult]:
     """Execute a sequence of browser actions on page."""
     if warnings is None:
@@ -303,7 +319,11 @@ async def execute_page_actions(
 
             # Post-action readiness wait on mutating actions
             if action_type in {"click", "fill", "type", "press", "select", "check", "uncheck", "evaluate"}:
-                await wait_for_stability(page, timeout=min(2.0, default_timeout))
+                await wait_for_stability(
+                    page,
+                    timeout=min(2.0, default_timeout),
+                    network_activity=network_activity,
+                )
 
             duration_ms = round((time.perf_counter() - start_t) * 1000, 2)
             results.append(

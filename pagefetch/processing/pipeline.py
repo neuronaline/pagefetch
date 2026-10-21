@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,13 +26,45 @@ from .non_html import (
 from .structure import StructureLimits, extract_structure
 
 
+_META_CHARSET_RE = re.compile(
+    rb"""<meta\s+[^>]*?(?:charset\s*=\s*['"]?([a-zA-Z0-9_\-]+)|content\s*=\s*['"][^'"]*?charset=\s*['"]?([a-zA-Z0-9_\-]+))""",
+    re.IGNORECASE,
+)
+
+
 def decode_response_body(response: HTTPResponse) -> str:
-    """Decode raw HTTP response bytes into string using response encoding or utf-8."""
-    encoding = response.encoding or "utf-8"
-    try:
-        return response.content.decode(encoding)
-    except (LookupError, UnicodeDecodeError):
-        return response.content.decode("utf-8", errors="replace")
+    """Decode raw HTTP response bytes into string using meta charset, response encoding or utf-8."""
+    # Sniff HTML meta charset from the first 4096 bytes
+    meta_encoding: str | None = None
+    if response.content:
+        match = _META_CHARSET_RE.search(response.content[:4096])
+        if match:
+            raw_enc = (match.group(1) or match.group(2)).decode("ascii", errors="ignore").strip().lower()
+            try:
+                import codecs
+                codecs.lookup(raw_enc)
+                meta_encoding = raw_enc
+            except (LookupError, ValueError):
+                meta_encoding = None
+
+    candidates: list[str] = []
+    if meta_encoding:
+        candidates.append(meta_encoding)
+    resp_enc = response.encoding.lower() if response.encoding else None
+    # Explicit Content-Type charset has high priority unless it is httpx's default fallback ('iso-8859-1')
+    if resp_enc and resp_enc != "iso-8859-1" and resp_enc not in candidates:
+        candidates.append(resp_enc)
+    if "utf-8" not in candidates:
+        candidates.append("utf-8")
+    if resp_enc and resp_enc not in candidates:
+        candidates.append(resp_enc)
+
+    for enc in candidates:
+        try:
+            return response.content.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return response.content.decode("utf-8", errors="replace")
 
 
 def parse_content_type(header: str | None) -> str:
@@ -42,20 +75,25 @@ def parse_content_type(header: str | None) -> str:
 def is_pdf_content(content_type: str, content: bytes, url: str | None = None) -> bool:
     """Check if content represents a PDF file by content-type, magic bytes, or URL."""
     ct = parse_content_type(content_type)
+    if is_html_like(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
+        return False
     if ct in ("application/pdf", "application/x-pdf") or (content and content.startswith(b"%PDF-")):
         return True
     if url:
         clean_url = url.lower().split("?", 1)[0].split("#", 1)[0]
-        if clean_url.endswith(".pdf"):
+        if clean_url.endswith(".pdf") and (not content or content.startswith(b"%PDF-")):
             return True
     return False
 
 
 def is_docx_content(content_type: str, content: bytes, url: str | None = None) -> bool:
     """Check if content represents a DOCX file by content-type, magic bytes, or URL."""
-    if content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    ct = parse_content_type(content_type)
+    if is_html_like(ct) or (looks_like_html(content) and not content.startswith(b"PK\x03\x04")):
+        return False
+    if ct == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         return True
-    if url and url.lower().split("?", 1)[0].endswith(".docx"):
+    if url and url.lower().split("?", 1)[0].endswith(".docx") and (not content or content.startswith(b"PK\x03\x04")):
         return True
     return bool(
         content.startswith(b"PK\x03\x04")
@@ -121,6 +159,9 @@ def looks_like_html(content: bytes) -> bool:
 
 def detect_document_kind(content_type: str, content: bytes, url: str | None = None) -> str:
     """Detect high-level document kind from content type, byte sniff, and URL."""
+    ct = parse_content_type(content_type)
+    if is_html_like(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
+        return "html"
     if is_pdf_content(content_type, content, url=url):
         return "pdf"
     if is_docx_content(content_type, content, url=url):
@@ -134,12 +175,10 @@ def detect_document_kind(content_type: str, content: bytes, url: str | None = No
     if is_xml_content(content_type, url=url):
         return "xml"
     if (
-        content_type.startswith("text/plain")
+        ct.startswith("text/plain")
         or (url and url.lower().split("?", 1)[0].endswith((".txt", ".md")))
     ):
         return "text"
-    if is_html_like(content_type) or looks_like_html(content):
-        return "html"
     return "unknown"
 
 

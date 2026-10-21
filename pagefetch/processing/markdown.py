@@ -44,7 +44,7 @@ class MarkdownConverter:
         if not isinstance(node, Tag):
             return ""
         name = node.name.lower()
-        if name in {"script", "style", "template", "head"}:
+        if name in {"script", "style", "template", "head", "noscript", "svg"}:
             return ""
         if re.fullmatch(r"h[1-6]", name):
             return f"\n\n{'#' * int(name[1])} {self._inline_children(node).strip()}\n\n"
@@ -190,7 +190,7 @@ class MarkdownConverter:
             for cell in cells:
                 while column in values_by_column:
                     column += 1
-                raw_cell = html_module.unescape(self._children(cell))
+                raw_cell = self._children(cell)
                 value = re.sub(r"\s+", " ", raw_cell.strip()).replace("|", "\\|")
                 colspan = self._span_value(cell.get("colspan"))
                 rowspan = self._span_value(cell.get("rowspan"))

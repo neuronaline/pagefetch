@@ -30,23 +30,27 @@ class SQLiteCache:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
-        await self._db.execute("PRAGMA busy_timeout=5000")
-        await self._db.execute("PRAGMA journal_mode=WAL")
-        await self._migrate_if_needed()
-        await self._db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS fetch_cache (
-                cache_key TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                expires_at REAL NOT NULL
+        try:
+            await self._db.execute("PRAGMA busy_timeout=5000")
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._migrate_if_needed()
+            await self._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fetch_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+                """
             )
-            """
-        )
-        await self._db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_fetch_cache_expires_at ON fetch_cache(expires_at)"
-        )
-        await self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        await self._db.commit()
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fetch_cache_expires_at ON fetch_cache(expires_at)"
+            )
+            await self._db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            await self._db.commit()
+        except Exception:
+            await self.close()
+            raise
 
     async def _migrate_if_needed(self) -> None:
         """Reconcile older ``fetch_cache`` schemas with the current layout.
@@ -150,7 +154,7 @@ class SQLiteCache:
             payload = result.json(
                 include_html=True,
                 include_structure=True,
-                include_screenshot=False,
+                include_screenshot=True,
             )
         except (TypeError, ValueError) as exc:
             raise RuntimeError(

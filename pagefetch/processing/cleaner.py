@@ -31,13 +31,17 @@ from typing import Literal
 from bs4 import BeautifulSoup, Tag
 
 _NOISE_RE = re.compile(
-    r"(?:^|[-_\s])(cookie(?:[-_\s]?(?:banner|consent|notice|law|policy|bar|modal|popup))?|"
-    r"consent(?:[-_\s]?(?:banner|modal|popup|overlay|root|wrapper))?|"
+    r"(?:^|[-_\s])(cookie[-_\s]?(?:banner|consent|notice|law|bar|modal|popup|dialog|overlay|wrap(?:per)?|container)|"
+    r"consent[-_\s]?(?:banner|modal|popup|overlay|root|wrapper|bar|dialog)|"
     r"advert(?:isement)?|ad-slot|ad-container|ad-wrapper|ad-banner|"
     r"tracking-pixel|modal-overlay|onetrust(?:-consent-sdk)?|cybotcookiebot|"
     r"cookiebot|didomi(?:-host)?|klaro|sp_message|qc-cmp\d?|usercentrics|"
-    r"trustarc|fc-consent-root|cookie-law-info|gdpr(?:-banner|-modal|-consent)?|"
+    r"trustarc|fc-consent-root|cookie-law-info|gdpr[-_\s]?(?:banner|modal|consent|overlay|popup)|"
     r"ccpa-banner)(?:$|[-_\s])",
+    re.IGNORECASE,
+)
+_AD_RE = re.compile(
+    r"(?:^|[-_\s])(advert(?:isement)?|ad-slot|ad-container|ad-wrapper|ad-banner|tracking-pixel)(?:$|[-_\s])",
     re.IGNORECASE,
 )
 _MAX_BLOCK_RE = re.compile(
@@ -49,7 +53,8 @@ _MAX_BLOCK_RE = re.compile(
 _CONTENT_CONTAINER_RE = re.compile(
     r"(?:^|[-_\s])(entry[-_]content|post[-_]content|article[-_]body|story[-_]content|"
     r"article[-_]content|main[-_]content|post[-_]body|article[-_]text|news[-_]content|"
-    r"story[-_]body|page[-_]content|content[-_]area)(?:$|[-_\s])",
+    r"story[-_]body|page[-_]content|content[-_]area|content|prose|markdown-body|"
+    r"documentation|article)(?:$|[-_\s])",
     re.IGNORECASE,
 )
 _SIDEBAR_RE = re.compile(
@@ -94,22 +99,22 @@ def _class_list(tag: Tag) -> list[str]:
 def clean_html(
     html: str | BeautifulSoup,
     cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
+    *,
+    copy: bool = False,
 ) -> BeautifulSoup:
     """Remove only strongly identified non-content from an HTML document.
 
-    ``minimal`` applies only the universally safe rules. ``standard`` retains
-    the conservative cookie/ad/tracking cleanup used by earlier releases.
+    ``minimal`` drops only hidden elements, 1x1 tracking pixels, and empty text blocks.
+    ``standard`` (default) adds ads, consent banners, and aria-hidden overlays while preserving
+    substantive article text.
     ``maximum`` additionally removes navigation, sidebars, site chrome, and
     blocks explicitly marked as comments, sharing, or related content.
 
-    .. note::
-
-        ``clean_html`` never mutates its input. When ``html`` is a
-        :class:`BeautifulSoup`, an independent deep copy is made (via
-        :func:`copy.deepcopy`) before any ``decompose()`` runs so that
-        the lxml C-level parser's shared navigation references cannot
-        leak mutations back to the caller's tree. Callers may safely
-        reuse the original tree after cleaning.
+    :param html: Input HTML string or parsed BeautifulSoup tree.
+    :param cleaning_level: Aggressiveness of noise reduction.
+    :param copy: When False (default) and *html* is a :class:`BeautifulSoup`, cleaning operates
+        in-place directly on the tree to avoid deep copying overhead. Pass ``copy=True`` when the
+        caller requires an independent copy and wishes to preserve the original tree unmodified.
     """
     if cleaning_level not in _VALID_CLEANING_LEVELS:
         raise ValueError(f"cleaning_level must be one of {sorted(_VALID_CLEANING_LEVELS)}")
@@ -117,27 +122,13 @@ def clean_html(
         raise TypeError(
             f"clean_html expects str or BeautifulSoup, got {type(html).__name__}"
         )
-    # Work on an independent copy so the caller's BeautifulSoup is never
-    # mutated by ``decompose()`` side effects. ``_copy.copy`` (BeautifulSoup's
-    # ``__copy__``) walks the tree, but the underlying lxml C-level parser
-    # keeps shared references for navigation generators (``stripped_strings``,
-    # ``parents``) — a ``decompose`` call here could leak back into the
-    # caller's tree and silently drop navigation links / footer images that
-    # downstream consumers depend on (see :mod:`pagefetch.processing.html`
-    # which reuses ``raw_soup`` after this call). ``copy.deepcopy`` walks
-    # the tree fully and produces a genuinely disjoint tree; the cost is
-    # comparable to one ``lxml`` parse, which is already on the critical
-    # path.
     soup = (
         _copy.deepcopy(html)
-        if isinstance(html, BeautifulSoup)
-        else BeautifulSoup(html, "lxml")
+        if (copy and isinstance(html, BeautifulSoup))
+        else (html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml"))
     )
 
-    # Build a visible-text snapshot only when noscript tags exist. This lets the
-    # noscript rule distinguish a fallback that is already rendered elsewhere
-    # from content that exists only in a noscript subtree without paying the cost
-    # on documents that do not contain noscript blocks.
+    # Build a visible-text snapshot only when noscript tags exist.
     noscripts = soup.find_all("noscript")
     if noscripts:
         rendered_strings: list[str] = [
@@ -151,7 +142,22 @@ def clean_html(
         visible_text = " ".join(rendered_strings)
         for tag in list(noscripts):
             fallback = tag.get_text(" ", strip=True)
-            if fallback and len(fallback) >= 20 and fallback in visible_text:
+            fallback_lower = fallback.lower()
+            is_js_notice = any(
+                phrase in fallback_lower
+                for phrase in (
+                    "enable javascript",
+                    "requires javascript",
+                    "javascript is disabled",
+                    "javascript to run",
+                    "turn on javascript",
+                    "support javascript",
+                )
+            )
+            has_tracking_iframe = bool(
+                tag.find("iframe", src=re.compile(r"googletagmanager|analytics|facebook|doubleclick", re.I))
+            )
+            if is_js_notice or has_tracking_iframe or (fallback and len(fallback) >= 20 and fallback in visible_text):
                 tag.decompose()
 
     for tag in list(soup.find_all(True)):
@@ -167,11 +173,15 @@ def clean_html(
         matches_noise = _NOISE_RE.search(identity) is not None
         standard_noise = False
         if cleaning_level != "minimal":
-            if matches_noise:
+            if tag.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                standard_noise = False
+            elif matches_noise:
+                is_ad = _AD_RE.search(identity) is not None
                 is_safe_container = (
                     tag.name in {"html", "body", "main", "article"}
                     or _CONTENT_CONTAINER_RE.search(identity) is not None
                     or tag.find(["main", "article"]) is not None
+                    or (not is_ad and _inside_content(tag))
                 )
                 standard_noise = not is_safe_container
             elif aria_hidden_attr:
@@ -211,7 +221,7 @@ def _remove_boilerplate(soup: BeautifulSoup, *, is_maximum: bool = False) -> Non
         classes = " ".join(_class_list(tag))
         identity = f"{tag.get('id', '')} {classes}"
         role = str(tag.get("role", "")).lower()
-        is_navigation = tag.name == "nav" or role in {"navigation", "menubar", "tablist"}
+        is_navigation = (tag.name == "nav" and not _inside_content(tag)) or role in {"navigation", "menubar"}
         is_sidebar = (
             tag.name == "aside"
             or role == "complementary"
