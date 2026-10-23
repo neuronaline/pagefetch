@@ -117,6 +117,7 @@ class BrowserFetcher:
         retries: int,
         proxy: ProxySettings,
         max_content_size: int,
+        browser_concurrency: int = 4,
         browser_pre_check_byte_margin: float = 1.5,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
@@ -130,6 +131,7 @@ class BrowserFetcher:
         self.retries = retries
         self.proxy = proxy
         self.max_content_size = max_content_size
+        self.browser_concurrency = browser_concurrency
         self.browser_pre_check_byte_margin = browser_pre_check_byte_margin
         self.confidence_threshold = confidence_threshold
         self.block_images = block_images
@@ -949,7 +951,7 @@ class BrowserFetcher:
                 except Exception:
                     pass
             if context is not None:
-                max_pool_size = max(2, self.browser_concurrency)
+                max_pool_size = max(2, getattr(self, "browser_concurrency", 4))
                 try:
                     await context.clear_cookies()
                     async with self._context_lock:
