@@ -54,6 +54,75 @@ CUSTOM_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
 _DECODO_SESSION_DURATION_MINUTES = (1, 1440)  # inclusive
 _BYTEFUL_SESSION_DURATION_SECONDS = (60, 7 * 24 * 3600)  # inclusive
 
+# Process-scoped random seed so sticky domain sessions are consistent within
+# a running process but do not permanently pin a domain to a burned IP across
+# process restarts.
+_PROCESS_SESSION_SEED: str = os.urandom(4).hex()
+
+# Per-domain failure epoch counter. Incremented whenever a domain encounters
+# an anti-bot block or challenge so subsequent requests and retries immediately
+# rotate to a fresh residential exit IP.
+_DOMAIN_FAILURE_EPOCHS: dict[str, int] = {}
+
+# Repurposed 2-letter TLDs that are used globally rather than for a specific country.
+_GENERIC_CCTLD_EXCLUSIONS: frozenset[str] = frozenset(
+    {"io", "ai", "co", "me", "tv", "gg", "sh", "ly", "to", "cc", "fm", "ws", "is", "so", "vc", "la", "gl", "ac", "im"}
+)
+
+
+def _detect_env_country() -> str | None:
+    """Return an explicit two-letter ISO country code from environment variables if set."""
+    env_country = (os.getenv("PROXY_COUNTRY") or os.getenv("DEFAULT_COUNTRY") or "").strip().lower()
+    if len(env_country) == 2 and env_country.isalpha():
+        return env_country
+    return None
+
+
+def infer_target_country(url: str) -> str | None:
+    """Infer a two-letter ISO country code from *url* or environment variables."""
+    env_override = _detect_env_country()
+    if env_override:
+        return env_override
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or url).lower().strip(".")
+    if hostname:
+        parts = hostname.split(".")
+        if len(parts) >= 2:
+            tld = parts[-1]
+            if len(tld) == 2 and tld.isalpha() and tld not in _GENERIC_CCTLD_EXCLUSIONS:
+                return "gb" if tld == "uk" else tld
+    return None
+
+
+def accept_language_for_country(
+    country: str | None,
+    default: str = "en-US,en;q=0.5",
+) -> str:
+    """Return an ``Accept-Language`` header aligned with *country* unless *default* was customized."""
+    if default != "en-US,en;q=0.5" or not country:
+        return default
+    cc = country.lower()
+    if cc == "us":
+        return default
+    if cc in {"gb", "ca", "au", "nz", "ie"}:
+        return f"en-{cc.upper()},en;q=0.9"
+    return f"{cc}-{cc.upper()},{cc};q=0.9,en-US;q=0.8,en;q=0.7"
+
+
+def bump_domain_session(domain: str) -> int:
+    """Increment the failure epoch for *domain* so subsequent requests rotate to a new proxy session."""
+    key = domain.lower().strip(".")
+    epoch = _DOMAIN_FAILURE_EPOCHS.get(key, 0) + 1
+    _DOMAIN_FAILURE_EPOCHS[key] = epoch
+    if len(_DOMAIN_FAILURE_EPOCHS) > 2000:
+        _DOMAIN_FAILURE_EPOCHS.pop(next(iter(_DOMAIN_FAILURE_EPOCHS)))
+    return epoch
+
+
+def get_domain_epoch(domain: str) -> int:
+    """Return the current failure epoch for *domain*."""
+    return _DOMAIN_FAILURE_EPOCHS.get(domain.lower().strip("."), 0)
+
 
 @dataclass(slots=True, frozen=True)
 class ProxySettings:
@@ -162,14 +231,15 @@ def _format_byteful_ttl(seconds: int) -> str:
 
 def _inject_byteful_session(
     proxy_url: str,
-    session_id: str,
+    session_id: str | None = None,
     *,
     session_duration_seconds: int | None = None,
+    country: str | None = None,
 ) -> str:
-    """Append Byteful's documented ``_s_<id>`` sticky-session token.
+    """Append Byteful's documented ``_c_<code>`` and ``_s_<id>`` tokens.
 
-    See BYTEFUL_DOCS §4: ``residential.byteful.com:8000:{username}_s_{id}:{password}``.
-    Omitting the token yields the Basic Random Residential Proxy form,
+    See BYTEFUL_DOCS §4: ``residential.byteful.com:8000:{username}_c_{country}_s_{id}:{password}``.
+    Omitting ``session_id`` yields the Basic Random Residential Proxy form,
     which rotates the egress IP on every request. When ``session_duration_seconds``
     is provided the TTL token is appended as documented in BYTEFUL_DOCS §4
     (``_ttl_<number><unit>``); 1 minute minimum, 7 days maximum.
@@ -177,22 +247,28 @@ def _inject_byteful_session(
     parsed = urlsplit(proxy_url)
     if not parsed.username:
         return proxy_url
+    if not country and not session_id:
+        return proxy_url
     username = unquote(parsed.username)
-    if session_duration_seconds is not None:
-        ttl_token = _format_byteful_ttl(session_duration_seconds)
-        username = f"{username}_s_{session_id}_ttl_{ttl_token}"
-    else:
-        username = f"{username}_s_{session_id}"
+    if country and "_c_" not in username:
+        username = f"{username}_c_{country.lower()}"
+    if session_id:
+        if session_duration_seconds is not None:
+            ttl_token = _format_byteful_ttl(session_duration_seconds)
+            username = f"{username}_s_{session_id}_ttl_{ttl_token}"
+        else:
+            username = f"{username}_s_{session_id}"
     return _rewrite_username(proxy_url, username)
 
 
 def _inject_decodo_session(
     proxy_url: str,
-    session_id: str,
+    session_id: str | None = None,
     *,
     session_duration_seconds: int | None = None,
+    country: str | None = None,
 ) -> str:
-    """Append Decodo's documented ``-session-<id>`` sticky-session token.
+    """Append Decodo's documented ``-country-<code>`` and ``-session-<id>`` tokens.
 
     See DECODO_DOCS §3 (Scheme A) and §4 (parameter matrix). Targeting
     parameters are hyphen-delimited (``session-<id>``, ``country-us``,
@@ -208,20 +284,26 @@ def _inject_decodo_session(
     if not parsed.username:
         return proxy_url
     raw_user = unquote(parsed.username)
+    if not country and not session_id:
+        return proxy_url
     base = raw_user if raw_user.startswith("user-") else f"user-{raw_user}"
-    username = f"{base}-session-{session_id}"
-    if session_duration_seconds is not None:
-        minutes = session_duration_seconds // 60
-        lo, hi = _DECODO_SESSION_DURATION_MINUTES
-        if minutes < lo:
-            raise ProxyConfigurationError(
-                "decodo session_duration must be at least 1 minute (DECODO_DOCS §4)"
-            )
-        if minutes > hi:
-            raise ProxyConfigurationError(
-                "decodo session_duration must be at most 1440 minutes (DECODO_DOCS §4)"
-            )
-        username = f"{username}-sessionduration-{minutes}"
+    username = base
+    if country and "-country-" not in username:
+        username = f"{username}-country-{country.lower()}"
+    if session_id:
+        username = f"{username}-session-{session_id}"
+        if session_duration_seconds is not None:
+            minutes = session_duration_seconds // 60
+            lo, hi = _DECODO_SESSION_DURATION_MINUTES
+            if minutes < lo:
+                raise ProxyConfigurationError(
+                    "decodo session_duration must be at least 1 minute (DECODO_DOCS §4)"
+                )
+            if minutes > hi:
+                raise ProxyConfigurationError(
+                    "decodo session_duration must be at most 1440 minutes (DECODO_DOCS §4)"
+                )
+            username = f"{username}-sessionduration-{minutes}"
     return _rewrite_username(proxy_url, username)
 
 
@@ -238,11 +320,12 @@ _SESSION_INJECTORS: dict[str, Callable[..., str]] = {
 def inject_session_id_for(
     provider: str,
     proxy_url: str,
-    session_id: str,
+    session_id: str | None = None,
     *,
     session_duration_seconds: int | None = None,
+    country: str | None = None,
 ) -> str:
-    """Inject a sticky session ID using the syntax required by *provider*.
+    """Inject a sticky session ID and optional country code using *provider* syntax.
 
     Dispatches to the provider-specific injector registered in
     :data:`_SESSION_INJECTORS`.  Unknown providers and ``custom`` are
@@ -259,20 +342,31 @@ def inject_session_id_for(
         proxy_url,
         session_id,
         session_duration_seconds=session_duration_seconds,
+        country=country,
     )
 
 
 def make_domain_session(domain: str, salt: str = "") -> str:
-    """Return a stable session ID for *domain* (sticky: one exit per domain).
+    """Return a session ID for *domain* (sticky: one exit per domain per epoch).
 
     Hex strings are a safe subset of the alphanumeric session-ID grammar
     documented for both DECODO (DECODO_DOCS §4) and Byteful (BYTEFUL_DOCS
-    §4: "random alphanumeric"). An optional *salt* can be provided to obtain
-    a fresh exit node for the same domain (e.g. on browser fallback after an
-    HTTP block).
+    §4: "random alphanumeric"). Incorporates the process session seed and
+    any domain failure epoch so burned IPs are automatically rotated.
     """
-    token = f"{domain}:{salt}" if salt else domain
+    epoch = get_domain_epoch(domain)
+    parts = [domain, _PROCESS_SESSION_SEED]
+    if epoch:
+        parts.append(f"e{epoch}")
+    if salt:
+        parts.append(salt)
+    token = ":".join(parts)
     return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def make_random_session() -> str:
+    """Return a fresh random alphanumeric session ID for a single fetch operation."""
+    return os.urandom(6).hex()
 
 
 def resolve_proxy(provider: str) -> ProxySettings:

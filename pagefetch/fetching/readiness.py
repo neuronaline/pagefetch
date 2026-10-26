@@ -33,16 +33,26 @@ async def in_page_metrics(page: Any) -> PageMetrics:
                 }
                 const lowered = (body?.innerText || '').toLowerCase();
                 const title = (document.title || '').toLowerCase();
+                const hasChallengeDom = !!(
+                    document.querySelector(
+                        '#challenge-running, #challenge-stage, #challenge-form, #challenge-error-text, ' +
+                        '.cf-turnstile, [id^="cf-chl-widget"], ' +
+                        'iframe[src*="challenges.cloudflare.com"], form[action*="validateCaptcha" i], ' +
+                        'input[name="cf-turnstile-response"]'
+                    )
+                );
                 const patterns = [
                     'checking your browser', 'verify you are human', 'attention required',
-                    'just a moment', 'security check', 'robot olmadığınızı', 'erişim engellendi',
+                    'just a moment', 'security check',
+                    'bir dakika lütfen', 'robot olmadığınızı', 'erişim engellendi',
                     'güvenlik kontrolü', 'проверка вашего браузера', 'подтвердите, что вы не робот',
                     'wir überprüfen ihren browser', 'bitte bestätigen sie', 'nous vérifions votre navigateur',
                     'vérifiez que vous êtes humain', 'verificando tu navegador', 'verifica que no eres un robot',
-                    'cf-chl-', 'cf-turnstile', 'challenge-form'
+                    'cf-chl-', 'cf-turnstile', 'challenge-form',
+                    'enter the characters you see below', 'validatecaptcha'
                 ];
                 const hasChallengeText = patterns.some(p => lowered.includes(p) || title.includes(p));
-                const challenge = (hasChallengeText || title.includes('challenge')) && bodyText < 500;
+                const challenge = (hasChallengeDom || hasChallengeText || title.includes('challenge')) && bodyText < 600;
                 return {text: bodyText, mainText, challenge};
             }"""
         )

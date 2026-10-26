@@ -44,7 +44,7 @@ _STEALTH_PRESETS: dict[str, dict[str, object]] = {
         "humanize": True,
         "block_level": "balanced",
         "request_pacing": 0.5,
-        "session_rotation": "rotate",
+        "session_rotation": "sticky",
     },
     "max": {
         "humanize": True,
@@ -107,6 +107,9 @@ class PageFetchConfig:
     screenshot_max_bytes: int = 50 * 1024 * 1024
     # Number of requests served by a browser process before recycling.
     max_browser_requests: int = 50
+    # Idle seconds before an inactive browser process is automatically closed
+    # to free RAM (None or 0 disables automatic idle teardown).
+    browser_idle_ttl: float | None = 180.0
     # Browser-mode renders the page first and then measures the resulting DOM.
     # The char-length pre-check uses a multiplicative byte margin over the
     # configured max_content_size to account for multi-byte UTF-8. The
@@ -215,6 +218,19 @@ class PageFetchConfig:
             or self.browser_pre_check_byte_margin < 1.0
         ):
             raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
+        if self.browser_idle_ttl is not None:
+            if (
+                not isinstance(self.browser_idle_ttl, int | float)
+                or isinstance(self.browser_idle_ttl, bool)
+                or not math.isfinite(self.browser_idle_ttl)
+                or self.browser_idle_ttl < 0
+            ):
+                raise ValueError("browser_idle_ttl must be a non-negative finite number or None")
+            object.__setattr__(
+                self,
+                "browser_idle_ttl",
+                float(self.browser_idle_ttl) if self.browser_idle_ttl > 0 else None,
+            )
         if not isinstance(self.cache_path, str | Path):
             raise ValueError("cache_path must be a string or Path")
 
@@ -292,6 +308,7 @@ class PageFetchConfig:
             raise_on_error=flat.get("raise_on_error", False),
             screenshot_max_bytes=flat.get("screenshot_max_bytes", 50 * 1024 * 1024),
             max_browser_requests=flat.get("max_browser_requests", 50),
+            browser_idle_ttl=flat.get("browser_idle_ttl", 180.0),
             browser_pre_check_byte_margin=flat.get("browser_pre_check_byte_margin", 1.5),
             headers=flat.get("headers"),
             cookies=flat.get("cookies"),
@@ -327,6 +344,7 @@ class PageFetchConfig:
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
         max_browser_requests: int = 50,
+        browser_idle_ttl: str | int | float | None = 180.0,
         browser_pre_check_byte_margin: float = 1.5,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
@@ -346,7 +364,7 @@ class PageFetchConfig:
         # and ``max`` stealth levels we therefore default to ``False`` and
         # let the caller opt back in explicitly.  An explicit ``True`` /
         # ``False`` from the caller is honored regardless of stealth level.
-        if block_images is _UNSET:
+        if block_images is _UNSET or block_images is None:
             block_images = stealth_level not in {"balanced", "max"}
 
         ttl = parse_duration(cache_ttl)
@@ -367,6 +385,18 @@ class PageFetchConfig:
             )
         else:
             session_duration_seconds = int(session_duration)
+
+        idle_ttl_seconds: float | None
+        if browser_idle_ttl is None:
+            idle_ttl_seconds = None
+        elif isinstance(browser_idle_ttl, str):
+            idle_ttl_seconds = float(parse_duration(browser_idle_ttl))
+        elif isinstance(browser_idle_ttl, bool) or not isinstance(browser_idle_ttl, int | float):
+            raise ValueError(
+                "browser_idle_ttl must be a duration string, a non-negative number (seconds), or None"
+            )
+        else:
+            idle_ttl_seconds = float(browser_idle_ttl) if browser_idle_ttl > 0 else None
 
         return cls(
             mode=mode,
@@ -395,6 +425,7 @@ class PageFetchConfig:
             raise_on_error=raise_on_error,
             screenshot_max_bytes=screenshot_max_bytes,
             max_browser_requests=max_browser_requests,
+            browser_idle_ttl=idle_ttl_seconds,
             browser_pre_check_byte_margin=browser_pre_check_byte_margin,
             headers=(
                 {str(k).strip(): str(v).strip() for k, v in headers.items()}

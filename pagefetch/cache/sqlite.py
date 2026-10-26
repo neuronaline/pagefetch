@@ -130,7 +130,8 @@ class SQLiteCache:
             await self._db.commit()
             return None
         result.from_cache = True
-        result.fetch_method = "cache"
+        if not result.fetch_method:
+            result.fetch_method = "cache"
         if requested_screenshot and result.screenshot is None:
             result.warnings.append(
                 "Screenshot is not cached; pass use_cache=False to re-fetch."
@@ -154,7 +155,7 @@ class SQLiteCache:
             payload = result.json(
                 include_html=True,
                 include_structure=True,
-                include_screenshot=True,
+                include_screenshot=False,
             )
         except (TypeError, ValueError) as exc:
             raise RuntimeError(

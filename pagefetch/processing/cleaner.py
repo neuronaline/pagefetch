@@ -62,12 +62,10 @@ _SIDEBAR_RE = re.compile(
     re.IGNORECASE,
 )
 # Tightened pattern: only match explicit site/page chrome class names, not
-# the bare words ``header``/``footer`` (which would silently nuke a
-# ``<div class="card-header">`` inside an article or product card).  We still
-# rely on semantic ``role="banner"``/``role="contentinfo"`` and the
-# ``<header>``/``<footer>`` tags to catch unstyled site chrome.
+# the bare words ``header``/``footer`` or ``page-header`` (which commonly wraps
+# the primary ``<h1>`` article/page title in Bootstrap, Docusaurus, and blogs).
 _SITE_CHROME_RE = re.compile(
-    r"(?:^|[-_\s])(site-header|site-footer|page-header|page-footer|masthead)(?:$|[-_\s])",
+    r"(?:^|[-_\s])(site-header|site-footer|page-footer|masthead)(?:$|[-_\s])",
     re.IGNORECASE,
 )
 # Recognized CSS declarations that hide a block from sighted users.  Operates
@@ -132,18 +130,26 @@ def clean_html(
     noscripts = soup.find_all("noscript")
     if noscripts:
         rendered_strings: list[str] = [
-            string for string in soup.stripped_strings
-            if not any(
-                parent.name == "noscript"
-                for parent in getattr(string, "parents", ())
-                if hasattr(parent, "name")
+            stripped
+            for node in soup.strings
+            if (stripped := str(node).strip())
+            and not any(
+                getattr(parent, "name", None) in {"noscript", "script", "style", "template"}
+                for parent in getattr(node, "parents", ())
             )
         ]
         visible_text = " ".join(rendered_strings)
         for tag in list(noscripts):
+            if not tag.find(True) and "<" in str(tag.string or ""):
+                frag = BeautifulSoup(str(tag.string), "lxml")
+                if frag.find(True) is not None:
+                    tag.clear()
+                    frag_root = frag.body or frag
+                    for child in list(frag_root.contents):
+                        tag.append(child.extract())
             fallback = tag.get_text(" ", strip=True)
             fallback_lower = fallback.lower()
-            is_js_notice = any(
+            is_js_notice = len(fallback) < 350 and any(
                 phrase in fallback_lower
                 for phrase in (
                     "enable javascript",
@@ -159,6 +165,11 @@ def clean_html(
             )
             if is_js_notice or has_tracking_iframe or (fallback and len(fallback) >= 20 and fallback in visible_text):
                 tag.decompose()
+            elif len(visible_text) < 250 and len(fallback) >= 80:
+                tag.unwrap()
+
+    is_standard_or_max = cleaning_level in ("standard", "maximum")
+    is_maximum = cleaning_level == "maximum"
 
     for tag in list(soup.find_all(True)):
         if not isinstance(tag, Tag) or tag.parent is None or tag.attrs is None:
@@ -166,32 +177,33 @@ def clean_html(
         style = str(tag.get("style", "")).replace(" ", "").lower()
         hidden = tag.has_attr("hidden") or bool(_HIDDEN_STYLE_RE.search(style))
         tiny_image = tag.name == "img" and str(tag.get("width")) == "1" and str(tag.get("height")) == "1"
-        common_noise = hidden or tiny_image
-        aria_hidden_attr = str(tag.get("aria-hidden", "")).lower() == "true"
+        if hidden or tiny_image:
+            tag.decompose()
+            continue
+        if not is_standard_or_max or tag.name in {"html", "body", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            continue
+
         classes = " ".join(_class_list(tag))
         identity = f"{tag.get('id', '')} {classes}"
-        matches_noise = _NOISE_RE.search(identity) is not None
-        standard_noise = False
-        if cleaning_level != "minimal":
-            if tag.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-                standard_noise = False
-            elif matches_noise:
-                is_ad = _AD_RE.search(identity) is not None
-                is_safe_container = (
-                    tag.name in {"html", "body", "main", "article"}
-                    or _CONTENT_CONTAINER_RE.search(identity) is not None
-                    or tag.find(["main", "article"]) is not None
-                    or (not is_ad and _inside_content(tag))
-                )
-                standard_noise = not is_safe_container
-            elif aria_hidden_attr:
-                text_length = len(tag.get_text(" ", strip=True))
-                standard_noise = text_length < 200
-        if common_noise or standard_noise:
-            tag.decompose()
+        aria_hidden_attr = str(tag.get("aria-hidden", "")).lower() == "true"
 
-    if cleaning_level in ("standard", "maximum"):
-        _remove_boilerplate(soup, is_maximum=(cleaning_level == "maximum"))
+        if _NOISE_RE.search(identity) is not None:
+            is_ad = _AD_RE.search(identity) is not None
+            is_safe_container = (
+                tag.name in {"main", "article"}
+                or _CONTENT_CONTAINER_RE.search(identity) is not None
+                or tag.find(["main", "article"]) is not None
+                or (not is_ad and _inside_content(tag))
+            )
+            if not is_safe_container:
+                tag.decompose()
+                continue
+        elif aria_hidden_attr and len(tag.get_text(" ", strip=True)) < 200:
+            tag.decompose()
+            continue
+
+        if _should_remove_boilerplate_tag(tag, identity, is_maximum=is_maximum):
+            tag.decompose()
 
     return soup
 
@@ -213,47 +225,53 @@ def _inside_content(tag: Tag) -> bool:
     return False
 
 
+def _should_remove_boilerplate_tag(tag: Tag, identity: str, *, is_maximum: bool = False) -> bool:
+    """Return True if *tag* is unambiguous navigation, sidebar, chrome, or auxiliary boilerplate."""
+    role = str(tag.get("role", "")).lower()
+    in_content = _inside_content(tag)
+    has_primary_heading = tag.find(["h1", "h2"]) is not None
+
+    is_navigation = (tag.name == "nav" and not in_content) or role in {"navigation", "menubar"}
+    is_sidebar = (
+        tag.name == "aside"
+        or role == "complementary"
+        or _SIDEBAR_RE.search(identity) is not None
+    ) and not in_content
+    is_site_chrome = (
+        (role in {"banner", "contentinfo"} or _SITE_CHROME_RE.search(identity) is not None)
+        and not in_content
+        and not has_primary_heading
+    )
+    is_outside_content_header_or_footer = (
+        tag.name in {"header", "footer"}
+        and not in_content
+        and not has_primary_heading
+    )
+    is_auxiliary_block = False
+    if is_maximum and _MAX_BLOCK_RE.search(identity) is not None:
+        is_safe_article = (
+            tag.name in {"html", "body", "main", "article"}
+            or _CONTENT_CONTAINER_RE.search(identity) is not None
+            or tag.find(["main", "article"]) is not None
+            or has_primary_heading
+        )
+        is_auxiliary_block = not is_safe_article
+    return bool(
+        is_navigation
+        or is_sidebar
+        or is_site_chrome
+        or is_outside_content_header_or_footer
+        or is_auxiliary_block
+    )
+
+
 def _remove_boilerplate(soup: BeautifulSoup, *, is_maximum: bool = False) -> None:
     """Remove explicit page chrome, navigation, footers, sidebars, and auxiliary content blocks."""
     for tag in list(soup.find_all(True)):
         if not isinstance(tag, Tag) or tag.parent is None or tag.attrs is None:
             continue
-        classes = " ".join(_class_list(tag))
-        identity = f"{tag.get('id', '')} {classes}"
-        role = str(tag.get("role", "")).lower()
-        is_navigation = (tag.name == "nav" and not _inside_content(tag)) or role in {"navigation", "menubar"}
-        is_sidebar = (
-            tag.name == "aside"
-            or role == "complementary"
-            or _SIDEBAR_RE.search(identity) is not None
-        ) and not _inside_content(tag)
-        is_site_chrome = (
-            role in {"banner", "contentinfo"}
-            or (_SITE_CHROME_RE.search(identity) is not None and not _inside_content(tag))
-        )
-        # Semantic headers/footers are site chrome only outside main/article;
-        # preserve headers containing main heading tags (h1/h2) unless marked as site banner.
-        has_primary_heading = tag.name == "header" and tag.find(["h1", "h2"]) is not None
-        is_outside_content_header_or_footer = (
-            tag.name in {"header", "footer"}
-            and not _inside_content(tag)
-            and not has_primary_heading
-        )
-        is_auxiliary_block = False
-        if is_maximum and _MAX_BLOCK_RE.search(identity) is not None:
-            is_safe_article = (
-                tag.name in {"html", "body", "main", "article"}
-                or _CONTENT_CONTAINER_RE.search(identity) is not None
-                or tag.find(["main", "article"]) is not None
-            )
-            is_auxiliary_block = not is_safe_article
-        if (
-            is_navigation
-            or is_sidebar
-            or is_site_chrome
-            or is_outside_content_header_or_footer
-            or is_auxiliary_block
-        ):
+        identity = f"{tag.get('id', '')} {' '.join(_class_list(tag))}"
+        if _should_remove_boilerplate_tag(tag, identity, is_maximum=is_maximum):
             tag.decompose()
 
 

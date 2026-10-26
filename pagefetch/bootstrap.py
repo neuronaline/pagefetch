@@ -27,7 +27,7 @@ _FETCH_TIMEOUT = 300
 # host Python environment with full user privileges; the spec here is a trust
 # boundary. Set ``PAGEFETCH_AUTO_INSTALL=0`` to disable this path entirely
 # and require an explicit ``pip install pagefetch[browser]``.
-_CAMOUFOX_SPEC = "camoufox>=0.5.6,<1"
+_CAMOUFOX_SPEC = "camoufox[geoip]>=0.5.6,<1"
 
 
 class RuntimeBootstrapError(RuntimeError):

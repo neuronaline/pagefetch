@@ -12,7 +12,11 @@ STRONG_CHALLENGE_PATTERNS = (
     "checking your browser",
     "verify you are human",
     "attention required",
+    "just a moment",
+    "enter the characters you see below",
+    "type the characters you see in this image",
     # ── Turkish ── Cloudflare/Akamai localizations and Turkish-origin WAFs
+    "bir dakika lütfen",
     "robot olmadığınızı doğrulayın",
     "robot olmadığınızı doğruluyoruz",
     "erişim engellendi",
@@ -30,7 +34,7 @@ STRONG_CHALLENGE_PATTERNS = (
     "nous vérifions votre navigateur",
     "vérifiez que vous êtes humain",
     "accès refusé",
-    # ── Spanish ──
+    # ── Spanish / Portuguese / Italian ──
     "verificando tu navegador",
     "verifica que no eres un robot",
     "acceso denegado",
@@ -79,6 +83,11 @@ CHALLENGE_DOM_PATTERNS = (
     "h-captcha",
     "cf-turnstile",
     "challenge-form",
+    "challenge-error-text",
+    "challenge-stage",
+    "challenge-running",
+    "_cf_chl_opt",
+    "validatecaptcha",
 )
 JS_PATTERNS = (
     "enable javascript",
@@ -143,7 +152,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     noise_ids: set[int] = {id(tag) for tag in noise_tags}
     safe_ids: set[int] = set()
 
-    def _is_in_noise(node: object) -> bool:
+    def _is_in_noise(node: object, noise_names: frozenset[str] = _NOISE_TAG_NAMES) -> bool:
         curr = getattr(node, "parent", None)
         path: list[int] = []
         while curr is not None:
@@ -154,7 +163,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
             if cid in safe_ids:
                 safe_ids.update(path)
                 return False
-            if getattr(curr, "name", None) in _NOISE_TAG_NAMES:
+            if getattr(curr, "name", None) in noise_names:
                 noise_ids.add(cid)
                 noise_ids.update(path)
                 return True
@@ -172,6 +181,43 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and not _is_in_noise(node)
         and (value := str(node).strip())
     )
+    has_noscript_fallback = False
+    if len(text) < 250:
+        substantive_noscript_ids: set[int] = set()
+        for tag in noise_tags:
+            if tag.name != "noscript":
+                continue
+            ns_text = tag.get_text(" ", strip=True)
+            ns_lower = ns_text.lower()
+            is_js_notice = len(ns_text) < 350 and any(
+                phrase in ns_lower
+                for phrase in (
+                    *JS_PATTERNS,
+                    "requires javascript",
+                    "javascript is disabled",
+                    "javascript to run",
+                    "support javascript",
+                )
+            )
+            if len(ns_text) >= 150 and not is_js_notice:
+                substantive_noscript_ids.add(id(tag))
+        if substantive_noscript_ids:
+            has_noscript_fallback = True
+            non_noscript_noise = frozenset({"script", "style", "template"})
+            noise_ids = {
+                id(tag)
+                for tag in noise_tags
+                if id(tag) not in substantive_noscript_ids
+            }
+            safe_ids.clear()
+            text = " ".join(
+                value
+                for node in text_root.find_all(string=True)
+                if node.parent is not None
+                and not isinstance(node, (Comment, Doctype))
+                and not _is_in_noise(node, non_noscript_noise)
+                and (value := str(node).strip())
+            )
     lowered_text = text.lower()
     # HTML-level pattern matches use a case-insensitive regex over the raw
     # HTML string instead of ``html.lower()``; lower-casing a 25 MB string
@@ -281,8 +327,11 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     )
     framework = bool(_FRAMEWORK_RE.search(html))
     mounts = soup.select("#app:empty, #root:empty, #__next:empty, [data-reactroot]:empty")
-    shell = explicit_js or bool(mounts) or (framework and text_len < 250) or (
-        script_size > max(10_000, text_len * 8) and text_len < 400
+    shell = (
+        explicit_js
+        or (bool(mounts) and not has_noscript_fallback)
+        or (framework and text_len < 250)
+        or (script_size > max(10_000, text_len * 8) and text_len < 400)
     )
     placeholder = any(pattern in lowered_text for pattern in PLACEHOLDER_PATTERNS)
     wall = any(pattern in lowered_text for pattern in WALL_PATTERNS)
@@ -298,9 +347,9 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and not placeholder
         and not wall
         and not refresh
-        and not mounts
+        and (not mounts or has_noscript_fallback)
         and not explicit_js
-        and (script_size < 25_000 or script_size < max(5_000, text_len * 10))
+        and (script_size < 25_000 or script_size < max(5_000, text_len * 10) or (has_noscript_fallback and text_len >= 400))
         and text_len >= 80
         and word_count >= 12
         and (bool(paragraphs) or bool(headings))

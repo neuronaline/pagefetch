@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import random
@@ -28,12 +29,12 @@ logger = logging.getLogger("pagefetch.fetching.browser")
 
 # Resource-type blocking sets per stealth level.
 #   minimal:   only pure overhead (media, beacon)
-#   balanced:  also strip images, pings, and websockets
-#   aggressive: block everything non-essential including fonts
+#   balanced:  also strip pings
+#   aggressive: also strip images and fonts (stylesheets/websockets kept intact for layout & WAFs)
 BLOCK_LEVEL_SETS: dict[str, set[str]] = {
     "minimal": {"media", "beacon"},
-    "balanced": {"media", "beacon", "ping", "image", "websocket"},
-    "aggressive": {"media", "beacon", "ping", "image", "font", "websocket"},
+    "balanced": {"media", "beacon", "ping"},
+    "aggressive": {"media", "beacon", "ping", "image", "font"},
 }
 
 # Common challenge/WAF providers that run inside child frames or require
@@ -47,6 +48,7 @@ _CHALLENGE_DOMAINS: frozenset[str] = frozenset(
         "gstatic.com",
         "recaptcha.google.com",
         "arkoselabs.com",
+        "funcaptcha.com",
         "datadome.co",
         "perimeterx.net",
         "kasada.io",
@@ -54,7 +56,16 @@ _CHALLENGE_DOMAINS: frozenset[str] = frozenset(
         "imperva.com",
         "incapsula.com",
         "botguard.net",
+        "awswaf.com",
     }
+)
+
+_CHALLENGE_PATH_PREFIXES: tuple[str, ...] = (
+    "/cdn-cgi/",
+    "/__cf_chl",
+    "/_bm/",
+    "/akam/",
+    "/_sec/",
 )
 
 # Common third-party tracking, ads, and analytics domains to block from all frames
@@ -80,17 +91,6 @@ _TRACKER_DOMAINS: frozenset[str] = frozenset(
         "facebook.net",
     }
 )
-
-# Common desktop viewport pool — avoids a single fixed fingerprint
-# while staying within realistic bounds for content extraction.
-_VIEWPORT_POOL: list[tuple[int, int]] = [
-    (1280, 720),
-    (1366, 768),
-    (1440, 900),
-    (1536, 864),
-    (1600, 900),
-    (1920, 1080),
-]
 
 
 @dataclass(slots=True)
@@ -125,6 +125,7 @@ class BrowserFetcher:
         humanize: bool = False,
         accept_language: str = "en-US,en;q=0.5",
         max_browser_requests: int = 50,
+        idle_ttl: float | None = 180.0,
     ) -> None:
         self.semaphore = semaphore
         self.timeout = timeout
@@ -139,6 +140,7 @@ class BrowserFetcher:
         self.humanize = humanize
         self.accept_language = accept_language
         self.max_browser_requests = max_browser_requests
+        self.idle_ttl = float(idle_ttl) if idle_ttl is not None and idle_ttl > 0 else None
         self._request_count = 0
         self._manager: Any = None
         self._browser: Any = None
@@ -146,6 +148,8 @@ class BrowserFetcher:
         self._active_count = 0
         self._active_lock = asyncio.Lock()
         self._needs_reset = False
+        self._last_used = time.monotonic()
+        self._idle_task: asyncio.Task[None] | None = None
         self._context_pools: dict[str, list[Any]] = {}
         self._context_lock = asyncio.Lock()
         # Linux runs the browser headed against an in-process Xvfb to avoid
@@ -153,6 +157,37 @@ class BrowserFetcher:
         # Windows/macOS we stay on native headless — no display server is
         # needed there.
         self._xvfb: XvfbDisplay | None = None
+
+    def _cancel_idle_task(self) -> None:
+        task = self._idle_task
+        self._idle_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _schedule_idle_close(self) -> None:
+        self._cancel_idle_task()
+        if self.idle_ttl is None or self.idle_ttl <= 0 or self._browser is None:
+            return
+        ttl = self.idle_ttl
+
+        async def _reap_when_idle() -> None:
+            try:
+                await asyncio.sleep(ttl)
+                async with self._active_lock:
+                    if self._active_count > 0 or (time.monotonic() - self._last_used) < ttl * 0.95:
+                        return
+                logger.info("Closing idle Camoufox browser after %.1fs of inactivity", ttl)
+                await self.close()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.debug("Idle browser reaper error: %s", exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._idle_task = loop.create_task(_reap_when_idle())
+        except RuntimeError:
+            pass
 
     def _detect_os(self) -> str | None:
         """Return a Camoufox-compatible OS string matching the host."""
@@ -164,51 +199,35 @@ class BrowserFetcher:
             return "linux"
         return None
 
-    def _build_camoufox_options(self, host_os: str | None, use_xvfb: bool) -> dict[str, Any]:
+    def _build_camoufox_options(
+        self,
+        host_os: str | None,
+        use_xvfb: bool,
+        proxy: ProxySettings | None = None,
+    ) -> dict[str, Any]:
+        effective_proxy = proxy if proxy is not None else self.proxy
+        has_proxy = bool(effective_proxy and effective_proxy.url)
         primary_locale = self.accept_language.split(",")[0].split(";")[0].strip() or "en-US"
         options: dict[str, Any] = {
             "headless": not use_xvfb,
             "humanize": self.humanize,
             "enable_cache": True,
-            "block_webrtc": True,
+            "block_webrtc": not has_proxy,
             "locale": primary_locale,
-            "window": random.choice(_VIEWPORT_POOL),
         }
-        if bool(self.proxy and self.proxy.url):
-            options["geoip"] = True
-            browser_proxy = self.proxy.browser_config()
+        has_geoip = bool(importlib.util.find_spec("maxminddb"))
+        if has_proxy and effective_proxy is not None:
+            options["geoip"] = has_geoip
+            browser_proxy = effective_proxy.browser_config()
             if browser_proxy:
                 options["proxy"] = browser_proxy
         else:
             options["geoip"] = False
         if self.block_images:
             options["block_images"] = True
-            # Suppress the Camoufox LeakWarning that fires when
-            # ``block_images`` is enabled.  The warning exists
-            # because image blocking creates CSS/Canvas/WebGL
-            # inconsistencies that bot-detection scripts look for;
-            # in ``off`` stealth mode this is acceptable, and the
-            # operator has explicitly opted in by setting
-            # ``block_images=True``.  The ``balanced``/``max``
-            # stealth presets default to ``False`` to keep
-            # browser fingerprints coherent — see
-            # ``config.build()``.
             options["i_know_what_im_doing"] = True
         if host_os is not None:
             options["os"] = host_os
-        # Firefox user prefs for fetch-oriented performance.
-        # Disable cosmetic animations, speculative connections, and service workers;
-        # keep disk and memory cache on for repeat visits.
-        options["firefox_user_prefs"] = {
-            "browser.cache.disk.enable": True,
-            "browser.cache.memory.enable": True,
-            "toolkit.cosmeticAnimations.enabled": False,
-            "network.prefetch-next": False,
-            "network.dns.disablePrefetch": True,
-            "network.predictor.enabled": False,
-            "network.http.speculative-parallel-limit": 0,
-            "dom.serviceWorkers.enabled": False,
-        }
         browser_env = dict(os.environ)
         if use_xvfb and self._xvfb is not None:
             browser_env["DISPLAY"] = self._xvfb.display
@@ -225,12 +244,14 @@ class BrowserFetcher:
         options["env"] = browser_env
         return options
 
-    async def start(self) -> None:
+    async def start(self, proxy: ProxySettings | None = None) -> None:
         if self._browser is not None and getattr(self._browser, "is_connected", lambda: True)():
             return
         async with self._start_lock:
             if self._browser is not None and getattr(self._browser, "is_connected", lambda: True)():
                 return
+            if proxy is not None and self.proxy is None:
+                self.proxy = proxy
             # Clean up a stale manager left behind by an earlier reset or crash
             if self._manager is not None:
                 try:
@@ -297,7 +318,7 @@ class BrowserFetcher:
                             ) from exc
                         self._xvfb = xvfb
 
-                options = self._build_camoufox_options(host_os, use_xvfb)
+                options = self._build_camoufox_options(host_os, use_xvfb, proxy=proxy)
                 self._manager = AsyncCamoufox(**options)
                 self._browser = await self._manager.__aenter__()
             except TransportFailure:
@@ -349,6 +370,7 @@ class BrowserFetcher:
         url: str,
         *,
         proxy: ProxySettings | None = None,
+        proxy_resolver: Any = None,
         actions: Sequence[PageAction] | None = None,
         capture_xhr: bool | str | Sequence[str] = False,
         headers: dict[str, str] | None = None,
@@ -386,6 +408,7 @@ class BrowserFetcher:
         scroll_sleep_late = 0.15
 
         async with self._active_lock:
+            self._cancel_idle_task()
             self._active_count += 1
             self._request_count += 1
             if self.max_browser_requests > 0 and self._request_count >= self.max_browser_requests:
@@ -396,15 +419,25 @@ class BrowserFetcher:
                     remaining = total_deadline - time.monotonic()
                     if remaining <= 0:
                         raise self._timeout_failure()
+                    attempt_proxy = proxy
                     # ── browser I/O inside semaphore ──
                     async with self.semaphore:
-                        await asyncio.wait_for(self.start(), timeout=remaining)
+                        if attempt_proxy is not None and self.proxy is None:
+                            self.proxy = attempt_proxy
+                        await asyncio.wait_for(self.start(proxy=attempt_proxy), timeout=remaining)
                         remaining = total_deadline - time.monotonic()
                         if remaining <= 0:
                             raise self._timeout_failure()
+                        if attempt < self.retries:
+                            attempt_timeout = min(
+                                remaining,
+                                max(15.0, (self.timeout / (self.retries + 1)) * 1.6),
+                            )
+                        else:
+                            attempt_timeout = remaining
                         result = await self._fetch_page_once(
                             url,
-                            proxy=proxy,
+                            proxy=attempt_proxy,
                             actions=actions,
                             capture_xhr=capture_xhr,
                             headers=headers,
@@ -412,7 +445,7 @@ class BrowserFetcher:
                             max_scrolls=max_scrolls,
                             scroll_sleep_early=scroll_sleep_early,
                             scroll_sleep_late=scroll_sleep_late,
-                            page_timeout=remaining,
+                            page_timeout=attempt_timeout,
                             screenshot=screenshot,
                             screenshot_format=screenshot_format,
                             screenshot_max_bytes=screenshot_max_bytes,
@@ -422,7 +455,7 @@ class BrowserFetcher:
                     result.confidence = report
 
                     # Retry only for genuine failures: empty DOM, an active anti-bot challenge,
-                    # an unmounted JavaScript shell, or very low confidence without meaningful content.
+                    # an unmounted JavaScript shell, a blocked HTTP status, or very low confidence.
                     empty = not result.html.strip()
                     very_low_threshold = min(0.40, self.confidence_threshold)
                     has_substantive_content = (
@@ -430,15 +463,34 @@ class BrowserFetcher:
                         and not report.javascript_shell
                         and "very little visible text" not in report.reasons
                     )
-                    should_retry = empty or report.challenge or report.javascript_shell or (
-                        report.score < very_low_threshold and not has_substantive_content
+                    blocked_status = (
+                        result.status_code is not None
+                        and result.status_code in {403, 407, 429, 502, 503, 504}
+                        and report.score < self.confidence_threshold
+                    )
+                    should_retry = (
+                        empty
+                        or report.challenge
+                        or report.javascript_shell
+                        or blocked_status
+                        or (report.score < very_low_threshold and not has_substantive_content)
                     )
 
                     if should_retry and attempt < self.retries:
-                        # Escalate: more scrolls and longer waits on next attempt.
+                        # Escalate: more scrolls, longer waits, and rotate proxy/browser on block.
                         max_scrolls = min(12, max_scrolls + 3)
                         scroll_sleep_early = min(0.20, scroll_sleep_early + 0.03)
                         scroll_sleep_late = min(0.28, scroll_sleep_late + 0.05)
+                        if (report.challenge or blocked_status) and callable(proxy_resolver):
+                            new_proxy = proxy_resolver(attempt + 1)
+                            if new_proxy is not None:
+                                proxy = new_proxy
+                            async with self._active_lock:
+                                can_reset = self._active_count <= 1
+                            if can_reset:
+                                if new_proxy is not None:
+                                    self.proxy = new_proxy
+                                await self.close()
                         if not await self._backoff_before_deadline(attempt, total_deadline):
                             raise self._timeout_failure()
                         continue
@@ -450,8 +502,20 @@ class BrowserFetcher:
                     last_failure = exc
                     if not exc.error.retryable or attempt >= self.retries:
                         raise
-                    if exc.error.code in {"browser_launch_error", "browser_navigation_error"}:
-                        self._needs_reset = True
+                    new_proxy = None
+                    if callable(proxy_resolver):
+                        new_proxy = proxy_resolver(attempt + 1)
+                        if new_proxy is not None:
+                            proxy = new_proxy
+                    if exc.error.code in {"browser_launch_error", "browser_navigation_error", "browser_timeout"}:
+                        async with self._active_lock:
+                            can_reset = self._active_count <= 1
+                        if can_reset:
+                            if new_proxy is not None:
+                                self.proxy = new_proxy
+                            await self.close()
+                        else:
+                            self._needs_reset = True
                     if not await self._backoff_before_deadline(attempt, total_deadline):
                         raise self._timeout_failure() from exc
             # Unreachable: every iteration ``continue``-s, ``return``-s, or
@@ -462,14 +526,21 @@ class BrowserFetcher:
             )
         finally:
             should_reset = False
+            schedule_idle = False
             async with self._active_lock:
                 self._active_count -= 1
-                if self._active_count == 0 and self._needs_reset:
-                    self._needs_reset = False
-                    self._request_count = 0
-                    should_reset = True
+                self._last_used = time.monotonic()
+                if self._active_count == 0:
+                    if self._needs_reset:
+                        self._needs_reset = False
+                        self._request_count = 0
+                        should_reset = True
+                    else:
+                        schedule_idle = True
             if should_reset:
                 await self.close()
+            elif schedule_idle:
+                self._schedule_idle_close()
 
     async def _setup_interception(
         self,
@@ -569,25 +640,26 @@ class BrowserFetcher:
             request_url = request.url
             res_type = request.resource_type
             req_host = ""
+            req_path = ""
             if request_url.startswith(("http://", "https://", "ws://", "wss://")):
-                req_host = (urlsplit(request_url).hostname or "").lower()
+                req_parsed = urlsplit(request_url)
+                req_host = (req_parsed.hostname or "").lower()
+                req_path = (req_parsed.path or "").lower()
 
             is_challenge_host = any(
                 req_host == d or req_host.endswith("." + d)
                 for d in _CHALLENGE_DOMAINS
-            )
+            ) or any(req_path.startswith(p) for p in _CHALLENGE_PATH_PREFIXES)
 
             # Block non-essential resource types according to the configured block_level.
             blocked = set(
-                BLOCK_LEVEL_SETS.get(self.block_level, BLOCK_LEVEL_SETS["aggressive"])
+                BLOCK_LEVEL_SETS.get(self.block_level, BLOCK_LEVEL_SETS["balanced"])
             )
-            if not self.block_images:
+            if not self.block_images or screenshot:
                 blocked.discard("image")
-            if self.block_level == "aggressive" and not screenshot:
-                blocked.update({"stylesheet", "eventsource", "manifest", "other"})
 
-            # Never block WebSockets or scripts essential for challenge verification
-            if is_challenge_host and res_type in {"websocket", "script", "xhr", "fetch"}:
+            # Never block resources for challenge verification hosts/paths
+            if is_challenge_host:
                 is_blocked_type = False
             else:
                 is_blocked_type = res_type in blocked
@@ -599,15 +671,16 @@ class BrowserFetcher:
                     is_tracker = True
 
             external_frame = False
-            if res_type == "document" and request.frame != page.main_frame:
+            if self.block_level != "minimal" and res_type == "document" and request.frame != page.main_frame:
                 if request_url.startswith(("http://", "https://")) and not is_challenge_host:
                     external_frame = registrable_host(request_url) != _main_site
 
             # Also block cross-site scripts, XHR, and fetch requests
-            # initiated inside child frames (unless it's an anti-bot challenge host).
+            # initiated inside child frames (unless it's an anti-bot challenge host
+            # or block_level is minimal).
             external_script = False
             _main_frame = getattr(page, "main_frame", None)
-            if res_type in {"script", "xhr", "fetch"} and _main_frame is not None:
+            if self.block_level != "minimal" and res_type in {"script", "xhr", "fetch"} and _main_frame is not None:
                 if getattr(request, "frame", None) != _main_frame and not is_challenge_host:
                     if request_url.startswith(("http://", "https://")):
                         external_script = registrable_host(request_url) != _main_site
@@ -629,6 +702,43 @@ class BrowserFetcher:
 
         await page.route("**/*", route_handler)
         return network
+
+    async def _try_resolve_interstitial(self, page: Any) -> bool:
+        """Attempt a single click on a Turnstile widget or benign continue button."""
+        try:
+            box = await page.evaluate(
+                """() => {
+                    const el = document.querySelector(
+                        '.cf-turnstile, [id^="cf-chl-widget"], #challenge-stage iframe, #challenge-stage input[type="checkbox"]'
+                    );
+                    if (el) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 20 && r.height > 20) {
+                            return {x: r.x + Math.min(28, r.width / 2), y: r.y + r.height / 2};
+                        }
+                    }
+                    const hasTextInput = !!document.querySelector('input[type="text"], input[name*="field-keywords"]');
+                    if (!hasTextInput) {
+                        const btn = document.querySelector(
+                            'form[action*="validateCaptcha" i] button[type="submit"], ' +
+                            'form[action*="validateCaptcha" i] input[type="submit"]'
+                        );
+                        if (btn) {
+                            const r = btn.getBoundingClientRect();
+                            if (r.width > 10 && r.height > 10) {
+                                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                            }
+                        }
+                    }
+                    return null;
+                }"""
+            )
+            if isinstance(box, dict) and "x" in box and "y" in box:
+                await page.mouse.click(float(box["x"]), float(box["y"]))
+                return True
+        except Exception:
+            pass
+        return False
 
     async def _ensure_page_readiness(
         self,
@@ -652,16 +762,20 @@ class BrowserFetcher:
         if probe["challenge"]:
             # Challenge page detected (e.g. Cloudflare Turnstile / Just a moment).
             # Avoid scrolling which can interrupt solving, and poll until resolved.
-            challenge_timeout = min(8.0, self.timeout / 2)
-            challenge_deadline = time.monotonic() + challenge_timeout
+            challenge_timeout = min(15.0, self.timeout / 2)
+            challenge_started = time.monotonic()
+            challenge_deadline = challenge_started + challenge_timeout
+            clicked_interstitial = False
             while time.monotonic() < challenge_deadline:
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(0.35)
+                if not clicked_interstitial and (time.monotonic() - challenge_started) >= 2.0:
+                    clicked_interstitial = await self._try_resolve_interstitial(page)
                 probe = await in_page_metrics(page)
                 if not probe["challenge"]:
                     break
             await wait_for_stability(
                 page,
-                timeout=min(2.0, self.timeout / 4),
+                timeout=min(3.0, self.timeout / 4),
                 stable_rounds=2,
                 network_activity=lambda: (network["active"], network["last_activity"]),
             )
@@ -759,7 +873,10 @@ class BrowserFetcher:
         proxy_key = effective_proxy.url if effective_proxy and effective_proxy.url else ""
         try:
             async with asyncio.timeout(page_timeout):
-                context_headers = {"Accept-Language": self.accept_language}
+                has_proxy = bool(effective_proxy and effective_proxy.url)
+                context_headers: dict[str, str] = {}
+                if not has_proxy and self.accept_language != "en-US,en;q=0.5":
+                    context_headers["Accept-Language"] = self.accept_language
                 if headers:
                     context_headers.update(headers)
 
@@ -784,7 +901,6 @@ class BrowserFetcher:
                         "ignore_https_errors": True,
                         "java_script_enabled": True,
                         "accept_downloads": False,
-                        "service_workers": "block",
                     }
                     browser_proxy = effective_proxy.browser_config() if effective_proxy else None
                     if browser_proxy:
@@ -809,10 +925,11 @@ class BrowserFetcher:
                             logger.debug("Failed to set cookies on browser context: %s", exc)
 
                 page = await context.new_page()
-                try:
-                    await page.set_extra_http_headers(context_headers)
-                except Exception:
-                    pass
+                if context_headers:
+                    try:
+                        await page.set_extra_http_headers(context_headers)
+                    except Exception:
+                        pass
 
                 network = await self._setup_interception(
                     page,
@@ -821,10 +938,11 @@ class BrowserFetcher:
                     capture_xhr=capture_xhr,
                     screenshot=screenshot != "none",
                 )
+                goto_timeout_ms = int(max(1.0, min(page_timeout, self.timeout)) * 1000)
                 response = await page.goto(
                     url,
                     wait_until="domcontentloaded",
-                    timeout=int(self.timeout * 1000),
+                    timeout=goto_timeout_ms,
                 )
 
                 skip_scroll = await self._ensure_page_readiness(
@@ -896,7 +1014,7 @@ class BrowserFetcher:
                 doc_status = network.get("last_document_status")
                 final_status = doc_status if doc_status is not None else (response.status if response else None)
 
-                fetch_succeeded = True
+                fetch_succeeded = final_status is None or final_status < 400
                 return BrowserResponse(
                     url=page.url,
                     status_code=final_status,
@@ -952,6 +1070,7 @@ class BrowserFetcher:
                     pass
             if context is not None:
                 max_pool_size = max(2, getattr(self, "browser_concurrency", 4))
+                evicted_contexts: list[Any] = []
                 try:
                     await context.clear_cookies()
                     async with self._context_lock:
@@ -965,8 +1084,20 @@ class BrowserFetcher:
                         ):
                             pool.append(context)
                             context = None
+                            while len(self._context_pools) > 4:
+                                oldest_key = next(iter(self._context_pools))
+                                if oldest_key == proxy_key and len(self._context_pools) > 1:
+                                    keys_iter = iter(self._context_pools)
+                                    next(keys_iter)
+                                    oldest_key = next(keys_iter)
+                                evicted_contexts.extend(self._context_pools.pop(oldest_key, []))
                 except Exception:
                     pass
+                for evicted in evicted_contexts:
+                    try:
+                        await evicted.close()
+                    except Exception:
+                        pass
                 if context is not None:
                     try:
                         await context.close()
@@ -1031,6 +1162,7 @@ class BrowserFetcher:
         return str(soup)
 
     async def close(self) -> None:
+        self._cancel_idle_task()
         async with self._context_lock:
             for pool in self._context_pools.values():
                 for ctx in pool:

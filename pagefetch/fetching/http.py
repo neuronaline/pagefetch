@@ -123,6 +123,7 @@ class HTTPFetcher:
         *,
         method: str = "GET",
         proxy_url: str | None = None,
+        proxy_resolver: Callable[[int], str | None] | None = None,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
         content: bytes | str | None = None,
@@ -155,10 +156,45 @@ class HTTPFetcher:
                 else:
                     base_client = self.client
 
+                shared_transport = _SharedClientTransport(base_client)
+
+                async def _rotate_proxy_on_retry(next_attempt: int) -> None:
+                    nonlocal proxy_url, base_client, fallback_client
+                    if proxy_resolver is None or proxy_url is None:
+                        return
+                    new_proxy_url = proxy_resolver(next_attempt)
+                    if not new_proxy_url or new_proxy_url == proxy_url:
+                        return
+                    if base_client is not None:
+                        if fallback_client is not None:
+                            await fallback_client.aclose()
+                            fallback_client = None
+                        elif self.proxy_client_releaser is not None:
+                            self.proxy_client_releaser(base_client)
+                    proxy_url = new_proxy_url
+                    if self.proxy_client_provider is not None:
+                        base_client = await self.proxy_client_provider(proxy_url)
+                    else:
+                        req_headers = headers if headers is not None else self.client.headers
+                        fallback_client = httpx.AsyncClient(
+                            headers=req_headers,
+                            timeout=self.client.timeout,
+                            follow_redirects=False,
+                            max_redirects=self.max_redirects,
+                            http2=True,
+                            proxy=proxy_url,
+                            limits=httpx.Limits(
+                                max_connections=self.retries + 1,
+                                max_keepalive_connections=1,
+                            ),
+                        )
+                        base_client = fallback_client
+                    shared_transport._client = base_client
+
                 # Do not inject client-level headers into op_client so that _strip_credentials
                 # during cross-origin redirects is not subverted by httpx client-level header merging.
                 op_client = httpx.AsyncClient(
-                    transport=_SharedClientTransport(base_client),
+                    transport=shared_transport,
                     timeout=base_client.timeout,
                     follow_redirects=False,
                     max_redirects=self.max_redirects,
@@ -174,6 +210,8 @@ class HTTPFetcher:
                         data=data,
                         json_data=json_data,
                         retryable_status_codes=retryable_status_codes,
+                        has_proxy=bool(proxy_url),
+                        on_retry=_rotate_proxy_on_retry if proxy_resolver is not None else None,
                     )
                 finally:
                     await op_client.aclose()
@@ -196,6 +234,8 @@ class HTTPFetcher:
         data: dict[str, Any] | None = None,
         json_data: Any = None,
         retryable_status_codes: frozenset[int] | None = None,
+        has_proxy: bool = False,
+        on_retry: Callable[[int], Awaitable[None]] | None = None,
     ) -> HTTPResponse:
         retry_codes = retryable_status_codes if retryable_status_codes is not None else RETRYABLE_STATUS_CODES
         for attempt in range(self.retries + 1):
@@ -209,6 +249,7 @@ class HTTPFetcher:
                     content=content,
                     data=data,
                     json_data=json_data,
+                    has_proxy=has_proxy,
                 )
                 is_idempotent = method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
                 if response.status_code in retry_codes and attempt < self.retries:
@@ -219,6 +260,8 @@ class HTTPFetcher:
                     if not is_idempotent and response.status_code != 429:
                         return response
                     await self._backoff(attempt, response.headers.get("Retry-After"))
+                    if on_retry is not None:
+                        await on_retry(attempt + 1)
                     continue
                 return response
             except TransportFailure as exc:
@@ -226,6 +269,8 @@ class HTTPFetcher:
                 if not exc.error.retryable or attempt >= self.retries or not is_idempotent:
                     raise
                 await self._backoff(attempt)
+                if on_retry is not None:
+                    await on_retry(attempt + 1)
         # Unreachable: every loop iteration either ``continue``-s, ``return``-s,
         # or ``raise``-s. The exhaustive-iteration reasoning guarantees we never
         # fall through here; linters may flag this and that is fine.
@@ -242,6 +287,7 @@ class HTTPFetcher:
         content: bytes | str | None = None,
         data: dict[str, Any] | None = None,
         json_data: Any = None,
+        has_proxy: bool = False,
     ) -> HTTPResponse:
         client = client or self.client
         current_url = url
@@ -303,7 +349,7 @@ class HTTPFetcher:
                         next_url = urljoin(current_url, location)
                         try:
                             # Skip local DNS check when proxy is active to prevent DNS leaks, but still block private literal IPs
-                            validate_url(next_url, check_ssrf=True, resolve_dns=not bool(proxy_url))
+                            validate_url(next_url, check_ssrf=True, resolve_dns=not has_proxy)
                         except ValueError as exc:
                             raise TransportFailure(
                                 FetchErrorInfo(

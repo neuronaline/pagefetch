@@ -6,6 +6,7 @@ import asyncio
 import logging
 import random
 import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from datetime import UTC, datetime
@@ -60,8 +61,12 @@ from .processing.pipeline import (
 from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
 from .proxy.pool import _MAX_PROXY_HTTP_CLIENTS, _ProxyClientPool
 from .proxy.providers import (
+    accept_language_for_country,
+    bump_domain_session,
+    infer_target_country,
     inject_session_id_for,
     make_domain_session,
+    make_random_session,
 )
 from .utils.durations import parse_duration
 from .utils.urls import async_is_safe_host, normalize_url, registrable_host, validate_url
@@ -83,6 +88,13 @@ elif sys.platform == "darwin":
     _HOST_OS = "macos"
 else:
     _HOST_OS = "linux"
+
+# Process-wide adaptive host memory so short-lived PageFetch instances
+# (e.g., per-call context managers in agent tool loops) remember hosts that
+# required browser escalation within the last 10 minutes.
+_HOST_MEMORY_LOCK = threading.Lock()
+_HOST_ESCALATIONS: dict[str, list[float]] = {}
+_HOST_MEMORY: dict[str, float] = {}
 
 
 class _AsyncPacer:
@@ -156,6 +168,8 @@ class PageFetch:
         stealth_level: Literal["off", "balanced", "max"] = "off",
         raise_on_error: bool = False,
         screenshot_max_bytes: int = 50 * 1024 * 1024,
+        max_browser_requests: int = 50,
+        browser_idle_ttl: str | int | float | None = 180.0,
         browser_pre_check_byte_margin: float = 1.5,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
@@ -191,6 +205,8 @@ class PageFetch:
                 stealth_level=stealth_level,
                 raise_on_error=raise_on_error,
                 screenshot_max_bytes=screenshot_max_bytes,
+                max_browser_requests=max_browser_requests,
+                browser_idle_ttl=browser_idle_ttl,
                 browser_pre_check_byte_margin=browser_pre_check_byte_margin,
                 headers=headers,
                 cookies=cookies,
@@ -234,41 +250,47 @@ class PageFetch:
         # wait when no fetches are in flight.
         self._drain_event = asyncio.Event()
         self._drain_event.set()
-        self._host_escalations: dict[str, list[float]] = {}
-        self._host_memory: dict[str, float] = {}
+        self._host_escalations = _HOST_ESCALATIONS
+        self._host_memory = _HOST_MEMORY
 
     def _record_host_escalation(self, url: str) -> None:
         """Record an escalation to browser mode for adaptive host memory."""
         host = (urlsplit(url).hostname or url).lower()
         now = time.monotonic()
-        history = [t for t in self._host_escalations.get(host, []) if now - t <= 300.0]
-        history.append(now)
-        self._host_escalations[host] = history
-        if len(history) >= 2:
-            self._host_memory[host] = now + 600.0
-            logger.info("Host %s remembered for browser mode (10m TTL)", host)
+        with _HOST_MEMORY_LOCK:
+            history = [t for t in self._host_escalations.get(host, []) if now - t <= 300.0]
+            history.append(now)
+            self._host_escalations[host] = history
+            if len(history) >= 2:
+                self._host_memory[host] = now + 600.0
+                logger.info("Host %s remembered for browser mode (10m TTL)", host)
 
-        if len(self._host_memory) > 1000:
-            self._host_memory = {h: exp for h, exp in self._host_memory.items() if now < exp}
-            while len(self._host_memory) > 1000:
-                self._host_memory.pop(next(iter(self._host_memory)))
-        if len(self._host_escalations) > 1000:
-            self._host_escalations = {
-                h: hist for h, hist in self._host_escalations.items() if hist and now - hist[-1] <= 300.0
-            }
-            while len(self._host_escalations) > 1000:
-                self._host_escalations.pop(next(iter(self._host_escalations)))
+            if len(self._host_memory) > 1000:
+                expired = [h for h, exp in self._host_memory.items() if now >= exp]
+                for h in expired:
+                    self._host_memory.pop(h, None)
+                while len(self._host_memory) > 1000:
+                    self._host_memory.pop(next(iter(self._host_memory)))
+            if len(self._host_escalations) > 1000:
+                stale = [
+                    h for h, hist in self._host_escalations.items() if not hist or now - hist[-1] > 300.0
+                ]
+                for h in stale:
+                    self._host_escalations.pop(h, None)
+                while len(self._host_escalations) > 1000:
+                    self._host_escalations.pop(next(iter(self._host_escalations)))
 
     def _is_host_remembered(self, url: str) -> bool:
         """Return True if host is cached as requiring browser mode."""
         host = (urlsplit(url).hostname or url).lower()
-        expiry = self._host_memory.get(host)
-        if expiry is None:
+        with _HOST_MEMORY_LOCK:
+            expiry = self._host_memory.get(host)
+            if expiry is None:
+                return False
+            if time.monotonic() < expiry:
+                return True
+            self._host_memory.pop(host, None)
             return False
-        if time.monotonic() < expiry:
-            return True
-        self._host_memory.pop(host, None)
-        return False
 
     @classmethod
     def from_config(cls, config: PageFetchConfig) -> PageFetch:
@@ -384,8 +406,6 @@ class PageFetch:
                 self._http_fetchers.clear()
                 self._http_clients.clear()
                 self._proxy_http_clients.clear()
-                self._host_escalations.clear()
-                self._host_memory.clear()
                 self._closed = True
                 self._closing = False
         except asyncio.CancelledError:
@@ -791,16 +811,7 @@ class PageFetch:
             "block_level": self.config.block_level,
             "cleaning_level": self.config.cleaning_level,
             "confidence_threshold": self.config.confidence_threshold,
-            "humanize": self.config.humanize,
             "max_redirects": self.config.max_redirects,
-            "session_rotation": self.config.session_rotation,
-            # ``session_duration`` only affects how the residential proxy
-            # URL is constructed; a cached response is technically the
-            # same content either way.  We still include it in the cache
-            # key so that callers who toggle TTL between fetches see
-            # fresh upstream requests rather than stale hits, mirroring
-            # the existing ``session_rotation`` treatment above.
-            "session_duration": self.config.session_duration,
         }
         if self.config.headers:
             settings["cfg_headers"] = _mapping_cache_token(self.config.headers, lower_keys=True)
@@ -827,7 +838,8 @@ class PageFetch:
         started_at = time.perf_counter()
         try:
             self._validate_fetch_options(mode, proxy)
-            has_proxy = bool(proxy or self.config.proxy)
+            effective_proxy = proxy if proxy is not None else self.config.proxy
+            has_proxy = bool(effective_proxy and effective_proxy != "none")
             parsed = validate_url(url, check_ssrf=False)
             normalized_url = normalize_url(url)
             if parsed.hostname:
@@ -987,10 +999,16 @@ class PageFetch:
             merged_cookies = dict(self.config.cookies)
             if cookies:
                 merged_cookies.update(cookies)
+
+            def _http_retry_proxy_resolver(attempt: int) -> str | None:
+                bump_domain_session(registrable_host(url) or url)
+                return self._resolve_proxy_url(proxy, url, salt=f"http_r{attempt}")
+
             response = await fetcher.fetch(
                 url,
                 method=method,
                 proxy_url=per_request_proxy,
+                proxy_resolver=_http_retry_proxy_resolver if per_request_proxy else None,
                 headers=self._headers_for_url(url, extra_headers=headers),
                 cookies=merged_cookies if merged_cookies else None,
                 content=content,
@@ -1021,6 +1039,7 @@ class PageFetch:
                     status_code=response.status_code,
                 )
 
+
             escalate_to_browser = (
                 mode == "auto"
                 and method.upper() == "GET"
@@ -1032,6 +1051,7 @@ class PageFetch:
             )
             if escalate_to_browser:
                 logger.info("HTTP %s; using browser for %s", response.status_code, url)
+                bump_domain_session(registrable_host(url) or url)
                 self._record_host_escalation(url)
                 return await self._escalate_to_browser(
                     url,
@@ -1091,6 +1111,8 @@ class PageFetch:
         )
         if should_escalate:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
+            if report.challenge:
+                bump_domain_session(registrable_host(url) or url)
             if report.challenge or report.javascript_shell:
                 self._record_host_escalation(url)
             try:
@@ -1104,7 +1126,10 @@ class PageFetch:
                     headers=headers,
                     cookies=cookies,
                 )
-            except TransportFailure:
+            except TransportFailure as exc:
+                if report.challenge or not html.strip():
+                    raise
+                err_detail = f" ({exc.error.message})" if exc.error and exc.error.message else ""
                 return self._degraded_http_result(
                     url,
                     response,
@@ -1113,9 +1138,12 @@ class PageFetch:
                     report,
                     content_type,
                     proxy,
-                    "Browser rendering failed; showing basic HTTP version instead.",
+                    f"Browser rendering failed{err_detail}; showing basic HTTP version instead.",
                 )
             if not rendered.success:
+                if report.challenge or not html.strip():
+                    return rendered
+                err_detail = f" ({rendered.error.message})" if rendered.error and rendered.error.message else ""
                 return self._degraded_http_result(
                     url,
                     response,
@@ -1124,7 +1152,7 @@ class PageFetch:
                     report,
                     content_type,
                     proxy,
-                    "Browser rendered content was not usable; showing HTTP version instead.",
+                    f"Browser rendered content was not usable{err_detail}; showing HTTP version instead.",
                 )
             rendered.warnings.insert(0, "HTTP content confidence was low; browser fallback was used.")
             return rendered
@@ -1184,10 +1212,20 @@ class PageFetch:
         merged_cookies = dict(self.config.cookies)
         if cookies:
             merged_cookies.update(cookies)
+
+        def _retry_proxy_resolver(attempt: int) -> ProxySettings:
+            bump_domain_session(registrable_host(url) or url)
+            retry_salt = f"{proxy_salt}:r{attempt}" if proxy_salt else f"r{attempt}"
+            return ProxySettings(
+                provider=proxy,
+                url=self._resolve_proxy_url(proxy, url, salt=retry_salt),
+            )
+
         try:
             response = await fetcher.fetch(
                 url,
                 proxy=proxy_settings,
+                proxy_resolver=_retry_proxy_resolver,
                 actions=actions,
                 capture_xhr=capture_xhr,
                 headers=merged_headers if merged_headers else None,
@@ -1356,7 +1394,10 @@ class PageFetch:
         pool = _UA_POOL_BY_OS[_HOST_OS]
         pool_idx = int(md5(domain.encode()).hexdigest()[:8], 16) % len(pool)
         headers["User-Agent"] = pool[pool_idx]
-        headers["Accept-Language"] = self.config.accept_language
+        target_country = infer_target_country(url)
+        headers["Accept-Language"] = accept_language_for_country(
+            target_country, self.config.accept_language
+        )
         if self.config.headers:
             for k, v in self.config.headers.items():
                 lower_k = k.lower()
@@ -1398,14 +1439,21 @@ class PageFetch:
         settings = resolve_proxy(provider)
         if not settings.url:
             return None
-        if provider == "custom" or self.config.session_rotation == "rotate":
+        if provider == "custom":
             return settings.url
         domain = registrable_host(url) or url
+        country = infer_target_country(url)
+        session_id = (
+            make_random_session()
+            if self.config.session_rotation == "rotate"
+            else make_domain_session(domain, salt=salt)
+        )
         return inject_session_id_for(
             provider,
             settings.url,
-            make_domain_session(domain, salt=salt),
+            session_id,
             session_duration_seconds=self.config.session_duration,
+            country=country,
         )
 
     def _browser_pool_target(self, provider: str, url: str, salt: str = "") -> tuple[str, ProxySettings]:
@@ -1427,6 +1475,7 @@ class PageFetch:
             humanize=self.config.humanize,
             accept_language=self.config.accept_language,
             max_browser_requests=self.config.max_browser_requests,
+            idle_ttl=self.config.browser_idle_ttl,
         )
 
     async def _acquire_browser_fetcher(
@@ -1583,8 +1632,15 @@ class PageFetch:
 
     @staticmethod
     def _uncacheable(result: FetchResult) -> bool:
-        return bool(result.error) or result.status_code in BLOCKED_STATUS_CODES or (
-            result.status_code is not None and result.status_code >= 500
+        if (
+            bool(result.error)
+            or result.status_code in BLOCKED_STATUS_CODES
+            or (result.status_code is not None and result.status_code >= 500)
+        ):
+            return True
+        return any(
+            w.startswith(("Browser rendering failed;", "Browser rendered content was not usable;"))
+            for w in result.warnings
         )
 
     @staticmethod

@@ -6,7 +6,7 @@ import html as html_module
 import re
 from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, Declaration, Doctype, NavigableString, ProcessingInstruction, Tag
 
 from .images import image_candidate
 
@@ -39,13 +39,20 @@ class MarkdownConverter:
         return "".join(self._node(child) for child in tag.children)
 
     def _node(self, node: NavigableString | Tag) -> str:
+        if isinstance(node, (Comment, Doctype, ProcessingInstruction, Declaration)):
+            return ""
         if isinstance(node, NavigableString):
             return re.sub(r"\s+", " ", str(node))
         if not isinstance(node, Tag):
             return ""
         name = node.name.lower()
-        if name in {"script", "style", "template", "head", "noscript", "svg"}:
+        if name in {"script", "style", "template", "head", "noscript", "svg", "datalist"}:
             return ""
+        if name == "select":
+            selected = node.find("option", selected=True)
+            return selected.get_text(" ", strip=True) if selected else ""
+        if name == "option":
+            return node.get_text(" ", strip=True)
         if re.fullmatch(r"h[1-6]", name):
             return f"\n\n{'#' * int(name[1])} {self._inline_children(node).strip()}\n\n"
         if name == "br":
@@ -73,11 +80,11 @@ class MarkdownConverter:
             fence = "`" * max(3, max((len(run) for run in re.findall(r"`+", value)), default=0) + 1)
             return f"\n\n{fence}{language}\n{value}\n{fence}\n\n"
         if name == "a":
-            label = self._inline_children(node).strip()
-            href = node.get("href")
-            if not href:
+            label = re.sub(r"\s+", " ", re.sub(r"(?:^|\n)\s*#{1,6}\s+", " ", self._inline_children(node))).strip()
+            raw_href = str(node.get("href") or "").strip()
+            if not raw_href or raw_href == "#" or raw_href.lower().startswith(("javascript:", "vbscript:", "data:")):
                 return label
-            target = urljoin(self.base_url, str(href))
+            target = urljoin(self.base_url, raw_href)
             # Preserve ![alt](url) image syntax; escape unescaped [ and ] elsewhere
             safe_label = re.sub(
                 r"(!\[.*?\]\([^\)]*\))|([\[\]])",
@@ -88,7 +95,7 @@ class MarkdownConverter:
         if name == "img":
             source = image_candidate(node)
             if not source:
-                return node.get("alt", "")
+                return str(node.get("alt") or "").strip()
             alt = str(node.get("alt") or node.get("title") or "").replace("]", "\\]")
             title_value = node.get("title")
             if title_value:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import html as html_module
 import io
 import json
 import re
@@ -414,8 +415,166 @@ def process_json(content: bytes, encoding: str | None = None) -> ProcessedDocume
     return ProcessedDocument(title, markdown, pretty_json, metadata, warnings)
 
 
+def _xml_local_name(elem: Any) -> str:
+    tag = getattr(elem, "tag", None)
+    return tag.split("}")[-1].lower() if isinstance(tag, str) else ""
+
+
+def _xml_child_text(elem: Any, names: set[str]) -> str:
+    for child in elem:
+        if _xml_local_name(child) in names:
+            txt = "".join(child.itertext()).strip()
+            if txt:
+                return txt
+    return ""
+
+
+def _xml_entry_link(elem: Any) -> str:
+    fallback = ""
+    for child in elem:
+        if _xml_local_name(child) != "link":
+            continue
+        href = (child.get("href") or "").strip()
+        rel = (child.get("rel") or "alternate").strip().lower()
+        if href:
+            if rel == "alternate":
+                return href
+            if not fallback:
+                fallback = href
+        txt = "".join(child.itertext()).strip()
+        if txt and not fallback:
+            fallback = txt
+    return fallback
+
+
+def _render_feed_fragment(raw_body: str, base_url: str = "") -> tuple[str, str]:
+    body = raw_body.strip()
+    if not body:
+        return "", ""
+    if "<" in body and ">" in body:
+        from bs4 import BeautifulSoup
+        from .cleaner import clean_html
+        from .markdown import html_to_markdown
+
+        soup = clean_html(BeautifulSoup(body, "lxml"), "standard", copy=False)
+        md = html_to_markdown(soup, base_url)
+        txt = "\n".join(line.strip() for line in soup.get_text("\n").splitlines() if line.strip())
+        if md:
+            return md, txt
+    clean_txt = html_module.unescape(re.sub(r"\r\n?", "\n", body).strip())
+    return clean_txt, clean_txt
+
+
+def _process_syndication_feed(
+    root: Any,
+    encoding: str | None,
+    warnings: list[str],
+) -> ProcessedDocument | None:
+    root_local = _xml_local_name(root)
+    if root_local == "feed":
+        feed_type = "atom"
+        container = root
+        entries = [c for c in root if _xml_local_name(c) == "entry"]
+    elif root_local in {"rss", "rdf"}:
+        feed_type = "rss"
+        channel = next((c for c in root if _xml_local_name(c) == "channel"), root)
+        container = channel
+        entries = [c for c in channel if _xml_local_name(c) == "item"]
+        if not entries and channel is not root:
+            entries = [c for c in root if _xml_local_name(c) == "item"]
+    else:
+        return None
+
+    if not entries:
+        return None
+
+    feed_title = _xml_child_text(container, {"title"})
+    feed_subtitle = _xml_child_text(container, {"subtitle", "description"})
+    feed_link = _xml_entry_link(container)
+
+    md_sections: list[str] = []
+    text_sections: list[str] = []
+
+    if feed_title:
+        md_sections.append(f"# {feed_title}")
+        text_sections.append(feed_title)
+    if feed_subtitle and feed_subtitle != feed_title:
+        sub_md, sub_txt = _render_feed_fragment(feed_subtitle, feed_link)
+        if sub_md:
+            md_sections.append(sub_md)
+            text_sections.append(sub_txt)
+
+    rendered_count = 0
+    for idx, entry in enumerate(entries):
+        entry_title = _xml_child_text(entry, {"title"})
+        author = ""
+        for child in entry:
+            cname = _xml_local_name(child)
+            if cname == "author":
+                author = _xml_child_text(child, {"name"}) or "".join(child.itertext()).strip()
+                if author:
+                    break
+            elif cname == "creator":
+                author = "".join(child.itertext()).strip()
+                if author:
+                    break
+        timestamp = _xml_child_text(entry, {"published", "updated", "pubdate", "date"})
+        entry_link = _xml_entry_link(entry) or feed_link
+        raw_body = (
+            _xml_child_text(entry, {"encoded", "content"})
+            or _xml_child_text(entry, {"summary", "description"})
+        )
+
+        body_md, body_txt = _render_feed_fragment(raw_body, entry_link)
+        if not entry_title and not body_md:
+            continue
+
+        rendered_count += 1
+        entry_md_parts: list[str] = []
+        entry_txt_parts: list[str] = []
+
+        if entry_title and (idx == 0 or entry_title != feed_title):
+            if entry_link:
+                entry_md_parts.append(f"## [{entry_title}]({entry_link})")
+            else:
+                entry_md_parts.append(f"## {entry_title}")
+            entry_txt_parts.append(entry_title)
+
+        meta_bits: list[str] = []
+        if author:
+            meta_bits.append(f"**Author:** {author}")
+        if timestamp:
+            meta_bits.append(f"**Date:** {timestamp}")
+        if meta_bits:
+            entry_md_parts.append(" | ".join(meta_bits))
+            entry_txt_parts.append(" | ".join(b.replace("**", "") for b in meta_bits))
+
+        if body_md:
+            entry_md_parts.append(body_md)
+            entry_txt_parts.append(body_txt)
+
+        md_sections.append("\n\n".join(entry_md_parts))
+        text_sections.append("\n".join(entry_txt_parts))
+
+    if rendered_count == 0:
+        return None
+
+    return ProcessedDocument(
+        title=feed_title or root_local,
+        markdown="\n\n---\n\n".join(md_sections),
+        text="\n\n".join(text_sections),
+        metadata={
+            "root_element": root.tag,
+            "encoding": encoding,
+            "feed_type": feed_type,
+            "entry_count": rendered_count,
+        },
+        warnings=warnings,
+    )
+
+
 def process_xml(content: bytes, encoding: str | None = None) -> ProcessedDocument:
-    """Parse XML and retain its hierarchy in a fenced representation."""
+    """Parse XML and format syndication feeds as Markdown or generic XML as fenced code."""
     strict_parser = etree.XMLParser(
         resolve_entities=False, no_network=True, recover=False
     )
@@ -442,6 +601,11 @@ def process_xml(content: bytes, encoding: str | None = None) -> ProcessedDocumen
                 warnings=warnings + ["XML could not be recovered; returned decoded text instead."],
             )
         warnings.append("Malformed XML parsed using recovery mode.")
+
+    feed_doc = _process_syndication_feed(root, encoding, warnings)
+    if feed_doc is not None:
+        return feed_doc
+
     pretty = etree.tostring(root, encoding="unicode", pretty_print=True)
     text_parts = [part.strip() for part in root.itertext() if part.strip()]
     title = root.get("title") or root.tag.split("}")[-1]
