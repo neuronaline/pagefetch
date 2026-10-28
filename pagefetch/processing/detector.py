@@ -6,7 +6,12 @@ import math
 import re
 from dataclasses import dataclass
 
-from bs4 import BeautifulSoup, Comment, Doctype
+from bs4 import BeautifulSoup, Comment, Doctype, NavigableString, Tag
+from bs4.element import CData, TemplateString
+
+from .cleaner import is_js_notice_text, is_substantive_template
+
+_VISIBLE_STRING_TYPES = (NavigableString, CData, TemplateString)
 
 STRONG_CHALLENGE_PATTERNS = (
     "checking your browser",
@@ -116,7 +121,6 @@ _FRAMEWORK_RE = re.compile(
     "|".join(re.escape(pattern) for pattern in FRAMEWORK_PATTERNS),
     re.IGNORECASE,
 )
-_NOISE_TAG_NAMES = frozenset({"script", "style", "template", "noscript"})
 
 
 @dataclass(slots=True, frozen=True)
@@ -152,7 +156,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     noise_ids: set[int] = {id(tag) for tag in noise_tags}
     safe_ids: set[int] = set()
 
-    def _is_in_noise(node: object, noise_names: frozenset[str] = _NOISE_TAG_NAMES) -> bool:
+    def _is_in_noise(node: object) -> bool:
         curr = getattr(node, "parent", None)
         path: list[int] = []
         while curr is not None:
@@ -163,10 +167,6 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
             if cid in safe_ids:
                 safe_ids.update(path)
                 return False
-            if getattr(curr, "name", None) in noise_names:
-                noise_ids.add(cid)
-                noise_ids.update(path)
-                return True
             path.append(cid)
             curr = getattr(curr, "parent", None)
         safe_ids.update(path)
@@ -183,31 +183,21 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     )
     has_noscript_fallback = False
     if len(text) < 250:
-        substantive_noscript_ids: set[int] = set()
+        substantive_fallback_ids: set[int] = set()
         for tag in noise_tags:
-            if tag.name != "noscript":
-                continue
-            ns_text = tag.get_text(" ", strip=True)
-            ns_lower = ns_text.lower()
-            is_js_notice = len(ns_text) < 350 and any(
-                phrase in ns_lower
-                for phrase in (
-                    *JS_PATTERNS,
-                    "requires javascript",
-                    "javascript is disabled",
-                    "javascript to run",
-                    "support javascript",
-                )
-            )
-            if len(ns_text) >= 150 and not is_js_notice:
-                substantive_noscript_ids.add(id(tag))
-        if substantive_noscript_ids:
+            if tag.name == "noscript":
+                ns_text = tag.get_text(" ", strip=True)
+                if len(ns_text) >= 150 and not is_js_notice_text(ns_text):
+                    substantive_fallback_ids.add(id(tag))
+            elif tag.name == "template" and isinstance(tag, Tag):
+                if is_substantive_template(tag):
+                    substantive_fallback_ids.add(id(tag))
+        if substantive_fallback_ids:
             has_noscript_fallback = True
-            non_noscript_noise = frozenset({"script", "style", "template"})
             noise_ids = {
                 id(tag)
                 for tag in noise_tags
-                if id(tag) not in substantive_noscript_ids
+                if id(tag) not in substantive_fallback_ids
             }
             safe_ids.clear()
             text = " ".join(
@@ -215,7 +205,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
                 for node in text_root.find_all(string=True)
                 if node.parent is not None
                 and not isinstance(node, (Comment, Doctype))
-                and not _is_in_noise(node, non_noscript_noise)
+                and not _is_in_noise(node)
                 and (value := str(node).strip())
             )
     lowered_text = text.lower()
@@ -247,6 +237,8 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
          "main", "article", "section",
          "ul", "ol", "table", "pre", "blockquote", "nav"]
     ):
+        if _is_in_noise(tag):
+            continue
         name = tag.name
         if name == "p":
             paragraphs.append(tag)
@@ -255,11 +247,11 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         elif name in {"main", "article", "section"}:
             semantic.append(tag)
             if name in {"main", "article"}:
-                main_texts.append(tag.get_text(" ", strip=True))
+                main_texts.append(tag.get_text(" ", strip=True, types=_VISIBLE_STRING_TYPES))
         elif name in {"ul", "ol", "table", "pre", "blockquote"}:
             structured.append(tag)
         elif name == "nav":
-            nav_texts.append(tag.get_text(" ", strip=True))
+            nav_texts.append(tag.get_text(" ", strip=True, types=_VISIBLE_STRING_TYPES))
     if paragraphs:
         # Paragraph count is a strong SSR signal (SPAs rarely emit many <p>
         # tags before hydration).  Cap 0.12 ≈ 5 paragraphs; after that the
@@ -269,7 +261,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         # Heading hierarchy is a strong editorial signal.  Cap 0.07 ≈
         # 4 headings; further headings add little confidence.
         score += min(0.07, len(headings) * 0.02)
-    if semantic and any(len(tag.get_text(" ", strip=True)) > 120 for tag in semantic):
+    if semantic and any(len(tag.get_text(" ", strip=True, types=_VISIBLE_STRING_TYPES)) > 120 for tag in semantic):
         # A non-trivial <main>/<article>/<section> body is a near-certain
         # signal of server-rendered content (single 0.10 bonus).
         score += 0.10

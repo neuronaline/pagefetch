@@ -9,7 +9,7 @@ from typing import Any, Literal
 from bs4 import BeautifulSoup
 
 from ..models import ImageInfo, LinkInfo
-from .cleaner import clean_html
+from .cleaner import clean_html, unwrap_fallbacks
 from .detector import ConfidenceReport, analyze_html
 from .images import extract_images
 from .links import extract_links
@@ -51,6 +51,7 @@ def process_html(
     title, metadata, warnings = extract_metadata(raw_soup, base_url, response_headers)
     if confidence is None:
         confidence = analyze_html(html, soup=raw_soup)
+    unwrap_fallbacks(raw_soup)
     links = extract_links(raw_soup, base_url)
     images = extract_images(raw_soup, base_url)
     cleaned = clean_html(raw_soup, cleaning_level, copy=False)

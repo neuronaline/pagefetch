@@ -70,6 +70,8 @@ def image_candidate(node: Tag) -> str | None:
 def extract_images(soup: BeautifulSoup, base_url: str) -> list[ImageInfo]:
     images: list[ImageInfo] = []
     for image in soup.find_all("img"):
+        if image.find_parent("template") is not None:
+            continue
         source = image_candidate(image)
         if not source:
             continue

@@ -447,6 +447,26 @@ class HTTPFetcher:
                 raise TransportFailure(
                     FetchErrorInfo("too_many_redirects", "too many HTTP redirects", False, type(exc).__name__)
                 ) from exc
+            except httpx.ProxyError as exc:
+                message = str(exc)
+                msg_lower = message.lower()
+                is_forbidden = any(token in msg_lower for token in ("403", "forbidden", "restricted", "denied"))
+                is_auth_fail = "407" in msg_lower or "authentication" in msg_lower
+                if is_forbidden:
+                    code = "proxy_forbidden"
+                    err_msg = f"Proxy rejected connection to target: {message}"
+                    retryable = False
+                elif is_auth_fail:
+                    code = "proxy_error"
+                    err_msg = f"Proxy authentication failed: {message}"
+                    retryable = False
+                else:
+                    code = "proxy_error"
+                    err_msg = f"Proxy transport failed: {message}"
+                    retryable = True
+                raise TransportFailure(
+                    FetchErrorInfo(code, err_msg, retryable, type(exc).__name__)
+                ) from exc
             except httpx.ConnectError as exc:
                 message = str(exc).lower()
                 cause: BaseException | None = exc

@@ -61,10 +61,12 @@ from .processing.pipeline import (
 from .proxy import ProxyConfigurationError, ProxySettings, resolve_proxy
 from .proxy.pool import _MAX_PROXY_HTTP_CLIENTS, _ProxyClientPool
 from .proxy.providers import (
+    RESIDENTIAL_PROVIDERS,
     accept_language_for_country,
     bump_domain_session,
     infer_target_country,
     inject_session_id_for,
+    is_government_or_restricted_target,
     make_domain_session,
     make_random_session,
 )
@@ -988,6 +990,7 @@ class PageFetch:
         data: dict[str, Any] | None = None,
         json_data: Any = None,
     ) -> FetchResult:
+        direct_fallback_warning: str | None = None
         try:
             fetcher = await self._http_fetcher(proxy)
             per_request_proxy = self._resolve_proxy_url(proxy, url)
@@ -1004,18 +1007,43 @@ class PageFetch:
                 bump_domain_session(registrable_host(url) or url)
                 return self._resolve_proxy_url(proxy, url, salt=f"http_r{attempt}")
 
-            response = await fetcher.fetch(
-                url,
-                method=method,
-                proxy_url=per_request_proxy,
-                proxy_resolver=_http_retry_proxy_resolver if per_request_proxy else None,
-                headers=self._headers_for_url(url, extra_headers=headers),
-                cookies=merged_cookies if merged_cookies else None,
-                content=content,
-                data=data,
-                json_data=json_data,
-                retryable_status_codes=retry_codes,
-            )
+            try:
+                response = await fetcher.fetch(
+                    url,
+                    method=method,
+                    proxy_url=per_request_proxy,
+                    proxy_resolver=_http_retry_proxy_resolver if per_request_proxy else None,
+                    headers=self._headers_for_url(url, extra_headers=headers),
+                    cookies=merged_cookies if merged_cookies else None,
+                    content=content,
+                    data=data,
+                    json_data=json_data,
+                    retryable_status_codes=retry_codes,
+                )
+            except TransportFailure as exc:
+                if per_request_proxy and exc.error and exc.error.code in {"proxy_forbidden", "proxy_error"}:
+                    logger.warning(
+                        "Proxy failed with %s (%s); retrying %s directly without proxy",
+                        exc.error.code,
+                        exc.error.message,
+                        url,
+                    )
+                    direct_fetcher = await self._http_fetcher("none")
+                    response = await direct_fetcher.fetch(
+                        url,
+                        method=method,
+                        proxy_url=None,
+                        proxy_resolver=None,
+                        headers=self._headers_for_url(url, extra_headers=headers),
+                        cookies=merged_cookies if merged_cookies else None,
+                        content=content,
+                        data=data,
+                        json_data=json_data,
+                        retryable_status_codes=retry_codes,
+                    )
+                    direct_fallback_warning = "Proxy rejected connection to target host; fetched directly without proxy."
+                else:
+                    raise
         except TransportFailure:
             # Timeouts, DNS failures, disconnects, and other transport errors are not
             # fixed by rendering in a browser — surface them immediately instead of
@@ -1023,6 +1051,11 @@ class PageFetch:
             raise
         final_url = str(response.url)
         content_type = self._content_type(response.headers.get("Content-Type"))
+
+        def _with_fallback_warning(res: FetchResult) -> FetchResult:
+            if direct_fallback_warning and direct_fallback_warning not in res.warnings:
+                res.warnings.append(direct_fallback_warning)
+            return res
         if response.status_code >= 400:
             retryable = response.status_code in RETRYABLE_STATUS_CODES
             is_waf = self._body_looks_like_waf_challenge(response.content)
@@ -1071,19 +1104,21 @@ class PageFetch:
 
         kind = detect_document_kind(content_type, response.content, url=final_url)
         if kind == "pdf":
-            return self._result_from_pdf(url, response, proxy)
+            return _with_fallback_warning(self._result_from_pdf(url, response, proxy))
         if kind == "docx":
-            return self._result_from_docx(url, response, proxy)
+            return _with_fallback_warning(self._result_from_docx(url, response, proxy))
         if kind in ("csv", "tsv"):
-            return self._result_from_csv(
-                url, response, proxy, delimiter="\t" if kind == "tsv" else None
+            return _with_fallback_warning(
+                self._result_from_csv(
+                    url, response, proxy, delimiter="\t" if kind == "tsv" else None
+                )
             )
         if kind == "json":
-            return self._result_from_json(url, response, proxy)
+            return _with_fallback_warning(self._result_from_json(url, response, proxy))
         if kind == "xml":
-            return self._result_from_xml(url, response, proxy)
+            return _with_fallback_warning(self._result_from_xml(url, response, proxy))
         if kind == "text":
-            return self._result_from_text(url, response, proxy)
+            return _with_fallback_warning(self._result_from_text(url, response, proxy))
         if kind != "html":
             raise TransportFailure(
                 FetchErrorInfo(
@@ -1113,7 +1148,6 @@ class PageFetch:
             logger.info("HTTP confidence %.3f; using browser for %s", report.score, url)
             if report.challenge:
                 bump_domain_session(registrable_host(url) or url)
-            if report.challenge or report.javascript_shell:
                 self._record_host_escalation(url)
             try:
                 rendered = await self._escalate_to_browser(
@@ -1130,7 +1164,7 @@ class PageFetch:
                 if report.challenge or not html.strip():
                     raise
                 err_detail = f" ({exc.error.message})" if exc.error and exc.error.message else ""
-                return self._degraded_http_result(
+                return _with_fallback_warning(self._degraded_http_result(
                     url,
                     response,
                     html,
@@ -1139,12 +1173,12 @@ class PageFetch:
                     content_type,
                     proxy,
                     f"Browser rendering failed{err_detail}; showing basic HTTP version instead.",
-                )
+                ))
             if not rendered.success:
                 if report.challenge or not html.strip():
                     return rendered
                 err_detail = f" ({rendered.error.message})" if rendered.error and rendered.error.message else ""
-                return self._degraded_http_result(
+                return _with_fallback_warning(self._degraded_http_result(
                     url,
                     response,
                     html,
@@ -1153,9 +1187,11 @@ class PageFetch:
                     content_type,
                     proxy,
                     f"Browser rendered content was not usable{err_detail}; showing HTTP version instead.",
-                )
+                ))
+            if report.javascript_shell:
+                self._record_host_escalation(url)
             rendered.warnings.insert(0, "HTTP content confidence was low; browser fallback was used.")
-            return rendered
+            return _with_fallback_warning(rendered)
 
         result = self._result_from_html(
             original_url=url,
@@ -1172,7 +1208,7 @@ class PageFetch:
         )
         if mode == "http" and report.score < self.config.confidence_threshold:
             result.warnings.append("HTTP content may be incomplete; browser fallback is disabled.")
-        return result
+        return _with_fallback_warning(result)
 
     async def _fetch_browser(
         self,
@@ -1221,19 +1257,45 @@ class PageFetch:
                 url=self._resolve_proxy_url(proxy, url, salt=retry_salt),
             )
 
+        direct_browser_fallback_warning: str | None = None
         try:
-            response = await fetcher.fetch(
-                url,
-                proxy=proxy_settings,
-                proxy_resolver=_retry_proxy_resolver,
-                actions=actions,
-                capture_xhr=capture_xhr,
-                headers=merged_headers if merged_headers else None,
-                cookies=merged_cookies if merged_cookies else None,
-                screenshot=screenshot,
-                screenshot_format=screenshot_format,
-                screenshot_max_bytes=self.config.screenshot_max_bytes,
-            )
+            try:
+                response = await fetcher.fetch(
+                    url,
+                    proxy=proxy_settings,
+                    proxy_resolver=_retry_proxy_resolver,
+                    actions=actions,
+                    capture_xhr=capture_xhr,
+                    headers=merged_headers if merged_headers else None,
+                    cookies=merged_cookies if merged_cookies else None,
+                    screenshot=screenshot,
+                    screenshot_format=screenshot_format,
+                    screenshot_max_bytes=self.config.screenshot_max_bytes,
+                )
+            except TransportFailure as exc:
+                if proxy_settings.url and exc.error and exc.error.code in {"proxy_forbidden", "proxy_error"}:
+                    logger.warning(
+                        "Browser proxy failed with %s (%s); retrying %s directly without proxy",
+                        exc.error.code,
+                        exc.error.message,
+                        url,
+                    )
+                    _, direct_proxy_settings, direct_fetcher = await self._acquire_browser_fetcher("none", url)
+                    response = await direct_fetcher.fetch(
+                        url,
+                        proxy=direct_proxy_settings,
+                        proxy_resolver=None,
+                        actions=actions,
+                        capture_xhr=capture_xhr,
+                        headers=merged_headers if merged_headers else None,
+                        cookies=merged_cookies if merged_cookies else None,
+                        screenshot=screenshot,
+                        screenshot_format=screenshot_format,
+                        screenshot_max_bytes=self.config.screenshot_max_bytes,
+                    )
+                    direct_browser_fallback_warning = "Browser proxy rejected connection to target host; fetched directly without proxy."
+                else:
+                    raise
         finally:
             await self._release_browser_fetcher(cache_key)
 
@@ -1290,6 +1352,8 @@ class PageFetch:
         result.actions_executed = response.actions_executed
         result.xhr_responses = response.xhr_responses
         result.warnings.extend(response.warnings)
+        if direct_browser_fallback_warning and direct_browser_fallback_warning not in result.warnings:
+            result.warnings.append(direct_browser_fallback_warning)
         effective_status = result.status_code
         if report.challenge:
             result.success = False
@@ -1441,6 +1505,9 @@ class PageFetch:
             return None
         if provider == "custom":
             return settings.url
+        if provider in RESIDENTIAL_PROVIDERS and is_government_or_restricted_target(url):
+            logger.debug("Bypassing residential proxy for government/restricted target: %s", url)
+            return None
         domain = registrable_host(url) or url
         country = infer_target_country(url)
         session_id = (
@@ -1639,7 +1706,7 @@ class PageFetch:
         ):
             return True
         return any(
-            w.startswith(("Browser rendering failed;", "Browser rendered content was not usable;"))
+            w.startswith(("Browser rendering failed", "Browser rendered content was not usable"))
             for w in result.warnings
         )
 

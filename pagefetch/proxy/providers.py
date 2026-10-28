@@ -69,6 +69,32 @@ _GENERIC_CCTLD_EXCLUSIONS: frozenset[str] = frozenset(
     {"io", "ai", "co", "me", "tv", "gg", "sh", "ly", "to", "cc", "fm", "ws", "is", "so", "vc", "la", "gl", "ac", "im"}
 )
 
+# Second-level government and military tokens across national ccTLDs
+_RESTRICTED_GOV_TOKENS: frozenset[str] = frozenset({"gov", "mil", "gob", "gouv"})
+
+
+def is_government_or_restricted_target(url_or_hostname: str) -> bool:
+    """Return True if target host is a government or military domain restricted by residential proxies.
+
+    Commercial residential proxy gateways (Byteful, Decodo, BrightData, etc.) reject CONNECT
+    tunnels to .gov, .mil, and national government ccTLD domains (.gov.*, .mil.*, .gob.*, .gouv.*)
+    at the gateway level with 403 Forbidden.
+    """
+    if not url_or_hostname:
+        return False
+    parsed = urlsplit(url_or_hostname)
+    hostname = (parsed.hostname or url_or_hostname).lower().strip(".")
+    if not hostname:
+        return False
+    parts = hostname.split(".")
+    if len(parts) >= 2:
+        tld = parts[-1]
+        if tld in {"gov", "mil"}:
+            return True
+        if len(parts) >= 3 and parts[-2] in _RESTRICTED_GOV_TOKENS:
+            return True
+    return False
+
 
 def _detect_env_country() -> str | None:
     """Return an explicit two-letter ISO country code from environment variables if set."""

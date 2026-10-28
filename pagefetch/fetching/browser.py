@@ -152,6 +152,7 @@ class BrowserFetcher:
         self._idle_task: asyncio.Task[None] | None = None
         self._context_pools: dict[str, list[Any]] = {}
         self._context_lock = asyncio.Lock()
+        self._proxy_nav_lock = asyncio.Lock()
         # Linux runs the browser headed against an in-process Xvfb to avoid
         # the fingerprinting tells of Firefox's native headless mode. On
         # Windows/macOS we stay on native headless — no display server is
@@ -481,7 +482,15 @@ class BrowserFetcher:
                         max_scrolls = min(12, max_scrolls + 3)
                         scroll_sleep_early = min(0.20, scroll_sleep_early + 0.03)
                         scroll_sleep_late = min(0.28, scroll_sleep_late + 0.05)
-                        if (report.challenge or blocked_status) and callable(proxy_resolver):
+                        # Never rotate the proxy session or reset the browser on HTTP 407:
+                        # 407 is an outbound proxy authentication handshake race, not a target
+                        # site block. Keeping the same proxy_key lets retries reuse warm
+                        # authenticated contexts from _context_pools or serialize under _proxy_nav_lock.
+                        should_rotate = (
+                            report.challenge
+                            or (blocked_status and result.status_code != 407)
+                        ) and callable(proxy_resolver)
+                        if should_rotate:
                             new_proxy = proxy_resolver(attempt + 1)
                             if new_proxy is not None:
                                 proxy = new_proxy
@@ -895,6 +904,7 @@ class BrowserFetcher:
                         except Exception:
                             pass
 
+                reused_context = context is not None
                 if context is None:
                     context_kwargs: dict[str, Any] = {
                         "bypass_csp": False,
@@ -939,11 +949,19 @@ class BrowserFetcher:
                     screenshot=screenshot != "none",
                 )
                 goto_timeout_ms = int(max(1.0, min(page_timeout, self.timeout)) * 1000)
-                response = await page.goto(
-                    url,
-                    wait_until="domcontentloaded",
-                    timeout=goto_timeout_ms,
-                )
+                if has_proxy and not reused_context:
+                    async with self._proxy_nav_lock:
+                        response = await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=goto_timeout_ms,
+                        )
+                else:
+                    response = await page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=goto_timeout_ms,
+                    )
 
                 skip_scroll = await self._ensure_page_readiness(
                     page,
@@ -1041,10 +1059,29 @@ class BrowserFetcher:
         except Exception as exc:
             message = str(exc).lower()
             timeout = "timeout" in message
-            code = "browser_timeout" if timeout else "browser_navigation_error"
-            public_message = "browser navigation timed out" if timeout else "browser navigation failed"
+            proxy_tokens = (
+                "err_tunnel_connection_failed",
+                "ns_error_proxy_forbidden",
+                "err_proxy_connection_failed",
+                "proxy connection refused",
+                "proxy error",
+                "proxy 403",
+            )
+            is_proxy_rejection = any(token in message for token in proxy_tokens)
+            if timeout:
+                code = "browser_timeout"
+                public_message = "browser navigation timed out"
+                retryable = True
+            elif is_proxy_rejection:
+                code = "proxy_forbidden" if any(tok in message for tok in ("forbidden", "403")) else "proxy_error"
+                public_message = f"browser proxy connection failed: {exc}"
+                retryable = False
+            else:
+                code = "browser_navigation_error"
+                public_message = "browser navigation failed"
+                retryable = True
             raise TransportFailure(
-                FetchErrorInfo(code, public_message, True, type(exc).__name__)
+                FetchErrorInfo(code, public_message, retryable, type(exc).__name__)
             ) from exc
         finally:
             if isinstance(network, dict) and network.get("pending_xhr_tasks"):

@@ -28,7 +28,8 @@ import copy as _copy
 import re
 from typing import Literal
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4.element import TemplateString
 
 _NOISE_RE = re.compile(
     r"(?:^|[-_\s])(cookie[-_\s]?(?:banner|consent|notice|law|bar|modal|popup|dialog|overlay|wrap(?:per)?|container)|"
@@ -79,6 +80,125 @@ _HIDDEN_STYLE_RE = re.compile(
     re.IGNORECASE,
 )
 _VALID_CLEANING_LEVELS = frozenset({"minimal", "standard", "maximum"})
+_JS_NOTICE_PHRASES = (
+    "enable javascript",
+    "javascript is required",
+    "you need to enable javascript",
+    "please turn on javascript",
+    "requires javascript",
+    "javascript is disabled",
+    "javascript to run",
+    "turn on javascript",
+    "support javascript",
+)
+_CONTENT_SLOTS = frozenset({"contents", "content", "main", "body", "article"})
+_EDITORIAL_TAGS = ("p", "article", "section", "h1", "h2", "h3", "h4", "h5", "h6", "table", "ul", "ol")
+
+
+def is_js_notice_text(text: str) -> bool:
+    """Return True when *text* is a short JavaScript-required notice rather than article content."""
+    if len(text) >= 350:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _JS_NOTICE_PHRASES)
+
+
+def is_substantive_template(tpl: Tag) -> bool:
+    """Return True when a ``<template>`` tag holds server-rendered editorial content.
+
+    Distinguishes SSR content projection (e.g. Wiki.js ``<template slot="contents">``,
+    Declarative Shadow DOM ``<template shadowrootmode="open">``, or large SSR content
+    payloads) from inert UI modals, cookie banners, and client-side repeater templates.
+    """
+    if not tpl.parent:
+        return False
+    if any(getattr(p, "name", None) in {"head", "script", "style", "template"} for p in tpl.parents):
+        return False
+
+    ident_parts = [str(tpl.get("id", "")), " ".join(_class_list(tpl))]
+    first_el = tpl.find(True)
+    if isinstance(first_el, Tag):
+        role = str(first_el.get("role", "")).lower()
+        if role in {"dialog", "alertdialog"} or str(first_el.get("aria-modal", "")).lower() == "true":
+            return False
+        ident_parts.extend([str(first_el.get("id", "")), " ".join(_class_list(first_el))])
+    if _NOISE_RE.search(" ".join(ident_parts)) is not None:
+        return False
+
+    tpl_text = tpl.get_text(" ", strip=True)
+    if len(tpl_text) < 150 or is_js_notice_text(tpl_text):
+        return False
+    if "{{" in tpl_text and "}}" in tpl_text:
+        return False
+
+    slot = str(tpl.get("slot", "")).lower()
+    is_content_projection = (
+        slot in _CONTENT_SLOTS
+        or tpl.has_attr("shadowrootmode")
+        or tpl.has_attr("shadowroot")
+    )
+    if is_content_projection:
+        return slot in _CONTENT_SLOTS or tpl.find(_EDITORIAL_TAGS) is not None
+    return len(tpl_text) >= 400 and len(tpl.find_all(_EDITORIAL_TAGS, limit=2)) >= 2
+
+
+def _parse_raw_fallback_children(tag: Tag) -> None:
+    """Parse raw HTML string inside a fallback tag when the treebuilder left it unparsed."""
+    if not tag.find(True) and "<" in str(tag.string or ""):
+        frag = BeautifulSoup(str(tag.string), "lxml")
+        if frag.find(True) is not None:
+            tag.clear()
+            frag_root = frag.body or frag
+            for child in list(frag_root.contents):
+                tag.append(child.extract())
+
+
+def unwrap_fallbacks(soup: BeautifulSoup) -> None:
+    """Promote substantive ``<noscript>`` and ``<template>`` fallbacks in-place.
+
+    Also converts ``TemplateString`` nodes inside unwrapped ``<template>`` tags
+    to standard ``NavigableString`` instances so downstream ``get_text()`` calls
+    on ``soup``, ``<code>``, ``<pre>``, and ``<a>`` include the unwrapped text.
+    """
+    noscripts = soup.find_all("noscript")
+    templates = soup.find_all("template")
+    if not noscripts and not templates:
+        return
+
+    rendered_strings: list[str] = [
+        stripped
+        for node in soup.strings
+        if (stripped := str(node).strip())
+        and not any(
+            getattr(parent, "name", None) in {"noscript", "script", "style", "template"}
+            for parent in getattr(node, "parents", ())
+        )
+    ]
+    visible_text = " ".join(rendered_strings)
+
+    for tag in list(noscripts):
+        if not tag.parent:
+            continue
+        _parse_raw_fallback_children(tag)
+        fallback = tag.get_text(" ", strip=True)
+        has_tracking_iframe = bool(
+            tag.find("iframe", src=re.compile(r"googletagmanager|analytics|facebook|doubleclick", re.I))
+        )
+        if is_js_notice_text(fallback) or has_tracking_iframe or (fallback and len(fallback) >= 20 and fallback in visible_text):
+            tag.decompose()
+        elif len(visible_text) < 250 and len(fallback) >= 80:
+            tag.unwrap()
+
+    if len(visible_text) < 250:
+        for tpl in list(templates):
+            if not tpl.parent:
+                continue
+            _parse_raw_fallback_children(tpl)
+            if is_substantive_template(tpl):
+                for node in tpl.find_all(string=lambda s: type(s) is TemplateString):
+                    if not any(getattr(p, "name", None) == "template" and p is not tpl for p in node.parents):
+                        node.__class__ = NavigableString
+                tpl.unwrap()
 
 
 def _class_list(tag: Tag) -> list[str]:
@@ -126,47 +246,7 @@ def clean_html(
         else (html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml"))
     )
 
-    # Build a visible-text snapshot only when noscript tags exist.
-    noscripts = soup.find_all("noscript")
-    if noscripts:
-        rendered_strings: list[str] = [
-            stripped
-            for node in soup.strings
-            if (stripped := str(node).strip())
-            and not any(
-                getattr(parent, "name", None) in {"noscript", "script", "style", "template"}
-                for parent in getattr(node, "parents", ())
-            )
-        ]
-        visible_text = " ".join(rendered_strings)
-        for tag in list(noscripts):
-            if not tag.find(True) and "<" in str(tag.string or ""):
-                frag = BeautifulSoup(str(tag.string), "lxml")
-                if frag.find(True) is not None:
-                    tag.clear()
-                    frag_root = frag.body or frag
-                    for child in list(frag_root.contents):
-                        tag.append(child.extract())
-            fallback = tag.get_text(" ", strip=True)
-            fallback_lower = fallback.lower()
-            is_js_notice = len(fallback) < 350 and any(
-                phrase in fallback_lower
-                for phrase in (
-                    "enable javascript",
-                    "requires javascript",
-                    "javascript is disabled",
-                    "javascript to run",
-                    "turn on javascript",
-                    "support javascript",
-                )
-            )
-            has_tracking_iframe = bool(
-                tag.find("iframe", src=re.compile(r"googletagmanager|analytics|facebook|doubleclick", re.I))
-            )
-            if is_js_notice or has_tracking_iframe or (fallback and len(fallback) >= 20 and fallback in visible_text):
-                tag.decompose()
-            elif len(visible_text) < 250 and len(fallback) >= 80:
-                tag.unwrap()
+    unwrap_fallbacks(soup)
 
     is_standard_or_max = cleaning_level in ("standard", "maximum")
     is_maximum = cleaning_level == "maximum"
