@@ -254,6 +254,24 @@ class PageFetch:
         self._drain_event.set()
         self._host_escalations = _HOST_ESCALATIONS
         self._host_memory = _HOST_MEMORY
+        self._host_pacers: dict[str, _AsyncPacer] = {}
+        self._host_pacers_lock = threading.Lock()
+
+    async def _pace_host(self, url: str) -> None:
+        """Apply per-host request pacing so concurrent single fetches do not burst."""
+        if self.config.request_pacing <= 0:
+            return
+        host = registrable_host(url) or (urlsplit(url).hostname or "").lower()
+        if not host:
+            return
+        with self._host_pacers_lock:
+            pacer = self._host_pacers.get(host)
+            if pacer is None:
+                if len(self._host_pacers) >= 256:
+                    self._host_pacers.pop(next(iter(self._host_pacers)), None)
+                pacer = _AsyncPacer(self.config.request_pacing)
+                self._host_pacers[host] = pacer
+        await pacer.acquire()
 
     def _record_host_escalation(self, url: str) -> None:
         """Record an escalation to browser mode for adaptive host memory."""
@@ -544,6 +562,7 @@ class PageFetch:
             op_cache_settings["capture_xhr"] = repr(capture_xhr)
 
         async def transport(normalized_url: str) -> FetchResult:
+            await self._pace_host(normalized_url)
             if is_pdf_content("", b"", url=normalized_url) and not normalized_actions:
                 return await self._fetch_http_or_auto(
                     normalized_url,
@@ -876,7 +895,7 @@ class PageFetch:
             if self._cache and use_cache:
                 try:
                     cached = await self._cache.get(cache_key, requested_screenshot=requested_screenshot)
-                    if cached:
+                    if cached and not self._uncacheable(cached):
                         cached.duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
                         logger.debug("cache hit for %s", normalized_url)
                         return cached
@@ -1131,6 +1150,18 @@ class PageFetch:
         html = self._decode(response)
         raw_soup = BeautifulSoup(html, "lxml")
         report = analyze_html(html, soup=raw_soup)
+        has_challenge_header = (
+            response.status_code == 203
+            or "caf" in response.headers
+            or "x-ncbi-captcha" in response.headers.get("vary", "").lower()
+        )
+        if has_challenge_header and report.score < self.config.confidence_threshold and not report.challenge:
+            report = ConfidenceReport(
+                score=min(report.score, 0.08),
+                reasons=tuple(dict.fromkeys((*report.reasons, "challenge or anti-bot page detected"))),
+                challenge=True,
+                javascript_shell=report.javascript_shell,
+            )
         low_content_reasons = {"very little visible text", "short visible text", "document is mostly navigation"}
         should_escalate = (
             mode == "auto"
@@ -1702,8 +1733,19 @@ class PageFetch:
         if (
             bool(result.error)
             or result.status_code in BLOCKED_STATUS_CODES
+            or result.status_code == 203
             or (result.status_code is not None and result.status_code >= 500)
         ):
+            return True
+        md_stripped = (result.markdown or "").strip()
+        txt_stripped = (result.text or "").strip()
+        conf = result.content_confidence
+        if conf is not None and conf < 0.25 and not md_stripped and not txt_stripped:
+            return True
+        # Hostname-only stubs (challenge interstitials whose only text is the domain).
+        host = (urlsplit(result.final_url or result.url).hostname or "").lower().removeprefix("www.")
+        bodies = [b.lower().strip("./").removeprefix("www.") for b in (md_stripped, txt_stripped) if b]
+        if host and bodies and all(b == host for b in bodies):
             return True
         return any(
             w.startswith(("Browser rendering failed", "Browser rendered content was not usable"))

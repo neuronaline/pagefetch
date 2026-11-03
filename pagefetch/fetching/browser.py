@@ -66,6 +66,7 @@ _CHALLENGE_PATH_PREFIXES: tuple[str, ...] = (
     "/_bm/",
     "/akam/",
     "/_sec/",
+    "/_pow/",
 )
 
 # Common third-party tracking, ads, and analytics domains to block from all frames
@@ -769,19 +770,31 @@ class BrowserFetcher:
         # ── early-exit probe ──
         probe = await in_page_metrics(page)
         if probe["challenge"]:
-            # Challenge page detected (e.g. Cloudflare Turnstile / Just a moment).
+            # Challenge page detected (e.g. Cloudflare Turnstile / PoW / reCAPTCHA).
             # Avoid scrolling which can interrupt solving, and poll until resolved.
             challenge_timeout = min(15.0, self.timeout / 2)
             challenge_started = time.monotonic()
             challenge_deadline = challenge_started + challenge_timeout
             clicked_interstitial = False
+            empty_non_challenge_polls = 0
             while time.monotonic() < challenge_deadline:
                 await asyncio.sleep(0.35)
                 if not clicked_interstitial and (time.monotonic() - challenge_started) >= 2.0:
                     clicked_interstitial = await self._try_resolve_interstitial(page)
                 probe = await in_page_metrics(page)
                 if not probe["challenge"]:
-                    break
+                    if probe["text"] > 0 or probe["main_text"] > 0:
+                        break
+                    # When a challenge script calls window.location.reload(),
+                    # in_page_metrics may catch a mid-navigation exception or
+                    # observe an empty document before the reloaded DOM arrives.
+                    # Require consecutive settled non-challenge polls before exiting
+                    # with 0 text.
+                    empty_non_challenge_polls += 1
+                    if empty_non_challenge_polls >= 3 and network.get("active", 0) == 0:
+                        break
+                else:
+                    empty_non_challenge_polls = 0
             await wait_for_stability(
                 page,
                 timeout=min(3.0, self.timeout / 4),
@@ -790,6 +803,7 @@ class BrowserFetcher:
             )
             probe = await in_page_metrics(page)
             if probe["challenge"]:
+                network["unresolved_challenge"] = True
                 return True
 
         skip_scroll = (
@@ -880,6 +894,8 @@ class BrowserFetcher:
         fetch_succeeded = False
         effective_proxy = proxy if proxy is not None else self.proxy
         proxy_key = effective_proxy.url if effective_proxy and effective_proxy.url else ""
+        site_key = registrable_host(url) or (urlsplit(url).hostname or "").lower()
+        pool_key = f"{proxy_key}|{site_key}"
         try:
             async with asyncio.timeout(page_timeout):
                 has_proxy = bool(effective_proxy and effective_proxy.url)
@@ -889,9 +905,10 @@ class BrowserFetcher:
                 if headers:
                     context_headers.update(headers)
 
-                # Acquire reusable context from pool to preserve disk and memory HTTP cache
+                # Acquire reusable per-site context from pool to preserve disk/memory HTTP cache
+                # and same-site clearance cookies across requests to the same registrable domain.
                 async with self._context_lock:
-                    pool = self._context_pools.setdefault(proxy_key, [])
+                    pool = self._context_pools.setdefault(pool_key, [])
                     while pool:
                         candidate = pool.pop()
                         is_closed = getattr(candidate, "is_closed", None)
@@ -1108,10 +1125,12 @@ class BrowserFetcher:
             if context is not None:
                 max_pool_size = max(2, getattr(self, "browser_concurrency", 4))
                 evicted_contexts: list[Any] = []
+                unresolved_challenge = bool(isinstance(network, dict) and network.get("unresolved_challenge"))
                 try:
-                    await context.clear_cookies()
+                    if cookies or not fetch_succeeded or unresolved_challenge:
+                        await context.clear_cookies()
                     async with self._context_lock:
-                        pool = self._context_pools.setdefault(proxy_key, [])
+                        pool = self._context_pools.setdefault(pool_key, [])
                         if (
                             fetch_succeeded
                             and not self._needs_reset
@@ -1121,9 +1140,9 @@ class BrowserFetcher:
                         ):
                             pool.append(context)
                             context = None
-                            while len(self._context_pools) > 4:
+                            while len(self._context_pools) > 16:
                                 oldest_key = next(iter(self._context_pools))
-                                if oldest_key == proxy_key and len(self._context_pools) > 1:
+                                if oldest_key == pool_key and len(self._context_pools) > 1:
                                     keys_iter = iter(self._context_pools)
                                     next(keys_iter)
                                     oldest_key = next(keys_iter)

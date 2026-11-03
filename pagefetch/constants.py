@@ -78,12 +78,16 @@ WAF_CHALLENGE_MARKERS: tuple[bytes, ...] = (
     b"datadome",
     b"kasada",
     b"px-captcha",
+    b"/_pow/solve",
+    b"__identity_pow_cookie_check",
+    b"recaptchachallengepageui",
+    b"grecaptcha.enterprise.execute",
 )
 
 
 def looks_like_waf_challenge(content: bytes) -> bool:
-    """Return True when *content* carries WAF challenge markers in the first 4 KiB."""
+    """Return True when *content* carries WAF challenge markers in the first 8 KiB."""
     if not content:
         return False
-    head = content[:4096].lower()
+    head = content[:8192].lower()
     return any(marker in head for marker in WAF_CHALLENGE_MARKERS)

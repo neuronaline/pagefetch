@@ -56,13 +56,23 @@ def process_html(
     images = extract_images(raw_soup, base_url)
     cleaned = clean_html(raw_soup, cleaning_level, copy=False)
     markdown = html_to_markdown(cleaned, base_url)
-    text = "\n".join(line.strip() for line in cleaned.get_text("\n").splitlines() if line.strip())
+    text_root = cleaned.body if cleaned.body is not None else cleaned
+    text = "\n".join(line.strip() for line in text_root.get_text("\n").splitlines() if line.strip())
     if cleaning_level != "minimal" and len(text) < 50 and confidence.score >= 0.40:
         fallback_soup = clean_html(BeautifulSoup(html, "lxml"), "minimal", copy=False)
+        fallback_root = fallback_soup.body if fallback_soup.body is not None else fallback_soup
         fallback_text = "\n".join(
-            line.strip() for line in fallback_soup.get_text("\n").splitlines() if line.strip()
+            line.strip() for line in fallback_root.get_text("\n").splitlines() if line.strip()
         )
         if len(fallback_text) >= max(100, len(text) * 3):
             markdown = html_to_markdown(fallback_soup, base_url)
             text = fallback_text
+    if not text.strip() and not markdown.strip() and confidence.score >= 0.20:
+        reasons = tuple(dict.fromkeys((*confidence.reasons, "empty body after cleaning")))
+        confidence = ConfidenceReport(
+            score=min(confidence.score, 0.10),
+            reasons=reasons,
+            challenge=confidence.challenge,
+            javascript_shell=True,
+        )
     return ProcessedHTML(title, markdown, text, metadata, links, images, confidence, warnings)

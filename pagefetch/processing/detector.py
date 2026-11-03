@@ -9,9 +9,18 @@ from dataclasses import dataclass
 from bs4 import BeautifulSoup, Comment, Doctype, NavigableString, Tag
 from bs4.element import CData, TemplateString
 
-from .cleaner import is_js_notice_text, is_substantive_template
+from .cleaner import _HIDDEN_STYLE_RE, is_js_notice_text, is_substantive_template
 
 _VISIBLE_STRING_TYPES = (NavigableString, CData, TemplateString)
+
+_BODY_HIDDEN_CSS_RE = re.compile(
+    r"\bbody\s*\{[^}]*\b(?:visibility\s*:\s*hidden|display\s*:\s*none)\b",
+    re.IGNORECASE,
+)
+_BARE_DOMAIN_TITLE_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
+    re.IGNORECASE,
+)
 
 STRONG_CHALLENGE_PATTERNS = (
     "checking your browser",
@@ -20,6 +29,8 @@ STRONG_CHALLENGE_PATTERNS = (
     "just a moment",
     "enter the characters you see below",
     "type the characters you see in this image",
+    "cookies must be enabled",
+    "enable cookies for",
     # ── Turkish ── Cloudflare/Akamai localizations and Turkish-origin WAFs
     "bir dakika lütfen",
     "robot olmadığınızı doğrulayın",
@@ -93,6 +104,13 @@ CHALLENGE_DOM_PATTERNS = (
     "challenge-running",
     "_cf_chl_opt",
     "validatecaptcha",
+    "/_pow/solve",
+    "__identity_pow_cookie_check",
+    "challengeid",
+    "challengedomain",
+    "cookie-required",
+    "recaptchachallengepageui",
+    "grecaptcha.enterprise.execute",
 )
 JS_PATTERNS = (
     "enable javascript",
@@ -147,13 +165,43 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     # reused by metadata extraction, where JSON-LD script nodes are meaningful.
     noise_tags = soup(["script", "style", "template", "noscript"])
     script_size = sum(len(str(tag)) for tag in noise_tags if tag.name == "script")
+    style_css = " ".join(
+        tag.get_text(" ", strip=True) for tag in noise_tags if tag.name == "style"
+    )
+    body_tag = soup.body
+    body_inline_style = (
+        str(body_tag.get("style", "")).replace(" ", "").lower()
+        if isinstance(body_tag, Tag) and body_tag.attrs
+        else ""
+    )
+    body_hidden_by_css = bool(
+        _BODY_HIDDEN_CSS_RE.search(style_css)
+        and "visibility:visible" not in body_inline_style
+        and "display:block" not in body_inline_style
+    )
+    hidden_ids: set[int] = set()
+    for tag in soup.find_all(True):
+        if not isinstance(tag, Tag) or tag.attrs is None:
+            continue
+        style_attr = str(tag.get("style", "")).replace(" ", "").lower()
+        if tag.has_attr("hidden") or bool(_HIDDEN_STYLE_RE.search(style_attr)):
+            hidden_ids.add(id(tag))
+        elif (
+            str(tag.get("aria-hidden", "")).lower() == "true"
+            and tag.name not in {"html", "body", "main", "article"}
+            and tag.find(["main", "article"]) is None
+            # Mirror clean_html(): modal libraries mark whole app roots
+            # aria-hidden while a dialog is open, so only short chrome counts.
+            and len(tag.get_text(" ", strip=True)) < 200
+        ):
+            hidden_ids.add(id(tag))
     # Identify visible text while skipping noise subtrees. BeautifulSoup's
     # ``Tag.__hash__`` calls ``str(self)`` and ``Tag.__eq__`` matches on HTML
     # string equality, so storing tags directly in a set serializes subtrees
     # and falsely drops identical visible tags elsewhere in the document.
     # We use memoized ancestor lookup keyed by Python object ``id()``, which
     # runs in nanoseconds, never serializes, and avoids false positives.
-    noise_ids: set[int] = {id(tag) for tag in noise_tags}
+    noise_ids: set[int] = {id(tag) for tag in noise_tags} | hidden_ids
     safe_ids: set[int] = set()
 
     def _is_in_noise(node: object) -> bool:
@@ -198,7 +246,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
                 id(tag)
                 for tag in noise_tags
                 if id(tag) not in substantive_fallback_ids
-            }
+            } | hidden_ids
             safe_ids.clear()
             text = " ".join(
                 value
@@ -276,9 +324,15 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         # "Long enough AND at least 3 paragraphs" is the empirical cut-point
         # that distinguishes articles from landing-page hero blocks.
         score += 0.05
+    normalized_title = re.sub(r"\s+", " ", title.strip().lower())
+    is_bare_domain_title = bool(_BARE_DOMAIN_TITLE_RE.match(normalized_title))
     title_tokens = {token for token in re.findall(r"\w+", title.lower()) if len(token) > 3}
     body_tokens = set(re.findall(r"\w+", lowered_text))
-    title_overlap = bool(title_tokens and title_tokens.intersection(body_tokens))
+    title_overlap = bool(
+        title_tokens
+        and title_tokens.intersection(body_tokens)
+        and not (is_bare_domain_title and text_len < 250)
+    )
     if title_overlap:
         # Title/keyword overlap is a weak but cheap topic-coherence signal.
         score += 0.03
@@ -288,11 +342,14 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
 
     main_text = " ".join(main_texts)
     has_substantive_content = (
-        text_len >= 250
-        or (len(paragraphs) >= 2 and text_len >= 100)
-        or len(main_text) >= 80
-        or (bool(headings) and len(paragraphs) >= 2)
-        or word_count >= 40
+        not body_hidden_by_css
+        and (
+            text_len >= 250
+            or (len(paragraphs) >= 2 and text_len >= 100)
+            or len(main_text) >= 80
+            or (bool(headings) and len(paragraphs) >= 2)
+            or word_count >= 40
+        )
     )
     strong_challenge = (
         any(pattern in lowered_text for pattern in STRONG_CHALLENGE_PATTERNS)
@@ -303,7 +360,6 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
         and not has_substantive_content
     )
     weak_hits = sum(pattern in lowered_text for pattern in WEAK_CHALLENGE_PATTERNS)
-    normalized_title = re.sub(r"\s+", " ", title.strip().lower())
     weak_title = any(
         normalized_title == pattern or normalized_title.startswith(f"{pattern} |")
         for pattern in WEAK_CHALLENGE_PATTERNS
@@ -321,6 +377,7 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     mounts = soup.select("#app:empty, #root:empty, #__next:empty, [data-reactroot]:empty")
     shell = (
         explicit_js
+        or (body_hidden_by_css and (text_len < 400 or script_size > 0))
         or (bool(mounts) and not has_noscript_fallback)
         or (framework and text_len < 250)
         or (script_size > max(10_000, text_len * 8) and text_len < 400)

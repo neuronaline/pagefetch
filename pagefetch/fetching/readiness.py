@@ -23,7 +23,7 @@ async def in_page_metrics(page: Any) -> PageMetrics:
     """
     try:
         result: dict[str, Any] = await page.evaluate(
-            """() => {
+            r"""() => {
                 const body = document.body;
                 const bodyText = (body?.innerText || '').length;
                 const mains = document.querySelectorAll('main, article, [role="main"]');
@@ -33,17 +33,43 @@ async def in_page_metrics(page: Any) -> PageMetrics:
                 }
                 const lowered = (body?.innerText || '').toLowerCase();
                 const title = (document.title || '').toLowerCase();
+                const bodyStyle = body ? window.getComputedStyle(body) : null;
+                const bodyHidden = !!(
+                    bodyStyle && (bodyStyle.visibility === 'hidden' || bodyStyle.display === 'none')
+                );
                 const hasChallengeDom = !!(
                     document.querySelector(
                         '#challenge-running, #challenge-stage, #challenge-form, #challenge-error-text, ' +
                         '.cf-turnstile, [id^="cf-chl-widget"], ' +
                         'iframe[src*="challenges.cloudflare.com"], form[action*="validateCaptcha" i], ' +
-                        'input[name="cf-turnstile-response"]'
+                        'input[name="cf-turnstile-response"], ' +
+                        '#cookie-required, #__identity_pow_cookie_check, [id*="pow_cookie"]'
                     )
                 );
+                let hasChallengeScript = false;
+                if (bodyText < 600) {
+                    const scripts = document.querySelectorAll('script');
+                    for (const s of scripts) {
+                        const sc = (s.textContent || '') + ' ' + (s.src || '');
+                        if (
+                            sc.includes('/_pow/solve') ||
+                            sc.includes('__identity_pow_cookie_check') ||
+                            sc.includes('RecaptchaChallengePageUi') ||
+                            sc.includes('grecaptcha.enterprise.execute') ||
+                            (sc.includes('challengeId') && sc.includes('location.reload'))
+                        ) {
+                            hasChallengeScript = true;
+                            break;
+                        }
+                    }
+                }
+                const host = (window.location.hostname || '').toLowerCase().replace(/^www\./, '');
+                const cleanTitle = title.trim().replace(/^www\./, '');
+                const isHostnameTitle = !!(host && cleanTitle === host && bodyText < 200);
                 const patterns = [
                     'checking your browser', 'verify you are human', 'attention required',
                     'just a moment', 'security check',
+                    'cookies must be enabled', 'enable cookies for', 'recaptchachallengepageui',
                     'bir dakika lütfen', 'robot olmadığınızı', 'erişim engellendi',
                     'güvenlik kontrolü', 'проверка вашего браузера', 'подтвердите, что вы не робот',
                     'wir überprüfen ihren browser', 'bitte bestätigen sie', 'nous vérifions votre navigateur',
@@ -52,8 +78,15 @@ async def in_page_metrics(page: Any) -> PageMetrics:
                     'enter the characters you see below', 'validatecaptcha'
                 ];
                 const hasChallengeText = patterns.some(p => lowered.includes(p) || title.includes(p));
-                const challenge = (hasChallengeDom || hasChallengeText || title.includes('challenge')) && bodyText < 600;
-                return {text: bodyText, mainText, challenge};
+                const effectiveText = bodyHidden ? 0 : bodyText;
+                const challenge = (
+                    hasChallengeDom ||
+                    hasChallengeScript ||
+                    hasChallengeText ||
+                    isHostnameTitle ||
+                    title.includes('challenge')
+                ) && effectiveText < 600;
+                return {text: effectiveText, mainText: bodyHidden ? 0 : mainText, challenge};
             }"""
         )
     except Exception:
