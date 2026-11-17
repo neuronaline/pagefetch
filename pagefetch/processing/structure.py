@@ -14,6 +14,7 @@ the page being inspected.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
@@ -30,19 +31,16 @@ from ..models import (
 
 # Default safety limits. Callers can override via ``StructureLimits`` if a
 # project genuinely needs deeper trees or longer inline previews.
-_DEFAULT_MAX_DEPTH = 12
-_DEFAULT_MAX_NODES = 800
+DEFAULT_STRUCTURE_MAX_DEPTH = 12
+DEFAULT_STRUCTURE_MAX_NODES = 800
+_DEFAULT_MAX_DEPTH = DEFAULT_STRUCTURE_MAX_DEPTH
+_DEFAULT_MAX_NODES = DEFAULT_STRUCTURE_MAX_NODES
 _DEFAULT_TEXT_PREVIEW = 120
 _DEFAULT_INLINE_SOURCE_LIMIT = 4_096
 _DEFAULT_MAX_ASSET_ITEMS = 100
 _DEFAULT_MAX_ASSET_BYTES = 64 * 1024
 
 # Attribute whitelist used in compact mode to keep the tree payload small.
-# We keep the selectors' building blocks (``id``/``class``) plus the fields an
-# LLM or developer would reasonably look at first (``role``,
-# ``data-testid``/``data-test``/``data-id``, ``aria-*``, ``href``,
-# ``name``/``type``/``value``/``placeholder``/``title``/``alt``/``src``/
-# ``for``/``disabled``/``hidden``/``target``/``rel``).
 _COMPACT_ATTR_WHITELIST = frozenset(
     {
         "id",
@@ -67,6 +65,8 @@ _COMPACT_ATTR_WHITELIST = frozenset(
         "hidden",
         "target",
         "rel",
+        "tabindex",
+        "contenteditable",
     }
 )
 
@@ -183,8 +183,8 @@ def extract_structure(
     )
 
 
-_INTERACTIVE_TAGS = frozenset({"button", "select", "textarea", "summary", "option"})
-_INTERACTIVE_ROLES = frozenset(
+INTERACTIVE_TAGS = frozenset({"button", "select", "textarea", "summary", "option"})
+INTERACTIVE_ROLES = frozenset(
     {
         "button",
         "link",
@@ -201,28 +201,86 @@ _INTERACTIVE_ROLES = frozenset(
 )
 
 
-def _is_interactive(tag: Tag, attrs: dict[str, str]) -> bool:
-    if "disabled" in attrs or "hidden" in attrs:
+def build_js_interactive_tagger(
+    max_depth: int = DEFAULT_STRUCTURE_MAX_DEPTH,
+    max_nodes: int = DEFAULT_STRUCTURE_MAX_NODES,
+) -> str:
+    """Compile the in-page JS interactive tagger from Python's canonical spec."""
+    tags_literal = json.dumps(sorted(INTERACTIVE_TAGS))
+    roles_literal = json.dumps(sorted(INTERACTIVE_ROLES))
+    return f"""() => {{
+    const interactiveTags = new Set({tags_literal});
+    const interactiveRoles = new Set({roles_literal});
+    const isInteractive = (el) => {{
+        if (el.hasAttribute('disabled') || el.hasAttribute('hidden')) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        const tag = el.tagName.toLowerCase();
+        if (interactiveTags.has(tag)) return true;
+        if (tag === 'a' && el.hasAttribute('href') && el.getAttribute('href').trim() !== '') return true;
+        if (tag === 'input') {{
+            const t = (el.getAttribute('type') || 'text').toLowerCase();
+            return t !== 'hidden';
+        }}
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        if (interactiveRoles.has(role)) return true;
+        const ce = el.getAttribute('contenteditable');
+        if (ce === '' || ce === 'true') return true;
+        const ti = el.getAttribute('tabindex');
+        if (ti !== null && !isNaN(parseInt(ti, 10)) && parseInt(ti, 10) >= 0) return true;
+        return false;
+    }};
+    let count = 0;
+    let nodeCount = 0;
+    const maxDepth = {max_depth};
+    const maxNodes = {max_nodes};
+
+    function walk(node, depth) {{
+        if (!node || node.nodeType !== 1) return;
+        nodeCount++;
+        if (isInteractive(node)) {{
+            count++;
+            node.setAttribute('data-pf-action-id', String(count));
+        }}
+        if (depth + 1 < maxDepth && nodeCount < maxNodes) {{
+            for (let child = node.firstElementChild; child; child = child.nextElementSibling) {{
+                walk(child, depth + 1);
+                if (nodeCount >= maxNodes) break;
+            }}
+        }}
+    }}
+    const root = document.documentElement || document.body;
+    if (root) {{
+        walk(root, 0);
+    }}
+    return count;
+}}"""
+
+
+def _is_interactive(tag: Tag) -> bool:
+    """Evaluate interactivity against raw *tag* attributes (compact-mode invariant)."""
+    if tag.has_attr("disabled") or tag.has_attr("hidden"):
         return False
-    if attrs.get("aria-hidden") == "true":
+    if _stringify(tag.attrs.get("aria-hidden", "")).strip() == "true":
         return False
     tag_name = tag.name.lower()
-    if tag_name in _INTERACTIVE_TAGS:
+    if tag_name in INTERACTIVE_TAGS:
         return True
-    if tag_name == "a" and bool(attrs.get("href")):
+    if tag_name == "a" and tag.has_attr("href") and _stringify(tag.attrs.get("href", "")).strip() != "":
         return True
     if tag_name == "input":
-        inp_type = attrs.get("type", "text").lower()
+        inp_type = _stringify(tag.attrs.get("type", "text")).lower()
         return inp_type != "hidden"
-    role = attrs.get("role", "").lower()
-    if role in _INTERACTIVE_ROLES:
+    role = _stringify(tag.attrs.get("role", "")).lower()
+    if role in INTERACTIVE_ROLES:
         return True
-    if attrs.get("contenteditable") in {"", "true"}:
-        return True
-    tabindex = attrs.get("tabindex")
-    if tabindex is not None:
+    if tag.has_attr("contenteditable"):
+        ce = _stringify(tag.attrs.get("contenteditable", ""))
+        if ce in {"", "true"}:
+            return True
+    if tag.has_attr("tabindex"):
+        tabindex = _stringify(tag.attrs.get("tabindex", ""))
         try:
-            if int(tabindex) >= 0:
+            if int(tabindex.strip()) >= 0:
                 return True
         except ValueError:
             pass
@@ -299,7 +357,7 @@ def _describe(
     segment = _path_segment(tag, attrs)
     path = f"{parent_path} > {segment}" if parent_path else segment
 
-    is_interactive = _is_interactive(tag, attrs)
+    is_interactive = _is_interactive(tag)
     action_id: int | None = None
     if is_interactive:
         action_counters[0] += 1
@@ -541,4 +599,12 @@ def _full_text(tag: Tag) -> str:
     return tag.get_text()
 
 
-__all__ = ["StructureLimits", "extract_structure"]
+__all__ = [
+    "DEFAULT_STRUCTURE_MAX_DEPTH",
+    "DEFAULT_STRUCTURE_MAX_NODES",
+    "INTERACTIVE_ROLES",
+    "INTERACTIVE_TAGS",
+    "StructureLimits",
+    "build_js_interactive_tagger",
+    "extract_structure",
+]

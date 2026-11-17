@@ -41,6 +41,64 @@ class FetchErrorInfo:
     message: str
     retryable: bool
     exception_type: str | None = None
+    provider: str | None = None
+    domain: str | None = None
+    status_code: int | None = None
+    hint: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+            "exception_type": self.exception_type,
+        }
+        if self.provider is not None:
+            payload["provider"] = self.provider
+        if self.domain is not None:
+            payload["domain"] = self.domain
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        if self.hint is not None:
+            payload["hint"] = self.hint
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> FetchErrorInfo:
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
+
+
+@dataclass(slots=True)
+class ExpandedSection:
+    """A captured or unhidden page section (tab panel, accordion, disclosure)."""
+
+    title: str
+    kind: str = "tab"
+    markdown: str = ""
+    text: str = ""
+    html: str | None = None
+
+    def to_dict(self, *, include_html: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "title": self.title,
+            "kind": self.kind,
+            "markdown": self.markdown,
+            "text": self.text,
+        }
+        if include_html and self.html is not None:
+            payload["html"] = self.html
+        return payload
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ExpandedSection:
+        return cls(
+            title=str(data.get("title", "")),
+            kind=str(data.get("kind", "tab")),
+            markdown=str(data.get("markdown", "")),
+            text=str(data.get("text", "")),
+            html=data.get("html"),
+        )
 
 
 VALID_ACTION_TYPES: frozenset[str] = frozenset(
@@ -382,6 +440,7 @@ class FetchResult:
     error: FetchErrorInfo | None = None
     actions_executed: list[ActionResult] | None = None
     xhr_responses: list[CapturedXHR] | None = None
+    sections: list[ExpandedSection] | None = None
 
     def __post_init__(self) -> None:
         self.metadata = {} if self.metadata is None else self.metadata
@@ -408,6 +467,7 @@ class FetchResult:
             warnings=list(self.warnings),
             actions_executed=list(self.actions_executed) if self.actions_executed is not None else None,
             xhr_responses=list(self.xhr_responses) if self.xhr_responses is not None else None,
+            sections=list(self.sections) if self.sections is not None else None,
         )
 
     def to_dict(
@@ -448,6 +508,8 @@ class FetchResult:
                 continue
             if field.name == "xhr_responses" and not value:
                 continue
+            if field.name == "sections" and not value:
+                continue
             if isinstance(value, datetime):
                 output[field.name] = value.isoformat()
             elif field.name in {"links", "images"}:
@@ -456,8 +518,13 @@ class FetchResult:
                 output[field.name] = [asdict(item) if is_dataclass(item) else dict(item) for item in value]
             elif field.name == "xhr_responses" and value is not None:
                 output[field.name] = [asdict(item) if is_dataclass(item) else dict(item) for item in value]
+            elif field.name == "sections" and value is not None:
+                output[field.name] = [
+                    item.to_dict(include_html=include_html) if isinstance(item, ExpandedSection) else dict(item)
+                    for item in value
+                ]
             elif field.name == "error" and value is not None:
-                output[field.name] = asdict(value)
+                output[field.name] = value.to_dict() if hasattr(value, "to_dict") else asdict(value)
             elif field.name == "structure" and value is not None:
                 output[field.name] = value.to_dict(compact=compact_structure)
             elif field.name == "screenshot" and value is not None:
@@ -499,7 +566,7 @@ class FetchResult:
         values["links"] = [LinkInfo(**item) for item in values.get("links", [])]
         values["images"] = [ImageInfo(**item) for item in values.get("images", [])]
         error = values.get("error")
-        values["error"] = FetchErrorInfo(**error) if error else None
+        values["error"] = FetchErrorInfo.from_dict(error) if isinstance(error, dict) else error
         structure = values.get("structure")
         values["structure"] = PageStructure.from_dict(structure) if structure else None
         if values.get("actions_executed"):
@@ -511,6 +578,11 @@ class FetchResult:
             values["xhr_responses"] = [
                 CapturedXHR(**item) if isinstance(item, dict) else item
                 for item in values["xhr_responses"]
+            ]
+        if values.get("sections"):
+            values["sections"] = [
+                ExpandedSection.from_dict(item) if isinstance(item, dict) else item
+                for item in values["sections"]
             ]
         screenshot = values.get("screenshot")
         if isinstance(screenshot, str):
@@ -534,13 +606,3 @@ class FetchResult:
         if isinstance(fetched_at, str):
             values["fetched_at"] = datetime.fromisoformat(fetched_at)
         return cls(**values)
-
-
-def _structure_to_dict(value: PageStructure, *, compact: bool = False) -> dict[str, Any]:
-    """Serialize a PageStructure, mapping ``async_`` back to ``async``."""
-    return value.to_dict(compact=compact)
-
-
-def _structure_from_dict(data: dict[str, Any]) -> PageStructure:
-    """Inverse of the lossless structure representation."""
-    return PageStructure.from_dict(data)

@@ -9,6 +9,7 @@ import json
 import re
 import sys
 import zipfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -18,10 +19,25 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 DOCX_NS = {"w": W_NS, "r": R_NS}
 
-CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
-DC_NS = "http://purl.org/dc/elements/1.1/"
-DCTERMS_NS = "http://purl.org/dc/terms/"
-CORE_NS = {"cp": CP_NS, "dc": DC_NS, "dcterms": DCTERMS_NS}
+CORE_NS = {
+    "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "dcterms": "http://purl.org/dc/terms/",
+}
+
+_DOCX_CORE_FIELDS: tuple[tuple[str, str], ...] = (
+    (".//dc:title", "title"),
+    (".//dc:creator", "creator"),
+    (".//cp:lastModifiedBy", "last_modified_by"),
+    (".//dcterms:created", "created"),
+    (".//dcterms:modified", "modified"),
+)
+
+# Set generous CSV cell bound once at import time instead of mutating process globals per request.
+try:
+    csv.field_size_limit(sys.maxsize)
+except OverflowError:
+    csv.field_size_limit(2147483647)
 
 
 @dataclass(slots=True)
@@ -46,6 +62,50 @@ def _decode_text(content: bytes, encoding: str | None) -> tuple[list[str], str]:
         pass
     text = content.decode("utf-8", errors="replace")
     return ["Text decoded with UTF-8 replacement; some bytes were lost."], text
+
+
+def _format_gfm_table(
+    rows: Sequence[Sequence[str]],
+    *,
+    newline_replacement: str = " ",
+    max_data_rows: int | None = None,
+) -> tuple[str, bool]:
+    """Render rectangular/ragged string rows as a GFM Markdown table.
+
+    Returns ``(markdown_table, was_truncated)``.
+    """
+    if not rows:
+        return "", False
+    width = max(len(r) for r in rows)
+    if width == 0:
+        return "", False
+
+    def _clean_row(row: Sequence[str]) -> list[str]:
+        cleaned = [
+            cell.replace("|", r"\|").replace("\r", "").replace("\n", newline_replacement).strip()
+            for cell in row
+        ]
+        if len(cleaned) < width:
+            cleaned.extend([""] * (width - len(cleaned)))
+        return cleaned
+
+    md_lines = [
+        "| " + " | ".join(_clean_row(rows[0])) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    data_rows = rows[1:]
+    truncated = max_data_rows is not None and len(data_rows) > max_data_rows
+    display_rows = data_rows[:max_data_rows] if truncated else data_rows
+    for row in display_rows:
+        md_lines.append("| " + " | ".join(_clean_row(row)) + " |")
+
+    table_md = "\n".join(md_lines)
+    if truncated:
+        table_md += (
+            f"\n\n*Showing first {max_data_rows} of {len(data_rows)} data rows. "
+            f"Complete data available in text.*"
+        )
+    return table_md, truncated
 
 
 def process_pdf(content: bytes) -> ProcessedDocument:
@@ -73,9 +133,7 @@ def process_pdf(content: bytes) -> ProcessedDocument:
             warnings.append(f"Failed extracting text on PDF page {index}: {exc}")
             continue
 
-        # Clean line breaks and soft hyphens
         normalized = raw_text.replace("\xad", "").replace("\r\n", "\n").replace("\r", "\n")
-        # Join words split by hyphenation at line breaks: "inter-\nnet" -> "internet"
         normalized = re.sub(r"(\w+)-\n(\w+)", r"\1\2", normalized)
         text = normalized.strip()
         if text:
@@ -90,217 +148,181 @@ def process_pdf(content: bytes) -> ProcessedDocument:
     metadata["page_count"] = len(reader.pages)
     title = metadata.get("Title")
     if not title and page_texts:
-        # Fall back to first non-empty line of page 1 if it looks like a document title
         first_line = page_texts[0].split("\n", 1)[0].strip()
         if first_line and len(first_line) <= 120 and not first_line.endswith("."):
             title = first_line
 
     full_text = "\n\n".join(page_texts)
-    markdown_parts: list[str] = []
-    if title:
-        markdown_parts.append(f"# {title}")
-    for index, text in enumerate(page_texts, 1):
-        markdown_parts.append(f"## Page {index}\n\n{text}")
-
+    markdown_parts = [f"# {title}"] if title else []
+    markdown_parts.extend(f"## Page {index}\n\n{text}" for index, text in enumerate(page_texts, 1))
     return ProcessedDocument(title, "\n\n".join(markdown_parts), full_text, metadata, warnings)
+
+
+def _wrap_markdown_formatting(text: str, *, bold: bool, italic: bool, strike: bool) -> str:
+    if not (bold or italic or strike):
+        return text
+    l_ws = text[: len(text) - len(text.lstrip())]
+    r_ws = text[len(text.rstrip()) :]
+    core = text.strip()
+    if not core:
+        return text
+    if bold and italic:
+        core = f"***{core}***"
+    elif bold:
+        core = f"**{core}**"
+    elif italic:
+        core = f"*{core}*"
+    if strike:
+        core = f"~~{core}~~"
+    return f"{l_ws}{core}{r_ws}"
+
+
+def _docx_paragraph(p_elem: Any, rels: dict[str, str]) -> tuple[str, str]:
+    style_elem = p_elem.find(".//w:pStyle", DOCX_NS)
+    style_val = style_elem.attrib.get(f"{{{W_NS}}}val", "") if style_elem is not None else ""
+    is_list = p_elem.find(".//w:numPr", DOCX_NS) is not None or "list" in style_val.lower()
+
+    md_parts: list[str] = []
+    txt_parts: list[str] = []
+    for child in p_elem:
+        if not isinstance(child.tag, str):
+            continue
+        tag = child.tag.split("}")[-1]
+        if tag == "r":
+            run_text = "".join(child.xpath(".//w:t/text()", namespaces=DOCX_NS))
+            if not run_text:
+                continue
+            txt_parts.append(run_text)
+            md_parts.append(
+                _wrap_markdown_formatting(
+                    run_text,
+                    bold=child.find(".//w:b", DOCX_NS) is not None,
+                    italic=child.find(".//w:i", DOCX_NS) is not None,
+                    strike=child.find(".//w:strike", DOCX_NS) is not None,
+                )
+            )
+        elif tag == "hyperlink":
+            link_text = "".join(child.xpath(".//w:t/text()", namespaces=DOCX_NS))
+            if not link_text:
+                continue
+            txt_parts.append(link_text)
+            url = rels.get(child.attrib.get(f"{{{R_NS}}}id") or "", "")
+            if url:
+                safe_label = link_text.replace("[", r"\[").replace("]", r"\]")
+                md_parts.append(f"[{safe_label}]({url})")
+            else:
+                md_parts.append(link_text)
+
+    plain_line = "".join(txt_parts).strip()
+    md_line = "".join(md_parts).strip()
+    if not md_line:
+        return "", ""
+
+    lower_style = style_val.lower()
+    if lower_style.startswith("heading"):
+        level_char = style_val[-1] if style_val[-1].isdigit() else "1"
+        level = max(1, min(6, int(level_char)))
+        return f"{'#' * level} {md_line}", plain_line
+    if lower_style == "title":
+        return f"# {md_line}", plain_line
+    if lower_style == "subtitle":
+        return f"## {md_line}", plain_line
+    if is_list:
+        return f"- {md_line}", plain_line
+    return md_line, plain_line
+
+
+def _docx_table(tbl_elem: Any, rels: dict[str, str]) -> tuple[str, str]:
+    rows: list[list[str]] = []
+    raw_rows: list[list[str]] = []
+    for tr in tbl_elem.findall("./w:tr", DOCX_NS):
+        cells: list[str] = []
+        raw_cells: list[str] = []
+        for tc in tr.findall("./w:tc", DOCX_NS):
+            cell_md: list[str] = []
+            cell_txt: list[str] = []
+            for p in tc.findall(".//w:p", DOCX_NS):
+                p_md, p_txt = _docx_paragraph(p, rels)
+                if p_md:
+                    cell_md.append(p_md)
+                if p_txt:
+                    cell_txt.append(p_txt)
+            cells.append(" ".join(cell_md).strip())
+            raw_cells.append(" ".join(cell_txt).strip())
+        if any(cells):
+            rows.append(cells)
+            raw_rows.append(raw_cells)
+    if not rows:
+        return "", ""
+    table_md, _ = _format_gfm_table(rows, newline_replacement=" ")
+    return table_md, "\n".join("\t".join(r) for r in raw_rows)
 
 
 def process_docx(content: bytes) -> ProcessedDocument:
     """Extract structured Markdown and metadata from a DOCX (OpenXML) byte stream."""
     warnings: list[str] = []
     try:
-        zf = zipfile.ZipFile(io.BytesIO(content))
+        zf_ctx = zipfile.ZipFile(io.BytesIO(content))
     except Exception as exc:
         raise ValueError(f"Invalid DOCX archive: {exc}") from exc
 
-    namelist = zf.namelist()
-    if "word/document.xml" not in namelist:
-        raise ValueError("Invalid DOCX format: missing word/document.xml")
+    with zf_ctx as zf:
+        namelist = zf.namelist()
+        if "word/document.xml" not in namelist:
+            raise ValueError("Invalid DOCX format: missing word/document.xml")
 
-    # 1. Extract Dublin Core metadata
-    metadata: dict[str, Any] = {}
-    title: str | None = None
-    if "docProps/core.xml" in namelist:
+        metadata: dict[str, Any] = {}
+        if "docProps/core.xml" in namelist:
+            try:
+                core_root = etree.fromstring(zf.read("docProps/core.xml"))
+                for xpath, key in _DOCX_CORE_FIELDS:
+                    elem = core_root.find(xpath, CORE_NS)
+                    if elem is not None and elem.text:
+                        metadata[key] = elem.text.strip()
+            except Exception as exc:
+                warnings.append(f"Failed parsing DOCX core metadata: {exc}")
+
+        rels: dict[str, str] = {}
+        if "word/_rels/document.xml.rels" in namelist:
+            try:
+                rels_root = etree.fromstring(zf.read("word/_rels/document.xml.rels"))
+                for rel in rels_root:
+                    r_id = rel.attrib.get("Id")
+                    target = rel.attrib.get("Target")
+                    if r_id and target:
+                        rels[r_id] = target
+            except Exception as exc:
+                warnings.append(f"Failed parsing DOCX relationships: {exc}")
+
         try:
-            core_root = etree.fromstring(zf.read("docProps/core.xml"))
-            dc_title = core_root.find(".//dc:title", CORE_NS)
-            if dc_title is not None and dc_title.text:
-                title = dc_title.text.strip()
-                metadata["title"] = title
-            dc_creator = core_root.find(".//dc:creator", CORE_NS)
-            if dc_creator is not None and dc_creator.text:
-                metadata["creator"] = dc_creator.text.strip()
-            cp_modified_by = core_root.find(".//cp:lastModifiedBy", CORE_NS)
-            if cp_modified_by is not None and cp_modified_by.text:
-                metadata["last_modified_by"] = cp_modified_by.text.strip()
-            created = core_root.find(".//dcterms:created", CORE_NS)
-            if created is not None and created.text:
-                metadata["created"] = created.text.strip()
-            modified = core_root.find(".//dcterms:modified", CORE_NS)
-            if modified is not None and modified.text:
-                metadata["modified"] = modified.text.strip()
+            doc_root = etree.fromstring(zf.read("word/document.xml"))
         except Exception as exc:
-            warnings.append(f"Failed parsing DOCX core metadata: {exc}")
+            raise ValueError(f"Failed parsing DOCX XML tree: {exc}") from exc
 
-    # 2. Extract hyperlink relationships
-    rels: dict[str, str] = {}
-    if "word/_rels/document.xml.rels" in namelist:
-        try:
-            rels_root = etree.fromstring(zf.read("word/_rels/document.xml.rels"))
-            for rel in rels_root:
-                r_id = rel.attrib.get("Id")
-                target = rel.attrib.get("Target")
-                if r_id and target:
-                    rels[r_id] = target
-        except Exception as exc:
-            warnings.append(f"Failed parsing DOCX relationships: {exc}")
-
-    # 3. Parse main document
-    try:
-        doc_root = etree.fromstring(zf.read("word/document.xml"))
-    except Exception as exc:
-        raise ValueError(f"Failed parsing DOCX XML tree: {exc}") from exc
-
-    def _parse_p(p_elem: Any) -> tuple[str, str]:
-        """Return (markdown_str, plain_text_str) for a paragraph element."""
-        style_val = ""
-        style_elem = p_elem.find(".//w:pStyle", DOCX_NS)
-        if style_elem is not None:
-            style_val = style_elem.attrib.get(f"{{{W_NS}}}val", "")
-
-        is_list = p_elem.find(".//w:numPr", DOCX_NS) is not None or "list" in style_val.lower()
-
-        md_parts: list[str] = []
-        txt_parts: list[str] = []
-
-        for child in p_elem:
-            if not isinstance(child.tag, str):
-                continue
-            tag = child.tag.split("}")[-1]
-            if tag == "r":
-                bold = child.find(".//w:b", DOCX_NS) is not None
-                italic = child.find(".//w:i", DOCX_NS) is not None
-                strike = child.find(".//w:strike", DOCX_NS) is not None
-                run_text = "".join(child.xpath(".//w:t/text()", namespaces=DOCX_NS))
-                if run_text:
-                    txt_parts.append(run_text)
-                    if bold or italic or strike:
-                        l_ws = run_text[: len(run_text) - len(run_text.lstrip())]
-                        r_ws = run_text[len(run_text.rstrip()) :]
-                        core = run_text.strip()
-                        if core:
-                            if bold and italic:
-                                core = f"***{core}***"
-                            elif bold:
-                                core = f"**{core}**"
-                            elif italic:
-                                core = f"*{core}*"
-                            if strike:
-                                core = f"~~{core}~~"
-                            formatted = f"{l_ws}{core}{r_ws}"
-                        else:
-                            formatted = run_text
-                    else:
-                        formatted = run_text
-                    md_parts.append(formatted)
-            elif tag == "hyperlink":
-                r_id = child.attrib.get(f"{{{R_NS}}}id")
-                url = rels.get(r_id or "", "")
-                link_text = "".join(child.xpath(".//w:t/text()", namespaces=DOCX_NS))
-                if link_text:
-                    txt_parts.append(link_text)
-                    if url:
-                        safe_label = link_text.replace("[", r"\[").replace("]", r"\]")
-                        md_parts.append(f"[{safe_label}]({url})")
-                    else:
-                        md_parts.append(link_text)
-
-        plain_line = "".join(txt_parts).strip()
-        md_line = "".join(md_parts).strip()
-        if not md_line:
-            return "", ""
-
-        # Map headings
-        lower_style = style_val.lower()
-        if lower_style.startswith("heading"):
-            level_char = style_val[-1] if style_val[-1].isdigit() else "1"
-            level = max(1, min(6, int(level_char)))
-            return f"{'#' * level} {md_line}", plain_line
-        if lower_style == "title":
-            return f"# {md_line}", plain_line
-        if lower_style == "subtitle":
-            return f"## {md_line}", plain_line
-        if is_list:
-            return f"- {md_line}", plain_line
-
-        return md_line, plain_line
-
-    def _parse_tbl(tbl_elem: Any) -> tuple[str, str]:
-        """Convert a table element into a GFM table."""
-        rows: list[list[str]] = []
-        raw_rows: list[list[str]] = []
-        for tr in tbl_elem.findall("./w:tr", DOCX_NS):
-            cells: list[str] = []
-            raw_cells: list[str] = []
-            for tc in tr.findall("./w:tc", DOCX_NS):
-                cell_md: list[str] = []
-                cell_txt: list[str] = []
-                for p in tc.findall(".//w:p", DOCX_NS):
-                    p_md, p_txt = _parse_p(p)
-                    if p_md:
-                        cell_md.append(p_md)
-                    if p_txt:
-                        cell_txt.append(p_txt)
-                cell_value = " ".join(cell_md).replace("|", r"\|").replace("\n", " ").strip()
-                cells.append(cell_value)
-                raw_cells.append(" ".join(cell_txt).strip())
-            if any(cells):
-                rows.append(cells)
-                raw_rows.append(raw_cells)
-
-        if not rows:
-            return "", ""
-
-        width = max(len(r) for r in rows)
-        padded = [r + [""] * (width - len(r)) for r in rows]
-        md_lines = ["| " + " | ".join(padded[0]) + " |"]
-        md_lines.append("| " + " | ".join(["---"] * width) + " |")
-        for r in padded[1:]:
-            md_lines.append("| " + " | ".join(r) + " |")
-
-        txt_lines = ["\t".join(r) for r in raw_rows]
-        return "\n".join(md_lines), "\n".join(txt_lines)
-
+    title: str | None = metadata.get("title")
     body = doc_root.find("w:body", DOCX_NS)
     md_blocks: list[str] = []
     txt_blocks: list[str] = []
-
     if body is not None:
         for child in body:
             if not isinstance(child.tag, str):
                 continue
             tag = child.tag.split("}")[-1]
             if tag == "p":
-                p_md, p_txt = _parse_p(child)
-                if p_md:
-                    md_blocks.append(p_md)
-                if p_txt:
-                    txt_blocks.append(p_txt)
+                p_md, p_txt = _docx_paragraph(child, rels)
             elif tag == "tbl":
-                t_md, t_txt = _parse_tbl(child)
-                if t_md:
-                    md_blocks.append(t_md)
-                if t_txt:
-                    txt_blocks.append(t_txt)
+                p_md, p_txt = _docx_table(child, rels)
+            else:
+                continue
+            if p_md:
+                md_blocks.append(p_md)
+            if p_txt:
+                txt_blocks.append(p_txt)
 
-    if not title and md_blocks:
-        first_line = md_blocks[0]
-        if first_line.startswith("# "):
-            title = first_line[2:].strip()
+    if not title and md_blocks and md_blocks[0].startswith("# "):
+        title = md_blocks[0][2:].strip()
 
-    markdown = "\n\n".join(md_blocks)
-    text = "\n\n".join(txt_blocks)
-    return ProcessedDocument(title, markdown, text, metadata, warnings)
+    return ProcessedDocument(title, "\n\n".join(md_blocks), "\n\n".join(txt_blocks), metadata, warnings)
 
 
 def process_csv(
@@ -314,25 +336,16 @@ def process_csv(
     if not decoded.strip():
         return ProcessedDocument(None, "", "", {"row_count": 0, "column_count": 0}, warnings)
 
-    # Autodetect delimiter if not provided
     delim = delimiter
     if not delim:
         sample = decoded[:4096]
         try:
-            sniffer = csv.Sniffer()
-            dialect = sniffer.sniff(sample, delimiters=",\t;|")
-            delim = dialect.delimiter
+            delim = csv.Sniffer().sniff(sample, delimiters=",\t;|").delimiter
         except Exception:
             delim = "\t" if "\t" in sample and "," not in sample else ","
 
     try:
-        csv.field_size_limit(sys.maxsize)
-    except OverflowError:
-        csv.field_size_limit(2147483647)
-
-    reader = csv.reader(io.StringIO(decoded), delimiter=delim)
-    try:
-        raw_rows = list(reader)
+        raw_rows = list(csv.reader(io.StringIO(decoded), delimiter=delim))
     except Exception as exc:
         warnings.append(f"CSV parser error: {exc}")
         return ProcessedDocument(None, decoded, decoded, {"delimiter": delim}, warnings)
@@ -353,28 +366,10 @@ def process_csv(
         "encoding": encoding or "utf-8",
     }
 
-    # Format into GFM Markdown table
-    header = [cell.replace("|", r"\|").replace("\r", "").replace("\n", "<br>").strip() for cell in raw_rows[0]]
-    if len(header) < col_count:
-        header += [""] * (col_count - len(header))
-
-    md_lines = ["| " + " | ".join(header) + " |"]
-    md_lines.append("| " + " | ".join(["---"] * col_count) + " |")
-
-    data_rows = raw_rows[1:]
-    display_rows = data_rows[:max_table_rows]
-    for row in display_rows:
-        cleaned = [cell.replace("|", r"\|").replace("\r", "").replace("\n", "<br>").strip() for cell in row]
-        if len(cleaned) < col_count:
-            cleaned += [""] * (col_count - len(cleaned))
-        md_lines.append("| " + " | ".join(cleaned) + " |")
-
-    table_md = "\n".join(md_lines)
-    if len(data_rows) > max_table_rows:
-        table_md += (
-            f"\n\n*Showing first {max_table_rows} of {len(data_rows)} data rows. "
-            f"Complete data available in text.*"
-        )
+    table_md, truncated = _format_gfm_table(
+        raw_rows, newline_replacement="<br>", max_data_rows=max_table_rows
+    )
+    if truncated:
         warnings.append(f"Markdown table truncated to {max_table_rows} rows.")
 
     return ProcessedDocument(
@@ -411,8 +406,7 @@ def process_json(content: bytes, encoding: str | None = None) -> ProcessedDocume
         metadata["type"] = type(parsed).__name__
 
     pretty_json = json.dumps(parsed, indent=2, ensure_ascii=False)
-    markdown = f"```json\n{pretty_json}\n```"
-    return ProcessedDocument(title, markdown, pretty_json, metadata, warnings)
+    return ProcessedDocument(title, f"```json\n{pretty_json}\n```", pretty_json, metadata, warnings)
 
 
 def _xml_local_name(elem: Any) -> str:
@@ -447,6 +441,20 @@ def _xml_entry_link(elem: Any) -> str:
     return fallback
 
 
+def _xml_entry_author(entry: Any) -> str:
+    for child in entry:
+        cname = _xml_local_name(child)
+        if cname == "author":
+            author = _xml_child_text(child, {"name"}) or "".join(child.itertext()).strip()
+            if author:
+                return author
+        elif cname == "creator":
+            author = "".join(child.itertext()).strip()
+            if author:
+                return author
+    return ""
+
+
 def _render_feed_fragment(raw_body: str, base_url: str = "") -> tuple[str, str]:
     body = raw_body.strip()
     if not body:
@@ -472,15 +480,13 @@ def _process_syndication_feed(
 ) -> ProcessedDocument | None:
     root_local = _xml_local_name(root)
     if root_local == "feed":
-        feed_type = "atom"
-        container = root
+        feed_type, container = "atom", root
         entries = [c for c in root if _xml_local_name(c) == "entry"]
     elif root_local in {"rss", "rdf"}:
         feed_type = "rss"
-        channel = next((c for c in root if _xml_local_name(c) == "channel"), root)
-        container = channel
-        entries = [c for c in channel if _xml_local_name(c) == "item"]
-        if not entries and channel is not root:
+        container = next((c for c in root if _xml_local_name(c) == "channel"), root)
+        entries = [c for c in container if _xml_local_name(c) == "item"]
+        if not entries and container is not root:
             entries = [c for c in root if _xml_local_name(c) == "item"]
     else:
         return None
@@ -492,12 +498,8 @@ def _process_syndication_feed(
     feed_subtitle = _xml_child_text(container, {"subtitle", "description"})
     feed_link = _xml_entry_link(container)
 
-    md_sections: list[str] = []
-    text_sections: list[str] = []
-
-    if feed_title:
-        md_sections.append(f"# {feed_title}")
-        text_sections.append(feed_title)
+    md_sections: list[str] = [f"# {feed_title}"] if feed_title else []
+    text_sections: list[str] = [feed_title] if feed_title else []
     if feed_subtitle and feed_subtitle != feed_title:
         sub_md, sub_txt = _render_feed_fragment(feed_subtitle, feed_link)
         if sub_md:
@@ -507,24 +509,11 @@ def _process_syndication_feed(
     rendered_count = 0
     for idx, entry in enumerate(entries):
         entry_title = _xml_child_text(entry, {"title"})
-        author = ""
-        for child in entry:
-            cname = _xml_local_name(child)
-            if cname == "author":
-                author = _xml_child_text(child, {"name"}) or "".join(child.itertext()).strip()
-                if author:
-                    break
-            elif cname == "creator":
-                author = "".join(child.itertext()).strip()
-                if author:
-                    break
-        timestamp = _xml_child_text(entry, {"published", "updated", "pubdate", "date"})
         entry_link = _xml_entry_link(entry) or feed_link
         raw_body = (
             _xml_child_text(entry, {"encoded", "content"})
             or _xml_child_text(entry, {"summary", "description"})
         )
-
         body_md, body_txt = _render_feed_fragment(raw_body, entry_link)
         if not entry_title and not body_md:
             continue
@@ -534,17 +523,21 @@ def _process_syndication_feed(
         entry_txt_parts: list[str] = []
 
         if entry_title and (idx == 0 or entry_title != feed_title):
-            if entry_link:
-                entry_md_parts.append(f"## [{entry_title}]({entry_link})")
-            else:
-                entry_md_parts.append(f"## {entry_title}")
+            entry_md_parts.append(
+                f"## [{entry_title}]({entry_link})" if entry_link else f"## {entry_title}"
+            )
             entry_txt_parts.append(entry_title)
 
-        meta_bits: list[str] = []
-        if author:
-            meta_bits.append(f"**Author:** {author}")
-        if timestamp:
-            meta_bits.append(f"**Date:** {timestamp}")
+        author = _xml_entry_author(entry)
+        timestamp = _xml_child_text(entry, {"published", "updated", "pubdate", "date"})
+        meta_bits = [
+            bit
+            for bit in (
+                f"**Author:** {author}" if author else "",
+                f"**Date:** {timestamp}" if timestamp else "",
+            )
+            if bit
+        ]
         if meta_bits:
             entry_md_parts.append(" | ".join(meta_bits))
             entry_txt_parts.append(" | ".join(b.replace("**", "") for b in meta_bits))
@@ -575,17 +568,13 @@ def _process_syndication_feed(
 
 def process_xml(content: bytes, encoding: str | None = None) -> ProcessedDocument:
     """Parse XML and format syndication feeds as Markdown or generic XML as fenced code."""
-    strict_parser = etree.XMLParser(
-        resolve_entities=False, no_network=True, recover=False
-    )
+    strict_parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
     warnings: list[str] = []
     root: Any = None
     try:
         root = etree.fromstring(content, parser=strict_parser)
     except etree.XMLSyntaxError:
-        lenient_parser = etree.XMLParser(
-            resolve_entities=False, no_network=True, recover=True
-        )
+        lenient_parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=True)
         try:
             root = etree.fromstring(content, parser=lenient_parser)
         except etree.XMLSyntaxError:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -18,8 +18,9 @@ from ..constants import (
     RETRYABLE_STATUS_CODES,
     looks_like_waf_challenge,
 )
+from ..cookies import CookieProfile
 from ..models import FetchErrorInfo
-from ..utils.urls import validate_url
+from ..utils.urls import registrable_host, validate_url
 
 
 # Header names that may carry credentials or other material that must never
@@ -74,48 +75,72 @@ class TransportFailure(Exception):
         super().__init__(error.message)
 
 
-class _SharedClientTransport(httpx.AsyncBaseTransport):
-    """Transport adapter delegating to a client's pooled transport while isolating cookies.
+class _BorrowedTransport(httpx.AsyncBaseTransport):
+    """Non-closing wrapper letting a per-operation AsyncClient borrow a shared transport pool."""
 
-    httpx.AsyncClient accumulates cookies in `client.cookies` across all requests.
-    Wrapping the client's underlying transport in an ephemeral per-fetch `AsyncClient`
-    gives each fetch operation an isolated cookie jar (so Set-Cookie headers survive
-    redirect hops within the operation) without leaking cookies across distinct fetches
-    or concurrent requests, and without closing the shared connection pool on exit.
-    """
+    __slots__ = ("transport",)
 
-    def __init__(self, client: httpx.AsyncClient) -> None:
-        self._client = client
+    def __init__(self, transport: httpx.AsyncBaseTransport) -> None:
+        self.transport = transport
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        transport = self._client._transport_for_url(request.url)
-        return await transport.handle_async_request(request)
+        return await self.transport.handle_async_request(request)
 
     async def aclose(self) -> None:
         pass
 
 
 class HTTPFetcher:
-    """Fetch through one or more shared ``httpx.AsyncClient`` instances."""
+    """Fetch through a pooled direct transport and optional proxy transport pool."""
 
     def __init__(
         self,
-        client: httpx.AsyncClient,
+        direct_transport: httpx.AsyncBaseTransport,
         semaphore: asyncio.Semaphore,
         *,
         retries: int,
         max_content_size: int,
         max_redirects: int = 10,
-        proxy_client_provider: Callable[[str], Awaitable[httpx.AsyncClient]] | None = None,
-        proxy_client_releaser: Callable[[httpx.AsyncClient], None] | None = None,
+        timeout: httpx.Timeout | float = 20.0,
+        default_headers: Mapping[str, str] | None = None,
+        proxy_transport_provider: Callable[[str], httpx.AsyncBaseTransport] | None = None,
+        proxy_transport_releaser: Callable[[httpx.AsyncBaseTransport], None] | None = None,
     ) -> None:
-        self.client = client
+        self.direct_transport = direct_transport
         self.semaphore = semaphore
         self.retries = retries
         self.max_content_size = max_content_size
         self.max_redirects = max_redirects
-        self.proxy_client_provider = proxy_client_provider
-        self.proxy_client_releaser = proxy_client_releaser
+        self.timeout = timeout if isinstance(timeout, httpx.Timeout) else httpx.Timeout(timeout)
+        self.default_headers: dict[str, str] = dict(default_headers or {})
+        self.proxy_transport_provider = proxy_transport_provider
+        self.proxy_transport_releaser = proxy_transport_releaser
+
+    def _acquire_transport(self, proxy_url: str | None) -> tuple[httpx.AsyncBaseTransport, bool]:
+        """Return ``(transport, is_ephemeral)`` for direct or proxied requests."""
+        if proxy_url is None:
+            return self.direct_transport, False
+        if self.proxy_transport_provider is not None:
+            return self.proxy_transport_provider(proxy_url), False
+        ephemeral = httpx.AsyncHTTPTransport(
+            http2=True,
+            proxy=proxy_url,
+            limits=httpx.Limits(
+                max_connections=self.retries + 1,
+                max_keepalive_connections=1,
+            ),
+        )
+        return ephemeral, True
+
+    async def _release_transport(
+        self, transport: httpx.AsyncBaseTransport | None, is_ephemeral: bool
+    ) -> None:
+        if transport is None or transport is self.direct_transport:
+            return
+        if is_ephemeral:
+            await transport.aclose()
+        elif self.proxy_transport_releaser is not None:
+            self.proxy_transport_releaser(transport)
 
     async def fetch(
         self,
@@ -125,77 +150,35 @@ class HTTPFetcher:
         proxy_url: str | None = None,
         proxy_resolver: Callable[[int], str | None] | None = None,
         headers: dict[str, str] | None = None,
-        cookies: dict[str, str] | None = None,
+        cookie_profile: CookieProfile | None = None,
+        cookie_rotator: Callable[[int], CookieProfile | None] | None = None,
+        initial_site: str | None = None,
         content: bytes | str | None = None,
         data: dict[str, Any] | None = None,
         json_data: Any = None,
         retryable_status_codes: frozenset[int] | None = None,
     ) -> HTTPResponse:
-        fallback_client: httpx.AsyncClient | None = None
-        base_client: httpx.AsyncClient | None = None
+        active_transport, is_ephemeral = self._acquire_transport(proxy_url)
+        borrowed = _BorrowedTransport(active_transport)
         async with self.semaphore:
             try:
-                if proxy_url is not None:
-                    if self.proxy_client_provider is not None:
-                        base_client = await self.proxy_client_provider(proxy_url)
-                    else:
-                        req_headers = headers if headers is not None else self.client.headers
-                        fallback_client = httpx.AsyncClient(
-                            headers=req_headers,
-                            timeout=self.client.timeout,
-                            follow_redirects=False,
-                            max_redirects=self.max_redirects,
-                            http2=True,
-                            proxy=proxy_url,
-                            limits=httpx.Limits(
-                                max_connections=self.retries + 1,
-                                max_keepalive_connections=1,
-                            ),
-                        )
-                        base_client = fallback_client
-                else:
-                    base_client = self.client
-
-                shared_transport = _SharedClientTransport(base_client)
-
                 async def _rotate_proxy_on_retry(next_attempt: int) -> None:
-                    nonlocal proxy_url, base_client, fallback_client
+                    nonlocal proxy_url, active_transport, is_ephemeral
                     if proxy_resolver is None or proxy_url is None:
                         return
                     new_proxy_url = proxy_resolver(next_attempt)
                     if not new_proxy_url or new_proxy_url == proxy_url:
                         return
-                    if base_client is not None:
-                        if fallback_client is not None:
-                            await fallback_client.aclose()
-                            fallback_client = None
-                        elif self.proxy_client_releaser is not None:
-                            self.proxy_client_releaser(base_client)
+                    await self._release_transport(active_transport, is_ephemeral)
                     proxy_url = new_proxy_url
-                    if self.proxy_client_provider is not None:
-                        base_client = await self.proxy_client_provider(proxy_url)
-                    else:
-                        req_headers = headers if headers is not None else self.client.headers
-                        fallback_client = httpx.AsyncClient(
-                            headers=req_headers,
-                            timeout=self.client.timeout,
-                            follow_redirects=False,
-                            max_redirects=self.max_redirects,
-                            http2=True,
-                            proxy=proxy_url,
-                            limits=httpx.Limits(
-                                max_connections=self.retries + 1,
-                                max_keepalive_connections=1,
-                            ),
-                        )
-                        base_client = fallback_client
-                    shared_transport._client = base_client
+                    active_transport, is_ephemeral = self._acquire_transport(proxy_url)
+                    borrowed.transport = active_transport
 
-                # Do not inject client-level headers into op_client so that _strip_credentials
-                # during cross-origin redirects is not subverted by httpx client-level header merging.
+                # Dedicated lightweight client per operation isolates Set-Cookie redirect jars
+                # without leaking across concurrent fetches or mutating default client headers.
                 op_client = httpx.AsyncClient(
-                    transport=shared_transport,
-                    timeout=base_client.timeout,
+                    transport=borrowed,
+                    timeout=self.timeout,
                     follow_redirects=False,
                     max_redirects=self.max_redirects,
                 )
@@ -205,7 +188,9 @@ class HTTPFetcher:
                         method=method,
                         client=op_client,
                         headers=headers,
-                        cookies=cookies,
+                        cookie_profile=cookie_profile,
+                        cookie_rotator=cookie_rotator,
+                        initial_site=initial_site,
                         content=content,
                         data=data,
                         json_data=json_data,
@@ -216,11 +201,7 @@ class HTTPFetcher:
                 finally:
                     await op_client.aclose()
             finally:
-                if proxy_url is not None and base_client is not None:
-                    if fallback_client is not None:
-                        await fallback_client.aclose()
-                    elif self.proxy_client_releaser is not None:
-                        self.proxy_client_releaser(base_client)
+                await self._release_transport(active_transport, is_ephemeral)
 
     async def _fetch_with_retries(
         self,
@@ -229,7 +210,9 @@ class HTTPFetcher:
         method: str = "GET",
         client: httpx.AsyncClient | None = None,
         headers: dict[str, str] | None = None,
-        cookies: dict[str, str] | None = None,
+        cookie_profile: CookieProfile | None = None,
+        cookie_rotator: Callable[[int], CookieProfile | None] | None = None,
+        initial_site: str | None = None,
         content: bytes | str | None = None,
         data: dict[str, Any] | None = None,
         json_data: Any = None,
@@ -238,6 +221,7 @@ class HTTPFetcher:
         on_retry: Callable[[int], Awaitable[None]] | None = None,
     ) -> HTTPResponse:
         retry_codes = retryable_status_codes if retryable_status_codes is not None else RETRYABLE_STATUS_CODES
+        active_profile = cookie_profile
         for attempt in range(self.retries + 1):
             try:
                 response = await self._request(
@@ -245,7 +229,8 @@ class HTTPFetcher:
                     method=method,
                     client=client,
                     headers=headers,
-                    cookies=cookies,
+                    cookie_profile=active_profile,
+                    initial_site=initial_site,
                     content=content,
                     data=data,
                     json_data=json_data,
@@ -260,8 +245,14 @@ class HTTPFetcher:
                     if not is_idempotent and response.status_code != 429:
                         return response
                     await self._backoff(attempt, response.headers.get("Retry-After"))
+                    if client is not None:
+                        client.cookies.clear()
                     if on_retry is not None:
                         await on_retry(attempt + 1)
+                    if cookie_rotator is not None and response.status_code in {403, 429, 503}:
+                        rotated = cookie_rotator(attempt + 1)
+                        if rotated is not None:
+                            active_profile = rotated
                     continue
                 return response
             except TransportFailure as exc:
@@ -269,6 +260,8 @@ class HTTPFetcher:
                 if not exc.error.retryable or attempt >= self.retries or not is_idempotent:
                     raise
                 await self._backoff(attempt)
+                if client is not None:
+                    client.cookies.clear()
                 if on_retry is not None:
                     await on_retry(attempt + 1)
         # Unreachable: every loop iteration either ``continue``-s, ``return``-s,
@@ -283,46 +276,56 @@ class HTTPFetcher:
         method: str = "GET",
         client: httpx.AsyncClient | None = None,
         headers: dict[str, str] | None = None,
-        cookies: dict[str, str] | None = None,
+        cookie_profile: CookieProfile | None = None,
+        initial_site: str | None = None,
         content: bytes | str | None = None,
         data: dict[str, Any] | None = None,
         json_data: Any = None,
         has_proxy: bool = False,
     ) -> HTTPResponse:
-        client = client or self.client
+        assert client is not None
         current_url = url
         current_method = method.upper()
         current_content = content
         current_data = data
         current_json = json_data
-        current_cookies: dict[str, str] | None = dict(cookies) if cookies else None
-        # Operate on a working copy so the caller's dict is never mutated.
-        # Initialize from headers or self.client.headers so all required request headers
-        # are present while allowing _strip_credentials to cleanly remove credentials
-        # on cross-origin redirects without interference from client-level headers.
+        effective_site = initial_site or registrable_host(url) or (urlsplit(url).hostname or "").lower()
         current_headers: dict[str, str] = dict(
-            headers if headers is not None else self.client.headers
+            headers if headers is not None else self.default_headers
         )
         redirect_count = 0
+        server_set_names: set[str] = set()
         while True:
+            hop_cookies: dict[str, str] = {}
+            if cookie_profile is not None:
+                for k, v in cookie_profile.to_http_cookies(
+                    current_url, initial_site=effective_site
+                ).items():
+                    if k not in server_set_names:
+                        hop_cookies[k] = v
             try:
                 async with client.stream(
                     current_method,
                     current_url,
                     headers=current_headers,
-                    cookies=current_cookies,
+                    cookies=hop_cookies if hop_cookies else None,
                     content=current_content,
                     data=current_data,
                     json=current_json,
                 ) as response:
                     # Pre-flight redirect handling. ``follow_redirects`` is
-                    # forced off on every httpx client (see ``HTTPFetcher.fetch``
-                    # and ``PageFetch._http_fetcher``) so the SSRF guard has
-                    # the final say before a single byte is sent to the next
-                    # hop.  Without this loop a 302 to ``http://127.0.0.1`` or
+                    # forced off on every per-operation httpx client so the SSRF
+                    # guard has the final say before a single byte is sent to the
+                    # next hop. Without this loop a 302 to ``http://127.0.0.1`` or
                     # ``http://169.254.169.254`` would race the connection
                     # open and render any post-response host check useless.
                     if response.status_code in REDIRECT_STATUS_CODES:
+                        for raw_sc in response.headers.get_list("set-cookie"):
+                            head = raw_sc.split(";", 1)[0]
+                            if "=" in head:
+                                sc_name = head.split("=", 1)[0].strip()
+                                if sc_name:
+                                    server_set_names.add(sc_name)
                         if redirect_count >= self.max_redirects:
                             raise TransportFailure(
                                 FetchErrorInfo(
@@ -383,7 +386,6 @@ class HTTPFetcher:
                         if _is_cross_origin(current_url, next_url):
                             if current_headers is not None:
                                 current_headers = _strip_credentials(current_headers)
-                            current_cookies = None
                         current_url = next_url
                         redirect_count += 1
                         continue
@@ -393,27 +395,27 @@ class HTTPFetcher:
                             FetchErrorInfo("content_too_large", "response exceeds maximum content size", False),
                             status_code=response.status_code,
                         )
-                    # Early check for unsupported binary types to avoid downloading large bodies
                     ct_header = response.headers.get("Content-Type", "")
-                    normalized_ct = ct_header.split(";")[0].strip().lower()
-                    clean_path = urlsplit(str(response.url)).path.lower()
-                    cd_header = response.headers.get("Content-Disposition", "").lower()
-                    doc_extensions = (".pdf", ".docx", ".csv", ".tsv", ".json", ".xml", ".txt", ".md", ".html", ".htm")
-                    is_doc_ext = clean_path.endswith(doc_extensions) or any(ext in cd_header for ext in doc_extensions)
-                    unsupported_binary = (
-                        normalized_ct.startswith(("video/", "audio/"))
-                        or (normalized_ct.startswith("image/") and normalized_ct != "image/svg+xml")
-                        or (normalized_ct in {"application/zip", "application/x-zip-compressed", "application/x-rar-compressed", "application/x-7z-compressed", "application/gzip", "application/x-tar"} and not is_doc_ext)
-                    )
-                    if unsupported_binary and response.status_code < 400:
-                        raise TransportFailure(
-                            FetchErrorInfo(
-                                "unsupported_content_type",
-                                f"Content type {normalized_ct!r} is an unsupported binary format",
-                                False,
-                            ),
-                            status_code=response.status_code,
+                    if response.status_code < 400:
+                        from ..processing.pipeline import (
+                            is_unsupported_binary_response,
+                            parse_content_type,
                         )
+
+                        if is_unsupported_binary_response(
+                            ct_header,
+                            str(response.url),
+                            response.headers.get("Content-Disposition", ""),
+                        ):
+                            normalized_ct = parse_content_type(ct_header)
+                            raise TransportFailure(
+                                FetchErrorInfo(
+                                    "unsupported_content_type",
+                                    f"Content type {normalized_ct!r} is an unsupported binary format",
+                                    False,
+                                ),
+                                status_code=response.status_code,
+                            )
                     chunks: list[bytes] = []
                     size = 0
                     max_read_size = 4096 if response.status_code >= 400 else self.max_content_size

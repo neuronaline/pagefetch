@@ -8,13 +8,14 @@ from typing import Any, Literal
 
 from bs4 import BeautifulSoup
 
-from ..models import ImageInfo, LinkInfo
+from ..models import ExpandedSection, ImageInfo, LinkInfo
 from .cleaner import clean_html, unwrap_fallbacks
 from .detector import ConfidenceReport, analyze_html
 from .images import extract_images
 from .links import extract_links
 from .markdown import html_to_markdown
 from .metadata import extract_metadata
+from .sections import extract_sections
 
 
 @dataclass(slots=True)
@@ -27,6 +28,7 @@ class ProcessedHTML:
     images: list[ImageInfo]
     confidence: ConfidenceReport
     warnings: list[str]
+    sections: list[ExpandedSection]
 
 
 def process_html(
@@ -54,7 +56,8 @@ def process_html(
     unwrap_fallbacks(raw_soup)
     links = extract_links(raw_soup, base_url)
     images = extract_images(raw_soup, base_url)
-    cleaned = clean_html(raw_soup, cleaning_level, copy=False)
+    cleaned = clean_html(raw_soup, cleaning_level, copy=False, fallbacks_unwrapped=True)
+    sections = extract_sections(cleaned, base_url)
     markdown = html_to_markdown(cleaned, base_url)
     text_root = cleaned.body if cleaned.body is not None else cleaned
     text = "\n".join(line.strip() for line in text_root.get_text("\n").splitlines() if line.strip())
@@ -67,6 +70,7 @@ def process_html(
         if len(fallback_text) >= max(100, len(text) * 3):
             markdown = html_to_markdown(fallback_soup, base_url)
             text = fallback_text
+            sections = extract_sections(fallback_soup, base_url)
     if not text.strip() and not markdown.strip() and confidence.score >= 0.20:
         reasons = tuple(dict.fromkeys((*confidence.reasons, "empty body after cleaning")))
         confidence = ConfidenceReport(
@@ -75,4 +79,4 @@ def process_html(
             challenge=confidence.challenge,
             javascript_shell=True,
         )
-    return ProcessedHTML(title, markdown, text, metadata, links, images, confidence, warnings)
+    return ProcessedHTML(title, markdown, text, metadata, links, images, confidence, warnings, sections)

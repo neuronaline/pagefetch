@@ -59,10 +59,12 @@ _BYTEFUL_SESSION_DURATION_SECONDS = (60, 7 * 24 * 3600)  # inclusive
 # process restarts.
 _PROCESS_SESSION_SEED: str = os.urandom(4).hex()
 
+from ..utils.cache_dict import BoundedTTLCache
+
 # Per-domain failure epoch counter. Incremented whenever a domain encounters
 # an anti-bot block or challenge so subsequent requests and retries immediately
 # rotate to a fresh residential exit IP.
-_DOMAIN_FAILURE_EPOCHS: dict[str, int] = {}
+_DOMAIN_FAILURE_EPOCHS: BoundedTTLCache[str, int] = BoundedTTLCache(max_size=2000)
 
 # Repurposed 2-letter TLDs that are used globally rather than for a specific country.
 _GENERIC_CCTLD_EXCLUSIONS: frozenset[str] = frozenset(
@@ -137,17 +139,12 @@ def accept_language_for_country(
 
 def bump_domain_session(domain: str) -> int:
     """Increment the failure epoch for *domain* so subsequent requests rotate to a new proxy session."""
-    key = domain.lower().strip(".")
-    epoch = _DOMAIN_FAILURE_EPOCHS.get(key, 0) + 1
-    _DOMAIN_FAILURE_EPOCHS[key] = epoch
-    if len(_DOMAIN_FAILURE_EPOCHS) > 2000:
-        _DOMAIN_FAILURE_EPOCHS.pop(next(iter(_DOMAIN_FAILURE_EPOCHS)))
-    return epoch
+    return _DOMAIN_FAILURE_EPOCHS.increment(domain.lower().strip("."))
 
 
 def get_domain_epoch(domain: str) -> int:
     """Return the current failure epoch for *domain*."""
-    return _DOMAIN_FAILURE_EPOCHS.get(domain.lower().strip("."), 0)
+    return _DOMAIN_FAILURE_EPOCHS.get(domain.lower().strip("."), 0) or 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -433,11 +430,3 @@ def resolve_proxy(provider: str) -> ProxySettings:
         f"unsupported proxy provider: {provider!r}. "
         f"Use one of: {sorted(VALID_PROXY_PROVIDERS)}"
     )
-
-
-def redact_proxy_url(value: str) -> str:
-    """Return a log-safe proxy URL with credentials masked."""
-    parsed = urlsplit(value)
-    host = parsed.hostname or ""
-    port = f":{parsed.port}" if parsed.port else ""
-    return urlunsplit((parsed.scheme, f"***:***@{host}{port}", "", "", ""))

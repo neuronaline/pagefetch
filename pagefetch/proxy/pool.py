@@ -1,4 +1,4 @@
-"""Bounded LRU pool for httpx.AsyncClient instances keyed by proxy URL."""
+"""Bounded LRU pool for ``httpx.AsyncHTTPTransport`` instances keyed by proxy URL."""
 
 from __future__ import annotations
 
@@ -11,159 +11,121 @@ import httpx
 logger = logging.getLogger("pagefetch.proxy.pool")
 
 _RESOURCE_CLOSE_TIMEOUT = 0.5
-_MAX_PROXY_HTTP_CLIENTS = 50
+_MAX_PROXY_TRANSPORTS = 50
 
 
-class _ProxyClientPool:
-    """Bounded LRU pool of ``httpx.AsyncClient`` instances keyed by proxy URL.
+class ProxyTransportPool:
+    """Bounded LRU pool of ``httpx.AsyncHTTPTransport`` instances keyed by proxy URL.
 
-    Evicted clients are scheduled for asynchronous ``aclose()`` on the
-    running event loop — the eviction path itself never blocks — and any
-    pending eviction tasks are awaited by :meth:`aclose_all` during the
-    outer :meth:`PageFetch.close` so no socket or FD leaks past teardown.
+    Evicted transports are scheduled for asynchronous ``aclose()`` on the
+    running event loop after any in-flight operations using them finish draining.
     """
 
-    __slots__ = ("_max_size", "_clients", "_eviction_tasks", "_in_flight", "_drain_events")
+    __slots__ = ("_max_size", "_transports", "_eviction_tasks", "_in_flight", "_drain_events")
 
-    def __init__(self, max_size: int = _MAX_PROXY_HTTP_CLIENTS) -> None:
+    def __init__(self, max_size: int = _MAX_PROXY_TRANSPORTS) -> None:
         self._max_size = max_size
-        self._clients: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
+        self._transports: OrderedDict[str, httpx.AsyncHTTPTransport] = OrderedDict()
         self._eviction_tasks: set[asyncio.Task[None]] = set()
-        self._in_flight: dict[httpx.AsyncClient, int] = {}
-        self._drain_events: dict[httpx.AsyncClient, asyncio.Event] = {}
+        self._in_flight: dict[httpx.AsyncHTTPTransport, int] = {}
+        self._drain_events: dict[httpx.AsyncHTTPTransport, asyncio.Event] = {}
 
-    def retain(self, client: httpx.AsyncClient) -> None:
-        """Mark *client* as actively handling an in-flight request."""
-        count = self._in_flight.get(client, 0) + 1
-        self._in_flight[client] = count
-        event = self._drain_events.get(client)
+    def retain(self, transport: httpx.AsyncHTTPTransport) -> None:
+        """Mark *transport* as actively handling an in-flight request."""
+        count = self._in_flight.get(transport, 0) + 1
+        self._in_flight[transport] = count
+        event = self._drain_events.get(transport)
         if event is not None and count > 0:
             event.clear()
 
-    def release(self, client: httpx.AsyncClient) -> None:
-        """Mark one in-flight request on *client* as completed."""
-        count = self._in_flight.get(client, 0) - 1
+    def release(self, transport: httpx.AsyncHTTPTransport) -> None:
+        """Mark one in-flight request on *transport* as completed."""
+        count = self._in_flight.get(transport, 0) - 1
         if count <= 0:
-            self._in_flight.pop(client, None)
-            event = self._drain_events.get(client)
+            self._in_flight.pop(transport, None)
+            event = self._drain_events.get(transport)
             if event is not None:
                 event.set()
         else:
-            self._in_flight[client] = count
+            self._in_flight[transport] = count
 
-    def in_flight(self, client: httpx.AsyncClient) -> int:
-        """Return the number of active in-flight requests on *client*."""
-        return self._in_flight.get(client, 0)
-
-    def __contains__(self, key: str) -> bool:
-        return key in self._clients
-
-    def __len__(self) -> int:
-        return len(self._clients)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, dict):
-            return dict(self._clients) == other
-        if isinstance(other, _ProxyClientPool):
-            return self._clients == other._clients
-        return NotImplemented
-
-    def __iter__(self):
-        return iter(self._clients)
-
-    def get(self, key: str) -> httpx.AsyncClient | None:
-        client = self._clients.get(key)
-        if client is not None:
-            self._clients.move_to_end(key)
-        return client
-
-    def values(self):
-        return self._clients.values()
+    def get(self, key: str) -> httpx.AsyncHTTPTransport | None:
+        transport = self._transports.get(key)
+        if transport is not None:
+            self._transports.move_to_end(key)
+        return transport
 
     def clear(self) -> None:
-        self._clients.clear()
+        self._transports.clear()
         self._in_flight.clear()
         self._drain_events.clear()
 
-    def put(self, key: str, client: httpx.AsyncClient) -> None:
-        """Insert *client* under *key*, evicting the oldest entry if needed.
-
-        Eviction schedules ``aclose()`` in the background and never blocks
-        the caller, so the hot path stays cheap even under heavy churn.
-        """
-        if key in self._clients:
-            old_client = self._clients[key]
-            if old_client is not client:
-                self._schedule_close(key, old_client)
-            self._clients[key] = client
-            self._clients.move_to_end(key)
+    def put(self, key: str, transport: httpx.AsyncHTTPTransport) -> None:
+        """Insert *transport* under *key*, scheduling non-blocking eviction if over capacity."""
+        if key in self._transports:
+            old_transport = self._transports[key]
+            if old_transport is not transport:
+                self._schedule_close(key, old_transport)
+            self._transports[key] = transport
+            self._transports.move_to_end(key)
             return
-        self._clients[key] = client
-        if len(self._clients) > self._max_size:
-            evicted_key, evicted_client = self._clients.popitem(last=False)
-            self._schedule_close(evicted_key, evicted_client)
+        self._transports[key] = transport
+        if len(self._transports) > self._max_size:
+            evicted_key, evicted_transport = self._transports.popitem(last=False)
+            self._schedule_close(evicted_key, evicted_transport)
 
-    def _schedule_close(self, key: str, client: httpx.AsyncClient) -> None:
+    def _schedule_close(self, key: str, transport: httpx.AsyncHTTPTransport) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop — nothing to schedule. The evicted client
-            # will be GC'd; httpx.AsyncClient does not hold native
-            # resources once it has never been opened.
             return
-        task = loop.create_task(self._safe_close(key, client))
+        task = loop.create_task(self._safe_close(key, transport))
         self._eviction_tasks.add(task)
         task.add_done_callback(self._eviction_tasks.discard)
 
-    async def _safe_close(self, key: str, client: httpx.AsyncClient) -> Exception | None:
-        if self._in_flight.get(client, 0) > 0:
-            event = self._drain_events.setdefault(client, asyncio.Event())
+    async def _safe_close(
+        self, key: str, transport: httpx.AsyncHTTPTransport
+    ) -> Exception | None:
+        if self._in_flight.get(transport, 0) > 0:
+            event = self._drain_events.setdefault(transport, asyncio.Event())
             try:
-                # Allow active requests to finish before closing connection pool
                 await asyncio.wait_for(event.wait(), timeout=5.0)
             except TimeoutError:
                 logger.warning(
-                    "proxy client %s in-flight requests did not drain within 5s before close",
+                    "proxy transport %s in-flight requests did not drain within 5s before close",
                     key,
                 )
             finally:
-                self._drain_events.pop(client, None)
-        self._in_flight.pop(client, None)
+                self._drain_events.pop(transport, None)
+        self._in_flight.pop(transport, None)
         try:
-            await asyncio.wait_for(client.aclose(), timeout=_RESOURCE_CLOSE_TIMEOUT)
+            await asyncio.wait_for(transport.aclose(), timeout=_RESOURCE_CLOSE_TIMEOUT)
             return None
         except TimeoutError as exc:
             logger.warning(
-                "proxy client %s close timed out after %.1f seconds",
+                "proxy transport %s close timed out after %.1f seconds",
                 key,
                 _RESOURCE_CLOSE_TIMEOUT,
             )
             return exc
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup
             logger.debug(
-                "evicted proxy client close failed (%s): %s",
+                "evicted proxy transport close failed (%s): %s",
                 key,
                 type(exc).__name__,
             )
             return exc
 
     async def aclose_all(self) -> list[BaseException | None]:
-        """Await pending evictions, then close every still-pooled client.
-
-        Returns the list of exceptions raised by individual ``aclose()`` calls
-        (or ``None`` for each successful close) so callers can log per-client
-        failures the same way they did for the previous gather-on-values
-        teardown loop.
-        """
-        clients = list(self._clients.values())
-        self._clients.clear()
+        """Await pending evictions, then close every still-pooled transport."""
+        transports = list(self._transports.values())
+        self._transports.clear()
         pending = list(self._eviction_tasks)
         self._eviction_tasks.clear()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         results = await asyncio.gather(
-            *(self._safe_close(f"pool-{i}", client) for i, client in enumerate(clients)),
+            *(self._safe_close(f"pool-{i}", t) for i, t in enumerate(transports)),
             return_exceptions=True,
         )
         return [r if isinstance(r, BaseException) else None for r in results]
-

@@ -1,4 +1,4 @@
-"""Shared rendering utilities for CLI and interactive modes."""
+"""Shared rendering utilities for CLI output."""
 
 from __future__ import annotations
 

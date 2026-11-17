@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -14,6 +15,7 @@ from ..fetching.http import HTTPResponse, TransportFailure
 from ..models import FetchErrorInfo, FetchResult
 from .detector import ConfidenceReport
 from .html import process_html
+from .sections import pop_section_attrs, render_clean_raw_html, restore_section_attrs
 from .non_html import (
     MissingOptionalDependency,
     process_csv,
@@ -67,72 +69,70 @@ def decode_response_body(response: HTTPResponse) -> str:
     return response.content.decode("utf-8", errors="replace")
 
 
+SUPPORTED_DOC_EXTENSIONS: tuple[str, ...] = (
+    ".pdf",
+    ".docx",
+    ".csv",
+    ".tsv",
+    ".json",
+    ".xml",
+    ".txt",
+    ".md",
+    ".html",
+    ".htm",
+)
+_UNSUPPORTED_ARCHIVE_TYPES: frozenset[str] = frozenset(
+    {
+        "application/zip",
+        "application/x-zip-compressed",
+        "application/x-rar-compressed",
+        "application/x-7z-compressed",
+        "application/gzip",
+        "application/x-tar",
+    }
+)
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+_EXTENSION_KIND_MAP: dict[str, str] = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".json": "json",
+    ".xml": "xml",
+    ".txt": "text",
+    ".md": "text",
+}
+
+
 def parse_content_type(header: str | None) -> str:
     """Extract normalized MIME type from Content-Type header."""
     return (header or "application/octet-stream").split(";", 1)[0].strip().lower()
 
 
-def is_pdf_content(content_type: str, content: bytes, url: str | None = None) -> bool:
-    """Check if content represents a PDF file by content-type, magic bytes, or URL."""
-    ct = parse_content_type(content_type)
-    if is_html_like(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
-        return False
-    if ct in ("application/pdf", "application/x-pdf") or (content and content.startswith(b"%PDF-")):
-        return True
-    if url:
-        clean_url = url.lower().split("?", 1)[0].split("#", 1)[0]
-        if clean_url.endswith(".pdf") and (not content or content.startswith(b"%PDF-")):
-            return True
-    return False
+def _clean_url_path(url: str | None) -> str:
+    if not url:
+        return ""
+    return urlsplit(url).path.lower()
 
 
-def is_docx_content(content_type: str, content: bytes, url: str | None = None) -> bool:
-    """Check if content represents a DOCX file by content-type, magic bytes, or URL."""
-    ct = parse_content_type(content_type)
-    if is_html_like(ct) or (looks_like_html(content) and not content.startswith(b"PK\x03\x04")):
-        return False
-    if ct == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        return True
-    if url and url.lower().split("?", 1)[0].endswith(".docx") and (not content or content.startswith(b"PK\x03\x04")):
-        return True
-    return bool(
-        content.startswith(b"PK\x03\x04")
-        and (b"word/document.xml" in content[:65536] or b"word/" in content[:65536])
+def is_unsupported_binary_response(
+    content_type: str,
+    url: str,
+    content_disposition: str = "",
+) -> bool:
+    """Return True when HTTP response headers indicate a non-text binary stream to abort early."""
+    normalized_ct = parse_content_type(content_type)
+    clean_path = _clean_url_path(url)
+    cd_lower = (content_disposition or "").lower()
+    is_doc_ext = clean_path.endswith(SUPPORTED_DOC_EXTENSIONS) or any(
+        ext in cd_lower for ext in SUPPORTED_DOC_EXTENSIONS
+    )
+    return (
+        normalized_ct.startswith(("video/", "audio/"))
+        or (normalized_ct.startswith("image/") and normalized_ct != "image/svg+xml")
+        or (normalized_ct in _UNSUPPORTED_ARCHIVE_TYPES and not is_doc_ext)
     )
 
 
-def is_csv_content(content_type: str, url: str | None = None) -> bool:
-    """Check if content represents CSV data."""
-    if content_type in ("text/csv", "application/csv"):
-        return True
-    return bool(url and url.lower().split("?", 1)[0].endswith(".csv"))
-
-
-def is_tsv_content(content_type: str, url: str | None = None) -> bool:
-    """Check if content represents TSV data."""
-    if content_type in ("text/tab-separated-values", "text/tsv"):
-        return True
-    return bool(url and url.lower().split("?", 1)[0].endswith(".tsv"))
-
-
-def is_json_content(content_type: str, url: str | None = None) -> bool:
-    """Check if content represents JSON data."""
-    if content_type in ("application/json", "text/json") or content_type.endswith("+json"):
-        return True
-    return bool(url and url.lower().split("?", 1)[0].endswith(".json"))
-
-
-def is_xml_content(content_type: str, url: str | None = None) -> bool:
-    """Check if content represents generic XML."""
-    if content_type in ("application/xml", "text/xml"):
-        return True
-    if "+xml" in content_type and content_type != "application/xhtml+xml":
-        return True
-    return bool(url and url.lower().split("?", 1)[0].endswith(".xml"))
-
-
-def is_html_like(content_type: str) -> bool:
-    """Return True when content_type should be processed as HTML."""
+def _is_html_mime(content_type: str) -> bool:
     return content_type in ("text/html", "application/xhtml+xml")
 
 
@@ -157,28 +157,48 @@ def looks_like_html(content: bytes) -> bool:
     )
 
 
-def detect_document_kind(content_type: str, content: bytes, url: str | None = None) -> str:
-    """Detect high-level document kind from content type, byte sniff, and URL."""
+def is_pdf_content(content_type: str, content: bytes, url: str | None = None) -> bool:
+    """Check if content represents a PDF file by content-type, magic bytes, or URL."""
     ct = parse_content_type(content_type)
-    if is_html_like(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
+    if _is_html_mime(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
+        return False
+    if ct in ("application/pdf", "application/x-pdf") or (content and content.startswith(b"%PDF-")):
+        return True
+    if _clean_url_path(url).endswith(".pdf") and (not content or content.startswith(b"%PDF-")):
+        return True
+    return False
+
+
+def detect_document_kind(content_type: str, content: bytes, url: str | None = None) -> str:
+    """Detect high-level document kind from declared MIME, magic bytes, and URL extension."""
+    ct = parse_content_type(content_type)
+    # Declared text/html or HTML byte sniff always beats misleading URL extensions (.md, .pdf).
+    if _is_html_mime(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
         return "html"
-    if is_pdf_content(content_type, content, url=url):
+    if is_pdf_content(ct, content, url=url):
         return "pdf"
-    if is_docx_content(content_type, content, url=url):
+
+    clean_path = _clean_url_path(url)
+    is_zip = bool(content and content.startswith(b"PK\x03\x04"))
+    if ct == _DOCX_MIME or (clean_path.endswith(".docx") and (not content or is_zip)):
         return "docx"
-    if is_csv_content(content_type, url=url):
+    if is_zip and (b"word/document.xml" in content[:65536] or b"word/" in content[:65536]):
+        return "docx"
+
+    if ct in ("text/csv", "application/csv"):
         return "csv"
-    if is_tsv_content(content_type, url=url):
+    if ct in ("text/tab-separated-values", "text/tsv"):
         return "tsv"
-    if is_json_content(content_type, url=url):
+    if ct in ("application/json", "text/json") or ct.endswith("+json"):
         return "json"
-    if is_xml_content(content_type, url=url):
+    if ct in ("application/xml", "text/xml") or ("+xml" in ct and ct != "application/xhtml+xml"):
         return "xml"
-    if (
-        ct.startswith("text/plain")
-        or (url and url.lower().split("?", 1)[0].endswith((".txt", ".md")))
-    ):
+    if ct.startswith("text/plain"):
         return "text"
+
+    for ext, kind in _EXTENSION_KIND_MAP.items():
+        if clean_path.endswith(ext):
+            return kind
     return "unknown"
 
 
@@ -236,13 +256,28 @@ def build_html_result(
     compact_structure: bool = False,
 ) -> FetchResult:
     """Transform raw HTML and metadata into a fully structured FetchResult."""
-    structure_source = soup if soup is not None else html
     limits = StructureLimits(compact=compact_structure) if compact_structure else None
-    structure = (
-        extract_structure(structure_source, final_url, limits=limits)
-        if include_structure
-        else None
-    )
+    # Capture clean raw HTML and structural summary BEFORE process_html mutates soup in place.
+    if soup is not None:
+        saved_section_attrs = pop_section_attrs(soup)
+        try:
+            clean_raw_html = str(soup) if saved_section_attrs else html
+            structure = (
+                extract_structure(soup, final_url, limits=limits)
+                if include_structure
+                else None
+            )
+        finally:
+            if saved_section_attrs:
+                restore_section_attrs(saved_section_attrs)
+    else:
+        clean_raw_html = render_clean_raw_html(html, None)
+        structure = (
+            extract_structure(clean_raw_html, final_url, limits=limits)
+            if include_structure
+            else None
+        )
+
     try:
         processed = process_html(
             html,
@@ -271,7 +306,7 @@ def build_html_result(
         encoding=encoding,
         title=processed.title,
         markdown=processed.markdown,
-        html=html,
+        html=clean_raw_html,
         text=processed.text,
         metadata=processed.metadata,
         links=processed.links,
@@ -282,6 +317,7 @@ def build_html_result(
         content_confidence=processed.confidence.score,
         fetched_at=datetime.now(UTC),
         warnings=processed.warnings,
+        sections=processed.sections or None,
     )
 
 
@@ -394,7 +430,7 @@ def build_xml_result(url: str, response: HTTPResponse, proxy: str) -> FetchResul
 
 
 def build_text_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
-    """Process a text/plain or JSON response and construct a FetchResult."""
+    """Process a plain-text or Markdown response and construct a FetchResult."""
     doc = process_text(response.content, response.encoding)
     return build_document_result(
         url,
@@ -404,4 +440,32 @@ def build_text_result(url: str, response: HTTPResponse, proxy: str) -> FetchResu
         "text",
         parse_content_type(response.headers.get("Content-Type")),
     )
+
+
+def build_non_html_result(
+    kind: str,
+    url: str,
+    response: HTTPResponse,
+    proxy: str,
+) -> FetchResult | None:
+    """Dispatch a classified non-HTML document response to its FetchResult builder."""
+    if kind == "pdf":
+        return build_pdf_result(url, response, proxy)
+    if kind == "docx":
+        return build_docx_result(url, response, proxy)
+    if kind in ("csv", "tsv"):
+        return build_csv_result(
+            url,
+            response,
+            proxy,
+            delimiter="\t" if kind == "tsv" else None,
+        )
+    if kind == "json":
+        return build_json_result(url, response, proxy)
+    if kind == "xml":
+        return build_xml_result(url, response, proxy)
+    if kind == "text":
+        return build_text_result(url, response, proxy)
+    return None
+
 

@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
-import threading
-import time
 from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import tldextract
+
+from .cache_dict import BoundedTTLCache
 
 _TLD_EXTRACT: tldextract.TLDExtract | None = None
 
@@ -32,8 +32,10 @@ def _get_tld_extract() -> tldextract.TLDExtract:
 # sub-resource requests do not hammer the resolver.
 _DNS_CACHE_TTL_SECONDS = 60.0
 _DNS_CACHE_MAX_SIZE = 2048
-_DNS_CACHE: dict[str, tuple[float, tuple[str, ...]]] = {}
-_DNS_CACHE_LOCK = threading.Lock()
+_DNS_CACHE: BoundedTTLCache[str, tuple[str, ...]] = BoundedTTLCache(
+    max_size=_DNS_CACHE_MAX_SIZE,
+    ttl=_DNS_CACHE_TTL_SECONDS,
+)
 
 
 def _ip_is_unsafe(ip_str: str) -> bool:
@@ -41,7 +43,6 @@ def _ip_is_unsafe(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
-        # An unparseable address is a hostile input by definition.
         return True
     ipv4_mapped = getattr(ip, "ipv4_mapped", None)
     if ipv4_mapped is not None and _ip_is_unsafe(str(ipv4_mapped)):
@@ -58,58 +59,33 @@ def _ip_is_unsafe(ip_str: str) -> bool:
 
 def _default_resolve_host_ips(hostname: str) -> list[str]:
     """Resolve *hostname* to its IPv4/IPv6 addresses via the system resolver."""
-    now = time.monotonic()
-    with _DNS_CACHE_LOCK:
-        cached = _DNS_CACHE.get(hostname)
-        if cached is not None and now - cached[0] < _DNS_CACHE_TTL_SECONDS:
-            return list(cached[1])
+    cached = _DNS_CACHE.get(hostname)
+    if cached is not None:
+        return list(cached)
     try:
-        # ``SOCK_STREAM`` mirrors what httpx would actually use; passing
-        # ``proto=0`` keeps the resolver free to pick any family.
         infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError, OSError):
         resolved: tuple[str, ...] = ()
     else:
         resolved = tuple(dict.fromkeys(info[4][0] for info in infos if info and info[4]))
     if resolved:
-        with _DNS_CACHE_LOCK:
-            if len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
-                expired = [k for k, v in _DNS_CACHE.items() if now - v[0] >= _DNS_CACHE_TTL_SECONDS]
-                for k in expired:
-                    del _DNS_CACHE[k]
-                while len(_DNS_CACHE) >= _DNS_CACHE_MAX_SIZE:
-                    _DNS_CACHE.pop(next(iter(_DNS_CACHE)))
-            _DNS_CACHE[hostname] = (now, resolved)
+        _DNS_CACHE.set(hostname, resolved)
     return list(resolved)
 
 
 def resolve_host_ips(hostname: str) -> list[str]:
-    """Public DNS-resolution hook.
-
-    Exposed at module scope so tests (and any future policy override) can
-    monkeypatch the resolution source without reaching into private state.
-    """
+    """Public DNS-resolution hook."""
     return _default_resolve_host_ips(hostname)
 
 
-def is_safe_host(hostname: str, *, resolve_dns: bool = True) -> bool:
-    """Return False if hostname resolves to a restricted network address.
+_DEFAULT_RESOLVE_HOOK = resolve_host_ips
 
-    Textual filters catch the obvious cases (``localhost``, ``.local``).
-    Literal IP literals are inspected directly. When ``resolve_dns`` is True,
-    any other hostname is resolved through the system resolver and rejected
-    if **any** of the returned addresses falls inside a private, loopback,
-    link-local, multicast, reserved, or unspecified range. When ``resolve_dns``
-    is False (e.g. when an outbound proxy is used), DNS lookups are skipped
-    to prevent DNS leaks, but localhost and private literal IPs are still blocked.
-    This closes the DNS-rebinding / wildcard-hostname (e.g.
-    ``127.0.0.1.nip.io``) SSRF bypass that the previous textual-only
-    implementation allowed through ``except ValueError: pass``.
-    """
+
+def _precheck_host_safety(hostname: str, *, resolve_dns: bool) -> bool | str:
+    """Validate host literals synchronously; return normalized host only when DNS lookup is needed."""
     host = hostname.strip().lower().rstrip(".")
     if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
         return False
-    # Literal IP — inspect directly (strip optional brackets for IPv6).
     clean_ip = host[1:-1] if host.startswith("[") and host.endswith("]") else host
     try:
         ipaddress.ip_address(clean_ip)
@@ -118,35 +94,30 @@ def is_safe_host(hostname: str, *, resolve_dns: bool = True) -> bool:
         pass
     if not resolve_dns:
         return True
-    # Domain name — resolve and check every returned address.
-    resolved = resolve_host_ips(host)
+    return host
+
+
+def is_safe_host(hostname: str, *, resolve_dns: bool = True) -> bool:
+    """Return False if hostname resolves to a restricted network address."""
+    verdict = _precheck_host_safety(hostname, resolve_dns=resolve_dns)
+    if isinstance(verdict, bool):
+        return verdict
+    resolved = resolve_host_ips(verdict)
     if not resolved:
-        # If DNS cannot resolve the host, return True so the transport layer
-        # (httpx/browser) can attempt connection and classify/retry transient
-        # DNS errors as dns_error rather than SSRF violations.
         return True
     return not any(_ip_is_unsafe(ip) for ip in resolved)
 
 
 async def async_is_safe_host(hostname: str, *, resolve_dns: bool = True) -> bool:
-    """Non-blocking async variant of is_safe_host running DNS in a thread pool."""
-    host = hostname.strip().lower().rstrip(".")
-    if not host or host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
-        return False
-    clean_ip = host[1:-1] if host.startswith("[") and host.endswith("]") else host
-    try:
-        ipaddress.ip_address(clean_ip)
-        return not _ip_is_unsafe(clean_ip)
-    except ValueError:
-        pass
-    if not resolve_dns:
-        return True
-    now = time.monotonic()
-    with _DNS_CACHE_LOCK:
-        cached = _DNS_CACHE.get(host)
-        if cached is not None and now - cached[0] < _DNS_CACHE_TTL_SECONDS:
-            return not any(_ip_is_unsafe(ip) for ip in cached[1]) if cached[1] else True
-    return await asyncio.to_thread(is_safe_host, host, resolve_dns=True)
+    """Non-blocking async variant of :func:`is_safe_host` running DNS in a thread pool."""
+    verdict = _precheck_host_safety(hostname, resolve_dns=resolve_dns)
+    if isinstance(verdict, bool):
+        return verdict
+    if resolve_host_ips is _DEFAULT_RESOLVE_HOOK:
+        cached = _DNS_CACHE.get(verdict)
+        if cached is not None:
+            return not any(_ip_is_unsafe(ip) for ip in cached) if cached else True
+    return await asyncio.to_thread(is_safe_host, verdict, resolve_dns=True)
 
 
 def validate_url(url: str, *, check_ssrf: bool = True, resolve_dns: bool = True) -> SplitResult:
@@ -172,9 +143,10 @@ def validate_url(url: str, *, check_ssrf: bool = True, resolve_dns: bool = True)
     return parsed
 
 
-def normalize_url(url: str) -> str:
+def normalize_url(url: str, *, parsed: SplitResult | None = None) -> str:
     """Normalize an HTTP URL without changing query semantics."""
-    parsed = validate_url(url, check_ssrf=False)
+    if parsed is None:
+        parsed = validate_url(url, check_ssrf=False)
     scheme = parsed.scheme.lower()
     hostname = (parsed.hostname or "").lower().rstrip(".")
     try:

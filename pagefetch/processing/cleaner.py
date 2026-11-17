@@ -31,6 +31,8 @@ from typing import Literal
 from bs4 import BeautifulSoup, NavigableString, Tag
 from bs4.element import TemplateString
 
+from .sections import HIDDEN_STYLE_RE as _HIDDEN_STYLE_RE, promote_static_panels, unhide_tag
+
 _NOISE_RE = re.compile(
     r"(?:^|[-_\s])(cookie[-_\s]?(?:banner|consent|notice|law|bar|modal|popup|dialog|overlay|wrap(?:per)?|container)|"
     r"consent[-_\s]?(?:banner|modal|popup|overlay|root|wrapper|bar|dialog)|"
@@ -69,15 +71,28 @@ _SITE_CHROME_RE = re.compile(
     r"(?:^|[-_\s])(site-header|site-footer|page-footer|masthead)(?:$|[-_\s])",
     re.IGNORECASE,
 )
-# Recognized CSS declarations that hide a block from sighted users.  Operates
-# on a pre-normalized style string (lower-cased, whitespace stripped, with
-# declarations separated by ``;``) so matching stays cheap.  Anchoring on
-# declaration boundaries prevents false positives like ``display:none-block``
-# — a non-standard value but observed in the wild — from triggering the
-# hidden-element branch.
-_HIDDEN_STYLE_RE = re.compile(
-    r"(?:^|;)(display|visibility):(none|hidden)(?:!important)?(?:;|$)",
+_DISCLOSURE_PANEL_RE = re.compile(
+    r"(?:^|[-_\s])(tab[-_]?pane|tab[-_]?panel|tab[-_]?content|ant-tabs-tabpane|"
+    r"accordion[-_]?(?:collapse|body|content|panel)|collapse[-_]?(?:body|content|panel)|"
+    r"read[-_]?more[-_]?(?:content|text|body)|show[-_]?more[-_]?(?:content|text|body)|"
+    r"more[-_]?text|expanded[-_]?content|spoiler[-_]?(?:content|body))(?:$|[-_\s])",
     re.IGNORECASE,
+)
+_NON_CONTENT_ROLES = frozenset(
+    {
+        "dialog",
+        "alertdialog",
+        "menu",
+        "menubar",
+        "navigation",
+        "banner",
+        "contentinfo",
+        "tooltip",
+        "status",
+        "alert",
+        "combobox",
+        "listbox",
+    }
 )
 _VALID_CLEANING_LEVELS = frozenset({"minimal", "standard", "maximum"})
 _JS_NOTICE_PHRASES = (
@@ -214,11 +229,70 @@ def _class_list(tag: Tag) -> list[str]:
     return [str(item) for item in (tag.get_attribute_list("class") or []) if item]
 
 
+def is_substantive_hidden_content(tag: Tag) -> bool:
+    """Return True when a CSS-hidden ``tag`` holds legitimate tab/disclosure content."""
+    if not isinstance(tag, Tag) or tag.attrs is None or not tag.parent:
+        return False
+    if tag.name in {
+        "html", "body", "head", "script", "style", "noscript", "template",
+        "svg", "iframe", "input", "select", "textarea", "meta", "link", "img",
+    }:
+        return False
+
+    role = str(tag.get("role", "")).lower()
+    if role in _NON_CONTENT_ROLES or str(tag.get("aria-modal", "")).lower() == "true":
+        return False
+
+    classes = " ".join(_class_list(tag))
+    identity = f"{tag.get('id', '')} {classes}"
+    if (
+        _NOISE_RE.search(identity) is not None
+        or _AD_RE.search(identity) is not None
+        or _SITE_CHROME_RE.search(identity) is not None
+        or _SIDEBAR_RE.search(identity) is not None
+    ):
+        return False
+
+    in_content = _inside_content(tag)
+    for parent in tag.parents:
+        if not isinstance(parent, Tag) or parent.attrs is None:
+            continue
+        p_role = str(parent.get("role", "")).lower()
+        if p_role in _NON_CONTENT_ROLES or str(parent.get("aria-modal", "")).lower() == "true":
+            return False
+        if parent.name in {"nav", "footer"} and not in_content:
+            return False
+        p_ident = f"{parent.get('id', '')} {' '.join(_class_list(parent))}"
+        if _NOISE_RE.search(p_ident) is not None or _AD_RE.search(p_ident) is not None:
+            return False
+
+    text = tag.get_text(" ", strip=True)
+    if len(text) < 20 or is_js_notice_text(text) or ("{{" in text and "}}" in text):
+        return False
+
+    is_explicit_panel = (
+        role == "tabpanel"
+        or getattr(tag.parent, "name", None) == "details"
+        or tag.has_attr("data-tab-panel")
+        or tag.has_attr("data-tab-content")
+        or _DISCLOSURE_PANEL_RE.search(identity) is not None
+    )
+    if is_explicit_panel:
+        return True
+
+    return (
+        in_content
+        and len(text) >= 120
+        and tag.find(["p", "table", "dl", "pre", "blockquote"]) is not None
+    )
+
+
 def clean_html(
     html: str | BeautifulSoup,
     cleaning_level: Literal["minimal", "standard", "maximum"] = "standard",
     *,
     copy: bool = False,
+    fallbacks_unwrapped: bool = False,
 ) -> BeautifulSoup:
     """Remove only strongly identified non-content from an HTML document.
 
@@ -233,6 +307,8 @@ def clean_html(
     :param copy: When False (default) and *html* is a :class:`BeautifulSoup`, cleaning operates
         in-place directly on the tree to avoid deep copying overhead. Pass ``copy=True`` when the
         caller requires an independent copy and wishes to preserve the original tree unmodified.
+    :param fallbacks_unwrapped: Set True when the caller already invoked :func:`unwrap_fallbacks`
+        on *html* to avoid a redundant pass.
     """
     if cleaning_level not in _VALID_CLEANING_LEVELS:
         raise ValueError(f"cleaning_level must be one of {sorted(_VALID_CLEANING_LEVELS)}")
@@ -246,7 +322,13 @@ def clean_html(
         else (html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, "lxml"))
     )
 
-    unwrap_fallbacks(soup)
+    if not fallbacks_unwrapped or isinstance(html, str):
+        unwrap_fallbacks(soup)
+    promote_static_panels(
+        soup,
+        is_substantive_hidden=is_substantive_hidden_content,
+        is_hidden_style=lambda s: bool(_HIDDEN_STYLE_RE.search(s)),
+    )
 
     is_standard_or_max = cleaning_level in ("standard", "maximum")
     is_maximum = cleaning_level == "maximum"
@@ -254,12 +336,18 @@ def clean_html(
     for tag in list(soup.find_all(True)):
         if not isinstance(tag, Tag) or tag.parent is None or tag.attrs is None:
             continue
-        style = str(tag.get("style", "")).replace(" ", "").lower()
+        style = str(tag.get("style", "")).lower()
         hidden = tag.has_attr("hidden") or bool(_HIDDEN_STYLE_RE.search(style))
         tiny_image = tag.name == "img" and str(tag.get("width")) == "1" and str(tag.get("height")) == "1"
-        if hidden or tiny_image:
+        if tiny_image:
             tag.decompose()
             continue
+        if hidden:
+            if is_substantive_hidden_content(tag):
+                unhide_tag(tag)
+            else:
+                tag.decompose()
+                continue
         if not is_standard_or_max or tag.name in {"html", "body", "h1", "h2", "h3", "h4", "h5", "h6"}:
             continue
 
@@ -343,16 +431,3 @@ def _should_remove_boilerplate_tag(tag: Tag, identity: str, *, is_maximum: bool 
         or is_outside_content_header_or_footer
         or is_auxiliary_block
     )
-
-
-def _remove_boilerplate(soup: BeautifulSoup, *, is_maximum: bool = False) -> None:
-    """Remove explicit page chrome, navigation, footers, sidebars, and auxiliary content blocks."""
-    for tag in list(soup.find_all(True)):
-        if not isinstance(tag, Tag) or tag.parent is None or tag.attrs is None:
-            continue
-        identity = f"{tag.get('id', '')} {' '.join(_class_list(tag))}"
-        if _should_remove_boilerplate_tag(tag, identity, is_maximum=is_maximum):
-            tag.decompose()
-
-
-_remove_maximum_blocks = _remove_boilerplate

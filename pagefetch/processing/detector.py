@@ -9,7 +9,18 @@ from dataclasses import dataclass
 from bs4 import BeautifulSoup, Comment, Doctype, NavigableString, Tag
 from bs4.element import CData, TemplateString
 
-from .cleaner import _HIDDEN_STYLE_RE, is_js_notice_text, is_substantive_template
+from .challenges import (
+    CHALLENGE_DOM_TOKENS as CHALLENGE_DOM_PATTERNS,
+    STRONG_CHALLENGE_PHRASES as STRONG_CHALLENGE_PATTERNS,
+    WEAK_CHALLENGE_PHRASES as WEAK_CHALLENGE_PATTERNS,
+    detect_challenge_provider as detect_challenge_provider,
+)
+from .cleaner import (
+    _HIDDEN_STYLE_RE,
+    is_js_notice_text,
+    is_substantive_hidden_content,
+    is_substantive_template,
+)
 
 _VISIBLE_STRING_TYPES = (NavigableString, CData, TemplateString)
 
@@ -22,96 +33,6 @@ _BARE_DOMAIN_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
-STRONG_CHALLENGE_PATTERNS = (
-    "checking your browser",
-    "verify you are human",
-    "attention required",
-    "just a moment",
-    "enter the characters you see below",
-    "type the characters you see in this image",
-    "cookies must be enabled",
-    "enable cookies for",
-    # ── Turkish ── Cloudflare/Akamai localizations and Turkish-origin WAFs
-    "bir dakika lütfen",
-    "robot olmadığınızı doğrulayın",
-    "robot olmadığınızı doğruluyoruz",
-    "erişim engellendi",
-    "güvenlik kontrolü",
-    # ── Russian ──
-    "проверка вашего браузера",
-    "подтвердите, что вы не робот",
-    "доступ запрещён",
-    "доступ ограничен",
-    # ── German ──
-    "wir überprüfen ihren browser",
-    "bitte bestätigen sie, dass sie kein bot sind",
-    "zugriff verweigert",
-    # ── French ──
-    "nous vérifions votre navigateur",
-    "vérifiez que vous êtes humain",
-    "accès refusé",
-    # ── Spanish / Portuguese / Italian ──
-    "verificando tu navegador",
-    "verifica que no eres un robot",
-    "acceso denegado",
-    # ── Chinese (Simplified) ──
-    "正在验证您的浏览器",
-    "请验证您是真人",
-    "访问被拒绝",
-    # ── Japanese ──
-    "ブラウザを確認しています",
-    "あなたが人間であることを確認",
-    "アクセス拒否",
-)
-WEAK_CHALLENGE_PATTERNS = (
-    "access denied",
-    "unusual traffic",
-    "captcha",
-    # Multilingual variants of the same weak signals.  Sourced from the
-    # localized challenge pages of Cloudflare, Akamai, DataDome, PerimeterX.
-    "erişim reddedildi",
-    "доступ закрыт",
-    "доступ отклонён",
-    "zugriff blockiert",
-    "suspicious activity",
-    "anormal trafik",
-    "необычный трафик",
-    "ungewöhnlicher datenverkehr",
-    "trafic inhabituel",
-    "tráfico inusual",
-    "异常流量",
-    "通常でないトラフィック",
-    "rate limit",
-    "rate-limited",
-    "too many requests",
-    "çok fazla istek",
-    "слишком много запросов",
-    "zu viele anfragen",
-    "trop de requêtes",
-    "demasiadas solicitudes",
-    "请求过多",
-    "リクエストが多すぎます",
-)
-# DOM-level challenge markers that are safe to scan in raw HTML
-CHALLENGE_DOM_PATTERNS = (
-    "cf-chl-",
-    "g-recaptcha",
-    "h-captcha",
-    "cf-turnstile",
-    "challenge-form",
-    "challenge-error-text",
-    "challenge-stage",
-    "challenge-running",
-    "_cf_chl_opt",
-    "validatecaptcha",
-    "/_pow/solve",
-    "__identity_pow_cookie_check",
-    "challengeid",
-    "challengedomain",
-    "cookie-required",
-    "recaptchachallengepageui",
-    "grecaptcha.enterprise.execute",
-)
 JS_PATTERNS = (
     "enable javascript",
     "javascript is required",
@@ -183,9 +104,10 @@ def analyze_html(html: str, *, soup: BeautifulSoup | None = None) -> ConfidenceR
     for tag in soup.find_all(True):
         if not isinstance(tag, Tag) or tag.attrs is None:
             continue
-        style_attr = str(tag.get("style", "")).replace(" ", "").lower()
+        style_attr = str(tag.get("style", "")).lower()
         if tag.has_attr("hidden") or bool(_HIDDEN_STYLE_RE.search(style_attr)):
-            hidden_ids.add(id(tag))
+            if not is_substantive_hidden_content(tag):
+                hidden_ids.add(id(tag))
         elif (
             str(tag.get("aria-hidden", "")).lower() == "true"
             and tag.name not in {"html", "body", "main", "article"}

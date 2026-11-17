@@ -23,9 +23,9 @@ BROWSER_HEADERS = {
     "TE": "trailers",
 }
 
-# Per-OS Firefox User-Agent pools.  ``client.py`` picks the pool matching
-# the runtime's ``sys.platform`` so outgoing HTTP requests declare an OS
-# consistent with the host (mismatched OS fingerprints are a known
+# Per-OS Firefox User-Agent pools.  ``TransportManager`` picks the pool
+# matching the runtime's ``sys.platform`` so outgoing HTTP requests declare an
+# OS consistent with the host (mismatched OS fingerprints are a known
 # bot-detection signal).  The Camoufox browser fallback sets its own
 # User-Agent independently, so this pool only governs httpx requests.
 _UA_POOL_BY_OS: dict[str, tuple[str, ...]] = {
@@ -58,36 +58,11 @@ VALID_HTTP_METHODS = frozenset(
 # SSRF guard can validate each ``Location`` header before the next hop.
 REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
 
-XML_TYPES = ("application/xml", "text/xml", "+xml")
 SAFE_RESPONSE_HEADERS = frozenset(
     {"cache-control", "content-language", "content-location", "date", "etag", "last-modified"}
 )
 
-WAF_CHALLENGE_MARKERS: tuple[bytes, ...] = (
-    b"cf-chl-bypass",
-    b"cf_chl_opt",
-    b"__cf_chl_jschl_tk__",
-    b"challenge-running",
-    b"checking your browser",
-    b"verify you are human",
-    b"just a moment",
-    b"attention required",
-    b"access denied",
-    b"akamai bot manager",
-    b"perimeterx",
-    b"datadome",
-    b"kasada",
-    b"px-captcha",
-    b"/_pow/solve",
-    b"__identity_pow_cookie_check",
-    b"recaptchachallengepageui",
-    b"grecaptcha.enterprise.execute",
+from .processing.challenges import (  # noqa: E402
+    WAF_CHALLENGE_MARKERS as WAF_CHALLENGE_MARKERS,
+    looks_like_waf_challenge as looks_like_waf_challenge,
 )
-
-
-def looks_like_waf_challenge(content: bytes) -> bool:
-    """Return True when *content* carries WAF challenge markers in the first 8 KiB."""
-    if not content:
-        return False
-    head = content[:8192].lower()
-    return any(marker in head for marker in WAF_CHALLENGE_MARKERS)

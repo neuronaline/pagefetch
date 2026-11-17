@@ -10,6 +10,7 @@ import sys
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from .client import PageFetch
 from .config import (
@@ -22,11 +23,12 @@ from .config import (
     VALID_SCREENSHOT_MODES,
     VALID_SESSION_ROTATION,
     VALID_STEALTH_LEVELS,
-    _UNSET,
     PageFetchConfig,
+    _normalize_headers_input,
+    merge_headers,
 )
 from .fetching.actions import normalize_actions
-from .models import FetchResult, PageAction
+from .models import PageAction
 from .utils.rendering import render_results
 from .utils.urls import read_urls_from_file
 
@@ -154,7 +156,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         dest="cookies",
         metavar="COOKIE",
-        help="Custom cookie in 'name=value' format (repeatable)",
+        help="Custom cookie or header profile in 'name=value' or 'k1=v1; k2=v2' format (repeatable)",
+    )
+    parser.add_argument(
+        "--cookie-file",
+        type=Path,
+        dest="cookie_file",
+        default=argparse.SUPPRESS,
+        metavar="PATH",
+        help="Path to Netscape cookies.txt or line-delimited Cookie header file",
+    )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        dest="expand",
+        help="Automatically expand 'Read more' disclosures, accordions, and dynamic tabs (forces mode=browser)",
+    )
+    parser.add_argument(
+        "--no-expand",
+        action="store_false",
+        default=argparse.SUPPRESS,
+        dest="expand",
+        help="Disable automatic disclosure and tab expansion",
     )
     parser.add_argument(
         "-d",
@@ -211,20 +235,18 @@ def _inputs(value: str) -> list[str]:
     return [value]
 
 
-parse_input_urls = _inputs
-
-
-
 def _build_config(args: argparse.Namespace) -> PageFetchConfig:
-    """Build configuration from YAML file (if provided) with CLI overrides."""
-    config = (
-        PageFetchConfig.from_yaml(args.config)
+    """Build configuration from YAML file (if provided) with CLI overrides in one pass."""
+    flat: dict[str, Any] = (
+        PageFetchConfig._read_yaml_dict(args.config)
         if getattr(args, "config", None)
-        else PageFetchConfig()
+        else {}
     )
 
-    known_fields = set(PageFetchConfig.__dataclass_fields__.keys())
-    cli_overrides = {
+    known_fields = {
+        name for name, f in PageFetchConfig.__dataclass_fields__.items() if f.init
+    }
+    cli_overrides: dict[str, Any] = {
         k: v for k, v in vars(args).items()
         if k in known_fields and v is not None
     }
@@ -233,46 +255,25 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
     if getattr(args, "no_cache", False):
         cli_overrides["cache_enabled"] = False
 
-    if not cli_overrides:
-        return config
+    if "stealth_level" in cli_overrides:
+        for preset_field in (
+            "block_level",
+            "humanize",
+            "session_rotation",
+            "request_pacing",
+            "block_images",
+        ):
+            if preset_field not in cli_overrides:
+                flat.pop(preset_field, None)
 
-    preset_override = "stealth_level" in cli_overrides
-    preset_fields = {"block_level", "humanize", "session_rotation", "request_pacing"}
+    if "headers" in cli_overrides and "headers" in flat:
+        cli_overrides["headers"] = merge_headers(
+            _normalize_headers_input(flat.get("headers")),
+            _normalize_headers_input(cli_overrides["headers"]),
+        )
 
-    kwargs: dict[str, object] = {}
-    for field in known_fields:
-        if field in cli_overrides:
-            kwargs[field] = cli_overrides[field]
-        elif preset_override and field in preset_fields:
-            kwargs[field] = None
-        elif preset_override and field == "block_images":
-            kwargs[field] = _UNSET
-        else:
-            kwargs[field] = getattr(config, field)
-
-    return PageFetchConfig.build(**kwargs)
-
-
-def _parse_cli_headers(headers_list: list[str] | None) -> dict[str, str]:
-    if not headers_list:
-        return {}
-    res: dict[str, str] = {}
-    for h in headers_list:
-        if ":" in h:
-            k, v = h.split(":", 1)
-            res[k.strip()] = v.strip()
-    return res
-
-
-def _parse_cli_cookies(cookies_list: list[str] | None) -> dict[str, str]:
-    if not cookies_list:
-        return {}
-    res: dict[str, str] = {}
-    for c in cookies_list:
-        if "=" in c:
-            k, v = c.split("=", 1)
-            res[k.strip()] = v.strip()
-    return res
+    flat.update(cli_overrides)
+    return PageFetchConfig(**flat)
 
 
 async def run_batch(
@@ -286,7 +287,7 @@ async def run_batch(
     output: Path | None = None,
     method: str = "GET",
     headers: dict[str, str] | None = None,
-    cookies: dict[str, str] | None = None,
+    cookies: Any = None,
     content: bytes | str | None = None,
     data: dict[str, Any] | None = None,
     json_data: Any = None,
@@ -294,11 +295,6 @@ async def run_batch(
     capture_xhr: bool | str | Sequence[str] = False,
 ) -> int:
     """Run a fetch/extract batch using *config* and write results.
-
-    This is the shared execution core used by both the argparse ``cli.main``
-    path and the interactive wizard.  Callers own prompting, validation, and
-    any UI-specific concerns; this helper returns a process exit code so the
-    interactive menu can also surface a meaningful status to the terminal.
 
     Returns 0 on full success, 1 if every URL failed, 3 on partial failure.
     Validation errors (empty URL list, bad inputs) raise ``ValueError``.
@@ -308,7 +304,7 @@ async def run_batch(
     extract_structure = output_format in {"structure", "raw"}
     include_screenshot = screenshot != "none" and output_format in {"raw", "json"}
     use_extract = extract_structure or screenshot != "none"
-    use_browser = use_extract or bool(actions) or bool(capture_xhr)
+    use_browser = use_extract or bool(actions) or bool(capture_xhr) or config.expand
     effective_mode = "browser" if use_browser else config.mode
     if use_browser and config.mode != "browser":
         print(
@@ -385,8 +381,6 @@ async def _run(args: argparse.Namespace) -> int:
     screenshot_format = getattr(args, "screenshot_format", "png") or "png"
     config = _build_config(args)
 
-    headers = _parse_cli_headers(getattr(args, "headers", None)) or None
-    cookies = _parse_cli_cookies(getattr(args, "cookies", None)) or None
     raw_actions = getattr(args, "actions", None)
     actions = normalize_actions(raw_actions) if raw_actions else None
 
@@ -419,8 +413,6 @@ async def _run(args: argparse.Namespace) -> int:
         screenshot_format=screenshot_format,
         output=args.output,
         method=method,
-        headers=headers,
-        cookies=cookies,
         content=data_payload,
         json_data=json_payload,
         actions=actions,

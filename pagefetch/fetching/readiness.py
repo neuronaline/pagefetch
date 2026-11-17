@@ -7,6 +7,8 @@ import time
 from collections.abc import Callable
 from typing import Any, TypedDict
 
+from ..processing.challenges import JS_IN_PAGE_METRICS_PROBE
+
 
 class PageMetrics(TypedDict):
     text: int
@@ -22,73 +24,7 @@ async def in_page_metrics(page: Any) -> PageMetrics:
     and a second stability wait.
     """
     try:
-        result: dict[str, Any] = await page.evaluate(
-            r"""() => {
-                const body = document.body;
-                const bodyText = (body?.innerText || '').length;
-                const mains = document.querySelectorAll('main, article, [role="main"]');
-                let mainText = 0;
-                for (const el of mains) {
-                    mainText += (el.innerText?.length || 0);
-                }
-                const lowered = (body?.innerText || '').toLowerCase();
-                const title = (document.title || '').toLowerCase();
-                const bodyStyle = body ? window.getComputedStyle(body) : null;
-                const bodyHidden = !!(
-                    bodyStyle && (bodyStyle.visibility === 'hidden' || bodyStyle.display === 'none')
-                );
-                const hasChallengeDom = !!(
-                    document.querySelector(
-                        '#challenge-running, #challenge-stage, #challenge-form, #challenge-error-text, ' +
-                        '.cf-turnstile, [id^="cf-chl-widget"], ' +
-                        'iframe[src*="challenges.cloudflare.com"], form[action*="validateCaptcha" i], ' +
-                        'input[name="cf-turnstile-response"], ' +
-                        '#cookie-required, #__identity_pow_cookie_check, [id*="pow_cookie"]'
-                    )
-                );
-                let hasChallengeScript = false;
-                if (bodyText < 600) {
-                    const scripts = document.querySelectorAll('script');
-                    for (const s of scripts) {
-                        const sc = (s.textContent || '') + ' ' + (s.src || '');
-                        if (
-                            sc.includes('/_pow/solve') ||
-                            sc.includes('__identity_pow_cookie_check') ||
-                            sc.includes('RecaptchaChallengePageUi') ||
-                            sc.includes('grecaptcha.enterprise.execute') ||
-                            (sc.includes('challengeId') && sc.includes('location.reload'))
-                        ) {
-                            hasChallengeScript = true;
-                            break;
-                        }
-                    }
-                }
-                const host = (window.location.hostname || '').toLowerCase().replace(/^www\./, '');
-                const cleanTitle = title.trim().replace(/^www\./, '');
-                const isHostnameTitle = !!(host && cleanTitle === host && bodyText < 200);
-                const patterns = [
-                    'checking your browser', 'verify you are human', 'attention required',
-                    'just a moment', 'security check',
-                    'cookies must be enabled', 'enable cookies for', 'recaptchachallengepageui',
-                    'bir dakika lütfen', 'robot olmadığınızı', 'erişim engellendi',
-                    'güvenlik kontrolü', 'проверка вашего браузера', 'подтвердите, что вы не робот',
-                    'wir überprüfen ihren browser', 'bitte bestätigen sie', 'nous vérifions votre navigateur',
-                    'vérifiez que vous êtes humain', 'verificando tu navegador', 'verifica que no eres un robot',
-                    'cf-chl-', 'cf-turnstile', 'challenge-form',
-                    'enter the characters you see below', 'validatecaptcha'
-                ];
-                const hasChallengeText = patterns.some(p => lowered.includes(p) || title.includes(p));
-                const effectiveText = bodyHidden ? 0 : bodyText;
-                const challenge = (
-                    hasChallengeDom ||
-                    hasChallengeScript ||
-                    hasChallengeText ||
-                    isHostnameTitle ||
-                    title.includes('challenge')
-                ) && effectiveText < 600;
-                return {text: effectiveText, mainText: bodyHidden ? 0 : mainText, challenge};
-            }"""
-        )
+        result: dict[str, Any] = await page.evaluate(JS_IN_PAGE_METRICS_PROBE)
     except Exception:
         return PageMetrics(text=0, main_text=0, challenge=False)
     if not isinstance(result, dict):
@@ -159,23 +95,47 @@ async def wait_for_stability(
 async def controlled_scroll(
     page: Any,
     *,
-    max_scrolls: int = 6,
-    max_height: int = 80_000,
-    sleep_early: float = 0.10,
-    sleep_late: float = 0.15,
+    max_scrolls: int = 25,
+    max_height: int = 150_000,
+    sleep_early: float = 0.12,
+    sleep_late: float = 0.18,
+    deadline: float | None = None,
+    network_activity: Callable[[], tuple[int, float]] | None = None,
 ) -> bool:
-    """Perform bounded viewport scrolling. Return true when the limit is reached."""
+    """Scroll the main window to the bottom. Return True when a configured limit stops scrolling."""
     unchanged = 0
     previous_height = 0
+    previous_dom = 0
     for index in range(max_scrolls):
-        # Single evaluate: capture pre-scroll metrics *then* scroll, saving one IPC roundtrip.
+        if deadline is not None and time.monotonic() >= deadline:
+            try:
+                await page.evaluate("() => window.scrollTo(0, 0)")
+            except Exception:
+                pass
+            return True
         try:
             metrics = await page.evaluate(
                 """() => {
-                    const h = document.documentElement.scrollHeight;
-                    const vp = window.innerHeight;
-                    window.scrollBy(0, Math.max(vp * 0.9, 400));
-                    return {height: h, y: window.scrollY, viewport: vp};
+                    for (const root of [document.documentElement, document.body]) {
+                        if (!root) continue;
+                        const st = window.getComputedStyle(root);
+                        if (st.overflow === 'hidden' || st.overflowY === 'hidden') {
+                            root.style.setProperty('overflow', 'visible', 'important');
+                            root.style.setProperty('overflow-y', 'auto', 'important');
+                        }
+                    }
+                    const vp = window.innerHeight || 800;
+                    const prevY = window.scrollY || 0;
+                    const dom = document.getElementsByTagName('*').length;
+                    const step = Math.max(Math.floor(vp * 0.85), 400);
+                    window.scrollBy(0, step);
+                    const newY = window.scrollY || 0;
+                    const newH = Math.max(
+                        document.documentElement?.scrollHeight || 0,
+                        document.body?.scrollHeight || 0
+                    );
+                    const atBottom = (newY + vp >= newH - 5) || (newY === prevY && newH <= vp + 5);
+                    return {height: newH, y: newY, viewport: vp, dom, atBottom};
                 }"""
             )
         except Exception:
@@ -183,22 +143,54 @@ async def controlled_scroll(
         if not isinstance(metrics, dict):
             break
         height = int(metrics.get("height", 0))
+        viewport = int(metrics.get("viewport", 800))
+        dom_count = int(metrics.get("dom", 0))
+        at_bottom = bool(metrics.get("atBottom", False))
+
         if height > max_height:
             try:
                 await page.evaluate("() => window.scrollTo(0, 0)")
             except Exception:
                 pass
             return True
-        if index < 3:
-            await asyncio.sleep(sleep_early)
-        else:
-            await asyncio.sleep(sleep_late)
-        if (
-            height <= previous_height
-            and int(metrics.get("y", 0)) + int(metrics.get("viewport", 0)) >= height
-        ):
+
+        await asyncio.sleep(sleep_early if index < 4 else sleep_late)
+
+        if at_bottom:
+            # Allow in-flight lazy-load XHRs triggered at bottom to settle and grow scrollHeight.
+            if network_activity is not None:
+                wait_cap = time.monotonic() + 0.8
+                if deadline is not None:
+                    wait_cap = min(wait_cap, deadline)
+                while time.monotonic() < wait_cap:
+                    active, _ = network_activity()
+                    if active <= 0:
+                        break
+                    await asyncio.sleep(0.06)
+                await asyncio.sleep(0.04)
+            try:
+                post = await page.evaluate(
+                    """() => ({
+                        height: Math.max(
+                            document.documentElement?.scrollHeight || 0,
+                            document.body?.scrollHeight || 0
+                        ),
+                        dom: document.getElementsByTagName('*').length
+                    })"""
+                )
+            except Exception:
+                post = {}
+            post_height = int(post.get("height", height)) if isinstance(post, dict) else height
+            post_dom = int(post.get("dom", dom_count)) if isinstance(post, dict) else dom_count
+            if post_height > max(height, previous_height) + 16 or post_dom > max(dom_count, previous_dom) + 4:
+                unchanged = 0
+                previous_height = post_height
+                previous_dom = post_dom
+                continue
+
             unchanged += 1
-            if unchanged >= 2:
+            # Short single-viewport documents need only 1 verified bottom check; taller pages verify twice.
+            if (height <= viewport + 5 and unchanged >= 1) or unchanged >= 2:
                 try:
                     await page.evaluate("() => window.scrollTo(0, 0)")
                 except Exception:
@@ -206,7 +198,10 @@ async def controlled_scroll(
                 return False
         else:
             unchanged = 0
+
         previous_height = height
+        previous_dom = dom_count
+
     try:
         await page.evaluate("() => window.scrollTo(0, 0)")
     except Exception:

@@ -1,7 +1,7 @@
-"""Explicit optional-dependency checks.
+"""Optional-dependency checks and opt-in browser runtime bootstrap.
 
-PageFetch auto-installs browser dependencies on first use. Set
-``PAGEFETCH_AUTO_INSTALL=0`` to disable automatic installation.
+Automatic browser installation is disabled by default. Set
+``PAGEFETCH_AUTO_INSTALL=1`` to allow automatic installation on first use.
 """
 
 from __future__ import annotations
@@ -21,12 +21,11 @@ _BOOTSTRAP_LOCK = threading.Lock()
 _INSTALL_TIMEOUT = 120
 _FETCH_TIMEOUT = 300
 
-# Single source of truth for the Camoufox pip spec used by the auto-install
-# path. This MUST stay in lockstep with the ``browser`` extra defined in
-# ``pyproject.toml``. ``pip install`` runs arbitrary PyPI-provided code in the
-# host Python environment with full user privileges; the spec here is a trust
-# boundary. Set ``PAGEFETCH_AUTO_INSTALL=0`` to disable this path entirely
-# and require an explicit ``pip install pagefetch[browser]``.
+# Single source of truth for the Camoufox pip spec used by the opt-in
+# auto-install path (``PAGEFETCH_AUTO_INSTALL=1``). This MUST stay in lockstep
+# with the ``browser`` extra defined in ``pyproject.toml``. ``pip install``
+# runs arbitrary PyPI-provided code in the host Python environment with full
+# user privileges; automatic installation is disabled by default.
 _CAMOUFOX_SPEC = "camoufox[geoip]>=0.5.6,<1"
 
 
@@ -134,10 +133,11 @@ def _install_browser_sync() -> None:
 
 
 def auto_bootstrap_browser() -> bool:
-    """Install the Camoufox package and browser binary when they are missing.
+    """Ensure the Camoufox browser binary is ready (installing when opted in).
 
-    Returns ``True`` when the browser is ready to use.  Safe to call
-    repeatedly — subsequent calls are no-ops.
+    When ``PAGEFETCH_AUTO_INSTALL=1`` is set, missing packages and binaries are
+    installed automatically; otherwise this checks whether the binary is already
+    on disk without modifying the environment.
     """
     if not _auto_install_enabled():
         return _has_camoufox_binary()
@@ -154,8 +154,8 @@ async def bootstrap_browser() -> None:
     if not _auto_install_enabled():
         if not _has_camoufox_binary():
             raise RuntimeBootstrapError(
-                "Automatic browser installation is disabled by PAGEFETCH_AUTO_INSTALL. "
-                "Install pagefetch[browser] and run 'python -m camoufox fetch'."
+                "Automatic browser installation is disabled (set PAGEFETCH_AUTO_INSTALL=1 "
+                "to enable, or install 'pagefetch[browser]' and run 'python -m camoufox fetch')."
             )
         return
     await asyncio.to_thread(_install_browser_sync)

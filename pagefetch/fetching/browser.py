@@ -1,4 +1,4 @@
-"""Lazy single-instance Camoufox browser transport."""
+"""Lazy single-instance Camoufox browser transport with ephemeral page contexts."""
 
 from __future__ import annotations
 
@@ -9,89 +9,32 @@ import os
 import random
 import sys
 import time
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
-from ..config import VALID_SCREENSHOT_FORMATS, VALID_SCREENSHOT_MODES
+from ..config import VALID_SCREENSHOT_FORMATS, VALID_SCREENSHOT_MODES, merge_headers
+from ..cookies import CookieProfile
 from ..models import ActionResult, CapturedXHR, FetchErrorInfo, PageAction
 from ..processing.detector import ConfidenceReport, analyze_html
+from ..processing.sections import prepare_expanded_dom
 from ..proxy.providers import ProxySettings
-from ..utils.urls import async_is_safe_host, is_safe_host, registrable_host
-from .actions import matches_xhr_pattern
+from ..utils.urls import registrable_host
+from .expander import (
+    expand_disclosures_only,
+    iterate_dynamic_tabs,
+    neutralize_overlays_and_unlock_scroll,
+)
 from .http import TransportFailure
+from .interception import PageNetworkTracker
 from .readiness import controlled_scroll, in_page_metrics, wait_for_stability
 from .virtual_display import XvfbDisplay, XvfbLaunchError, XvfbNotFound
 
 logger = logging.getLogger("pagefetch.fetching.browser")
-
-# Resource-type blocking sets per stealth level.
-#   minimal:   only pure overhead (media, beacon)
-#   balanced:  also strip pings
-#   aggressive: also strip images and fonts (stylesheets/websockets kept intact for layout & WAFs)
-BLOCK_LEVEL_SETS: dict[str, set[str]] = {
-    "minimal": {"media", "beacon"},
-    "balanced": {"media", "beacon", "ping"},
-    "aggressive": {"media", "beacon", "ping", "image", "font"},
-}
-
-# Common challenge/WAF providers that run inside child frames or require
-# WebSockets and dynamic scripts to verify human behavior.
-_CHALLENGE_DOMAINS: frozenset[str] = frozenset(
-    {
-        "cloudflare.com",
-        "challenges.cloudflare.com",
-        "hcaptcha.com",
-        "recaptcha.net",
-        "gstatic.com",
-        "recaptcha.google.com",
-        "arkoselabs.com",
-        "funcaptcha.com",
-        "datadome.co",
-        "perimeterx.net",
-        "kasada.io",
-        "geetest.com",
-        "imperva.com",
-        "incapsula.com",
-        "botguard.net",
-        "awswaf.com",
-    }
-)
-
-_CHALLENGE_PATH_PREFIXES: tuple[str, ...] = (
-    "/cdn-cgi/",
-    "/__cf_chl",
-    "/_bm/",
-    "/akam/",
-    "/_sec/",
-    "/_pow/",
-)
-
-# Common third-party tracking, ads, and analytics domains to block from all frames
-_TRACKER_DOMAINS: frozenset[str] = frozenset(
-    {
-        "google-analytics.com",
-        "googletagmanager.com",
-        "doubleclick.net",
-        "googlesyndication.com",
-        "googleadservices.com",
-        "hotjar.com",
-        "clarity.ms",
-        "criteo.com",
-        "criteo.net",
-        "outbrain.com",
-        "taboola.com",
-        "scorecardresearch.com",
-        "segment.io",
-        "segment.com",
-        "amplitude.com",
-        "mixpanel.com",
-        "connect.facebook.net",
-        "facebook.net",
-    }
-)
 
 
 @dataclass(slots=True)
@@ -101,6 +44,7 @@ class BrowserResponse:
     html: str
     warnings: list[str]
     confidence: ConfidenceReport
+    soup: BeautifulSoup | None = None
     screenshot: bytes | None = None
     screenshot_format: str | None = None
     actions_executed: list[ActionResult] | None = None
@@ -108,7 +52,7 @@ class BrowserResponse:
 
 
 class BrowserFetcher:
-    """Manage one Camoufox process and create an isolated page per request."""
+    """Manage one Camoufox process and open an isolated context per attempt."""
 
     def __init__(
         self,
@@ -118,7 +62,6 @@ class BrowserFetcher:
         retries: int,
         proxy: ProxySettings,
         max_content_size: int,
-        browser_concurrency: int = 4,
         browser_pre_check_byte_margin: float = 1.5,
         confidence_threshold: float = 0.80,
         block_images: bool = True,
@@ -127,13 +70,14 @@ class BrowserFetcher:
         accept_language: str = "en-US,en;q=0.5",
         max_browser_requests: int = 50,
         idle_ttl: float | None = 180.0,
+        max_scroll_steps: int = 25,
+        max_scroll_height: int = 150_000,
     ) -> None:
         self.semaphore = semaphore
         self.timeout = timeout
         self.retries = retries
         self.proxy = proxy
         self.max_content_size = max_content_size
-        self.browser_concurrency = browser_concurrency
         self.browser_pre_check_byte_margin = browser_pre_check_byte_margin
         self.confidence_threshold = confidence_threshold
         self.block_images = block_images
@@ -142,6 +86,8 @@ class BrowserFetcher:
         self.accept_language = accept_language
         self.max_browser_requests = max_browser_requests
         self.idle_ttl = float(idle_ttl) if idle_ttl is not None and idle_ttl > 0 else None
+        self.max_scroll_steps = max_scroll_steps
+        self.max_scroll_height = max_scroll_height
         self._request_count = 0
         self._manager: Any = None
         self._browser: Any = None
@@ -151,13 +97,8 @@ class BrowserFetcher:
         self._needs_reset = False
         self._last_used = time.monotonic()
         self._idle_task: asyncio.Task[None] | None = None
-        self._context_pools: dict[str, list[Any]] = {}
-        self._context_lock = asyncio.Lock()
+        # Serializes initial page.goto() under authenticated proxy to avoid Firefox 407 races.
         self._proxy_nav_lock = asyncio.Lock()
-        # Linux runs the browser headed against an in-process Xvfb to avoid
-        # the fingerprinting tells of Firefox's native headless mode. On
-        # Windows/macOS we stay on native headless — no display server is
-        # needed there.
         self._xvfb: XvfbDisplay | None = None
 
     def _cancel_idle_task(self) -> None:
@@ -186,13 +127,12 @@ class BrowserFetcher:
                 logger.debug("Idle browser reaper error: %s", exc)
 
         try:
-            loop = asyncio.get_running_loop()
-            self._idle_task = loop.create_task(_reap_when_idle())
+            self._idle_task = asyncio.get_running_loop().create_task(_reap_when_idle())
         except RuntimeError:
             pass
 
-    def _detect_os(self) -> str | None:
-        """Return a Camoufox-compatible OS string matching the host."""
+    @staticmethod
+    def _detect_os() -> str | None:
         if sys.platform == "win32":
             return "windows"
         if sys.platform == "darwin":
@@ -238,11 +178,6 @@ class BrowserFetcher:
             browser_env["GDK_BACKEND"] = "x11"
             browser_env["MOZ_ENABLE_WAYLAND"] = "0"
             options["virtual_display"] = self._xvfb.display
-        # ``options["env"]`` is a per-subprocess dict handed to the
-        # Camoufox/Playwright launch path, so the caller's
-        # ``os.environ`` is never mutated and no global launch lock
-        # is required to keep concurrent launches from racing on
-        # ``DISPLAY``.
         options["env"] = browser_env
         return options
 
@@ -254,7 +189,6 @@ class BrowserFetcher:
                 return
             if proxy is not None and self.proxy is None:
                 self.proxy = proxy
-            # Clean up a stale manager left behind by an earlier reset or crash
             if self._manager is not None:
                 try:
                     await self._manager.__aexit__(None, None, None)
@@ -263,9 +197,6 @@ class BrowserFetcher:
                 self._manager = None
             self._browser = None
 
-            # Auto-install camoufox + browser binary on first use so the
-            # import and launch below do not fail with a "not installed"
-            # error.  No-op when everything is already in place.
             from ..bootstrap import RuntimeBootstrapError, bootstrap_browser
 
             try:
@@ -279,68 +210,53 @@ class BrowserFetcher:
                 from camoufox.async_api import AsyncCamoufox
 
                 host_os = self._detect_os()
-                # Linux: headed against an in-process Xvfb. Other platforms:
-                # Firefox's native headless (no display server available).
                 use_xvfb = host_os == "linux"
-                if use_xvfb:
-                    if self._xvfb is None or not self._xvfb.is_running:
-                        xvfb = XvfbDisplay()
-                        start_task = asyncio.create_task(asyncio.to_thread(xvfb.start))
+                if use_xvfb and (self._xvfb is None or not self._xvfb.is_running):
+                    xvfb = XvfbDisplay()
+                    start_task = asyncio.create_task(asyncio.to_thread(xvfb.start))
+                    try:
+                        await asyncio.shield(start_task)
+                    except asyncio.CancelledError:
                         try:
                             await asyncio.shield(start_task)
-                        except asyncio.CancelledError:
-                            # The shielded task is still running; wait for
-                            # it to settle so ``xvfb.stop`` sees a consistent
-                            # process state. The cancellation supersedes any
-                            # start failure, so we discard the inner result.
-                            try:
-                                await asyncio.shield(start_task)
-                            except Exception:  # noqa: BLE001 — tear-down supersedes
-                                pass
-                            finally:
-                                await asyncio.shield(asyncio.to_thread(xvfb.stop))
-                            raise
-                        except XvfbNotFound as exc:
-                            raise TransportFailure(
-                                FetchErrorInfo(
-                                    "xvfb_missing",
-                                    str(exc),
-                                    False,
-                                    "XvfbNotFound",
-                                )
-                            ) from exc
-                        except XvfbLaunchError as exc:
-                            raise TransportFailure(
-                                FetchErrorInfo(
-                                    "xvfb_launch_error",
-                                    str(exc),
-                                    True,
-                                    "XvfbLaunchError",
-                                )
-                            ) from exc
-                        self._xvfb = xvfb
+                        except Exception:  # noqa: BLE001 — teardown supersedes
+                            pass
+                        finally:
+                            await asyncio.shield(asyncio.to_thread(xvfb.stop))
+                        raise
+                    except XvfbNotFound as exc:
+                        raise TransportFailure(
+                            FetchErrorInfo("xvfb_missing", str(exc), False, "XvfbNotFound")
+                        ) from exc
+                    except XvfbLaunchError as exc:
+                        raise TransportFailure(
+                            FetchErrorInfo("xvfb_launch_error", str(exc), True, "XvfbLaunchError")
+                        ) from exc
+                    self._xvfb = xvfb
 
                 options = self._build_camoufox_options(host_os, use_xvfb, proxy=proxy)
                 self._manager = AsyncCamoufox(**options)
                 self._browser = await self._manager.__aenter__()
             except TransportFailure:
                 raise
-
-            except Exception as exc:
+            except BaseException as exc:
                 if self._manager is not None:
+                    manager = self._manager
+                    self._manager = None
                     try:
-                        await self._manager.__aexit__(None, None, None)
-                    except Exception:
+                        await asyncio.shield(manager.__aexit__(None, None, None))
+                    except BaseException:
                         pass
-                self._manager = None
                 self._browser = None
                 if self._xvfb is not None:
                     xvfb = self._xvfb
                     self._xvfb = None
                     try:
-                        await asyncio.to_thread(xvfb.stop)
-                    except Exception:
+                        await asyncio.shield(asyncio.to_thread(xvfb.stop))
+                    except BaseException:
                         pass
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
                 raise TransportFailure(
                     FetchErrorInfo(
                         "browser_launch_error",
@@ -359,7 +275,6 @@ class BrowserFetcher:
         )
 
     async def _backoff_before_deadline(self, attempt: int, deadline: float) -> bool:
-        """Sleep for retry jitter without exceeding the operation deadline."""
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return False
@@ -376,26 +291,14 @@ class BrowserFetcher:
         actions: Sequence[PageAction] | None = None,
         capture_xhr: bool | str | Sequence[str] = False,
         headers: dict[str, str] | None = None,
-        cookies: dict[str, str] | None = None,
+        cookie_profile: CookieProfile | None = None,
+        cookie_rotator: Any = None,
+        expand: bool = False,
         screenshot: str = "none",
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
     ) -> BrowserResponse:
-        """Fetch a URL through the browser with adaptive retries.
-
-        The semaphore is acquired only during browser I/O, not during HTML
-        analysis or inter-retry backoff, so other tasks can use the browser
-        during those windows.
-
-        When *proxy* is supplied, it is applied to the isolated browser
-        context created for this request.
-
-        ``screenshot`` selects capture mode: ``"none"`` (default) skips the
-        capture, ``"viewport"`` captures the initial visible area,
-        ``"full"`` captures the entire scrollable page. ``screenshot_format``
-        is ``"png"`` (default) or ``"jpeg"``. Captures exceeding
-        ``screenshot_max_bytes`` are discarded with a warning.
-        """
+        """Fetch a URL through the browser with adaptive retries and clean per-attempt contexts."""
         if screenshot not in VALID_SCREENSHOT_MODES:
             raise ValueError(f"screenshot must be one of {sorted(VALID_SCREENSHOT_MODES)}")
         if screenshot_format not in VALID_SCREENSHOT_FORMATS:
@@ -404,10 +307,7 @@ class BrowserFetcher:
             raise ValueError("screenshot_max_bytes must be a positive integer")
 
         total_deadline = time.monotonic() + self.timeout
-        # Start with a balanced scroll profile; escalate on retry.
-        max_scrolls = 6
-        scroll_sleep_early = 0.10
-        scroll_sleep_late = 0.15
+        active_cookie_profile = cookie_profile
 
         async with self._active_lock:
             self._cancel_idle_task()
@@ -416,13 +316,13 @@ class BrowserFetcher:
             if self.max_browser_requests > 0 and self._request_count >= self.max_browser_requests:
                 self._needs_reset = True
         try:
+            last_failure: TransportFailure | None = None
             for attempt in range(self.retries + 1):
                 try:
                     remaining = total_deadline - time.monotonic()
                     if remaining <= 0:
                         raise self._timeout_failure()
                     attempt_proxy = proxy
-                    # ── browser I/O inside semaphore ──
                     async with self.semaphore:
                         if attempt_proxy is not None and self.proxy is None:
                             self.proxy = attempt_proxy
@@ -443,21 +343,16 @@ class BrowserFetcher:
                             actions=actions,
                             capture_xhr=capture_xhr,
                             headers=headers,
-                            cookies=cookies,
-                            max_scrolls=max_scrolls,
-                            scroll_sleep_early=scroll_sleep_early,
-                            scroll_sleep_late=scroll_sleep_late,
+                            cookie_profile=active_cookie_profile,
+                            expand=expand,
                             page_timeout=attempt_timeout,
                             screenshot=screenshot,
                             screenshot_format=screenshot_format,
                             screenshot_max_bytes=screenshot_max_bytes,
                         )
-                    # ── analysis outside semaphore ──
-                    report = analyze_html(result.html)
+                    report = analyze_html(result.html, soup=result.soup)
                     result.confidence = report
 
-                    # Retry only for genuine failures: empty DOM, an active anti-bot challenge,
-                    # an unmounted JavaScript shell, a blocked HTTP status, or very low confidence.
                     empty = not result.html.strip()
                     very_low_threshold = min(0.40, self.confidence_threshold)
                     has_substantive_content = (
@@ -465,33 +360,32 @@ class BrowserFetcher:
                         and not report.javascript_shell
                         and "very little visible text" not in report.reasons
                     )
-                    blocked_status = (
-                        result.status_code is not None
-                        and result.status_code in {403, 407, 429, 502, 503, 504}
+                    is_site_block = result.status_code in {403, 429, 503} and not (
+                        has_substantive_content and result.status_code == 503
+                    )
+                    transient_status = (
+                        result.status_code in {407, 502, 504}
                         and report.score < self.confidence_threshold
                     )
-                    should_retry = (
+                    needs_retry = (
                         empty
                         or report.challenge
                         or report.javascript_shell
-                        or blocked_status
+                        or is_site_block
+                        or transient_status
                         or (report.score < very_low_threshold and not has_substantive_content)
                     )
-
-                    if should_retry and attempt < self.retries:
-                        # Escalate: more scrolls, longer waits, and rotate proxy/browser on block.
-                        max_scrolls = min(12, max_scrolls + 3)
-                        scroll_sleep_early = min(0.20, scroll_sleep_early + 0.03)
-                        scroll_sleep_late = min(0.28, scroll_sleep_late + 0.05)
-                        # Never rotate the proxy session or reset the browser on HTTP 407:
-                        # 407 is an outbound proxy authentication handshake race, not a target
-                        # site block. Keeping the same proxy_key lets retries reuse warm
-                        # authenticated contexts from _context_pools or serialize under _proxy_nav_lock.
-                        should_rotate = (
-                            report.challenge
-                            or (blocked_status and result.status_code != 407)
-                        ) and callable(proxy_resolver)
-                        if should_rotate:
+                    if needs_retry and attempt < self.retries:
+                        if cookie_rotator is not None and (is_site_block or report.challenge):
+                            rotated = cookie_rotator(attempt + 1)
+                            if rotated is not None:
+                                active_cookie_profile = rotated
+                        should_rotate_proxy = (
+                            is_site_block
+                            or report.challenge
+                            or result.status_code in {502, 504}
+                        )
+                        if should_rotate_proxy and callable(proxy_resolver):
                             new_proxy = proxy_resolver(attempt + 1)
                             if new_proxy is not None:
                                 proxy = new_proxy
@@ -528,9 +422,6 @@ class BrowserFetcher:
                             self._needs_reset = True
                     if not await self._backoff_before_deadline(attempt, total_deadline):
                         raise self._timeout_failure() from exc
-            # Unreachable: every iteration ``continue``-s, ``return``-s, or
-            # ``raise``-s. ``last_failure`` is recorded for forensics but the
-            # exhaustive loop terminates before this line runs.
             raise AssertionError(
                 f"browser retry loop exited without terminating: last_failure={last_failure!r}"
             )
@@ -552,166 +443,86 @@ class BrowserFetcher:
             elif schedule_idle:
                 self._schedule_idle_close()
 
-    async def _setup_interception(
+    @asynccontextmanager
+    async def _open_isolated_page(
         self,
-        page: Any,
-        target_url: str,
-        proxy: ProxySettings | None = None,
-        capture_xhr: bool | str | Sequence[str] = False,
-        screenshot: bool = False,
-    ) -> dict[str, Any]:
-        network: dict[str, Any] = {
-            "active": 0,
-            "last_activity": time.monotonic(),
-            "last_document_status": None,
-            "captured_xhr": [],
-            "pending_xhr_tasks": set(),
+        url: str,
+        *,
+        effective_proxy: ProxySettings | None,
+        headers: dict[str, str] | None,
+        cookie_profile: CookieProfile | None,
+        capture_xhr: bool | str | Sequence[str],
+        screenshot: bool,
+    ) -> AsyncIterator[tuple[Any, PageNetworkTracker, bool]]:
+        """Create and deterministically tear down an isolated context + tracked page."""
+        has_proxy = bool(effective_proxy and effective_proxy.url)
+        # Never overwrite GeoIP Accept-Language with the default when a proxy is active.
+        base_lang = (
+            {"Accept-Language": self.accept_language}
+            if not has_proxy and self.accept_language != "en-US,en;q=0.5"
+            else None
+        )
+        context_headers = merge_headers(base_lang, headers)
+
+        context_kwargs: dict[str, Any] = {
+            "bypass_csp": False,
+            "ignore_https_errors": True,
+            "java_script_enabled": True,
+            "accept_downloads": False,
         }
-        total_xhr_bytes = [0]
+        browser_proxy = effective_proxy.browser_config() if effective_proxy else None
+        if browser_proxy:
+            context_kwargs["proxy"] = browser_proxy
 
-        def request_started(_request: Any) -> None:
-            network["active"] += 1
-            network["last_activity"] = time.monotonic()
-
-        def request_finished(_request: Any) -> None:
-            network["active"] = max(0, network["active"] - 1)
-            network["last_activity"] = time.monotonic()
-
-        async def _capture_xhr_body(resp: Any, req_method: str) -> None:
-            try:
-                ct = (resp.headers.get("content-type") or "").lower()
-                resp_headers = dict(resp.headers) if hasattr(resp, "headers") else None
-                body_bytes = await resp.body()
-                size = len(body_bytes)
-                total_xhr_bytes[0] += size
-                truncated = False
-                if size > 512 * 1024:
-                    body_bytes = body_bytes[: 512 * 1024]
-                    truncated = True
-                body_val: Any = None
-                if "application/json" in ct or "+json" in ct:
+        context = None
+        page = None
+        tracker = PageNetworkTracker(
+            target_url=url,
+            block_level=self.block_level,
+            block_images=self.block_images,
+            has_proxy=has_proxy,
+            capture_xhr=capture_xhr,
+            screenshot=screenshot,
+        )
+        try:
+            context = await self._browser.new_context(**context_kwargs)
+            if cookie_profile is not None:
+                cookie_list = cookie_profile.to_playwright_cookies(url)
+                if cookie_list:
                     try:
-                        import json
-
-                        body_val = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                        await context.add_cookies(cookie_list)
                     except Exception:
-                        body_val = body_bytes.decode("utf-8", errors="replace")
-                else:
-                    body_val = body_bytes.decode("utf-8", errors="replace")
-                network["captured_xhr"].append(
-                    CapturedXHR(
-                        url=resp.url,
-                        method=req_method,
-                        status_code=resp.status,
-                        content_type=ct or None,
-                        body=body_val,
-                        truncated=truncated,
-                        headers=resp_headers,
-                    )
-                )
-            except Exception:
-                pass
+                        target_host = urlsplit(url).hostname or "localhost"
+                        fallback_list = [
+                            {"name": c["name"], "value": c["value"], "domain": target_host, "path": "/"}
+                            for c in cookie_list
+                        ]
+                        try:
+                            await context.add_cookies(fallback_list)
+                        except Exception as exc:
+                            logger.debug("Failed to set cookies on browser context: %s", exc)
 
-        def on_document_response(resp: Any) -> None:
-            try:
-                req = getattr(resp, "request", None)
-                if req and req.resource_type == "document":
-                    frame = getattr(resp, "frame", None)
-                    if frame == page.main_frame:
-                        network["last_document_status"] = resp.status
-                if capture_xhr and req and req.resource_type in {"xhr", "fetch"}:
-                    if matches_xhr_pattern(resp.url, capture_xhr):
-                        pending_count = len(network["pending_xhr_tasks"])
-                        captured_count = len(network["captured_xhr"])
-                        if pending_count + captured_count < 50 and total_xhr_bytes[0] < 4 * 1024 * 1024:
-                            try:
-                                loop = asyncio.get_running_loop()
-                                t = loop.create_task(_capture_xhr_body(resp, req.method))
-                                network["pending_xhr_tasks"].add(t)
-                                t.add_done_callback(network["pending_xhr_tasks"].discard)
-                            except RuntimeError:
-                                pass
-            except Exception:
-                pass
-
-        page.on("request", request_started)
-        page.on("requestfinished", request_finished)
-        page.on("requestfailed", request_finished)
-        page.on("response", on_document_response)
-
-        # Pre-compute the registrable host once so route_handler avoids
-        # the expensive tldextract call on every document-frame request.
-        _main_site = registrable_host(target_url)
-        active_proxy = proxy if proxy is not None else self.proxy
-        has_proxy = bool(active_proxy and active_proxy.url)
-
-        async def route_handler(route: Any) -> None:
-            request = route.request
-            request_url = request.url
-            res_type = request.resource_type
-            req_host = ""
-            req_path = ""
-            if request_url.startswith(("http://", "https://", "ws://", "wss://")):
-                req_parsed = urlsplit(request_url)
-                req_host = (req_parsed.hostname or "").lower()
-                req_path = (req_parsed.path or "").lower()
-
-            is_challenge_host = any(
-                req_host == d or req_host.endswith("." + d)
-                for d in _CHALLENGE_DOMAINS
-            ) or any(req_path.startswith(p) for p in _CHALLENGE_PATH_PREFIXES)
-
-            # Block non-essential resource types according to the configured block_level.
-            blocked = set(
-                BLOCK_LEVEL_SETS.get(self.block_level, BLOCK_LEVEL_SETS["balanced"])
-            )
-            if not self.block_images or screenshot:
-                blocked.discard("image")
-
-            # Never block resources for challenge verification hosts/paths
-            if is_challenge_host:
-                is_blocked_type = False
-            else:
-                is_blocked_type = res_type in blocked
-
-            # Block 3rd-party trackers, ads, and session recorders from all frames
-            is_tracker = False
-            if not is_challenge_host and req_host:
-                if any(req_host == d or req_host.endswith("." + d) for d in _TRACKER_DOMAINS):
-                    is_tracker = True
-
-            external_frame = False
-            if self.block_level != "minimal" and res_type == "document" and request.frame != page.main_frame:
-                if request_url.startswith(("http://", "https://")) and not is_challenge_host:
-                    external_frame = registrable_host(request_url) != _main_site
-
-            # Also block cross-site scripts, XHR, and fetch requests
-            # initiated inside child frames (unless it's an anti-bot challenge host
-            # or block_level is minimal).
-            external_script = False
-            _main_frame = getattr(page, "main_frame", None)
-            if self.block_level != "minimal" and res_type in {"script", "xhr", "fetch"} and _main_frame is not None:
-                if getattr(request, "frame", None) != _main_frame and not is_challenge_host:
-                    if request_url.startswith(("http://", "https://")):
-                        external_script = registrable_host(request_url) != _main_site
-
-            try:
-                if is_blocked_type or is_tracker or external_frame or external_script:
-                    await route.abort()
-                    return
-
-                # Check host safety for allowed requests (skipping local DNS when proxy is active)
-                if req_host:
-                    if not await async_is_safe_host(req_host, resolve_dns=not has_proxy):
-                        await route.abort()
-                        return
-
-                await route.continue_()
-            except Exception:
-                pass
-
-        await page.route("**/*", route_handler)
-        return network
+            page = await context.new_page()
+            if context_headers:
+                try:
+                    await page.set_extra_http_headers(context_headers)
+                except Exception:
+                    pass
+            await tracker.attach(page)
+            has_auth_proxy = bool(browser_proxy and browser_proxy.get("username"))
+            yield page, tracker, has_auth_proxy
+        finally:
+            await tracker.detach(page)
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
 
     async def _try_resolve_interstitial(self, page: Any) -> bool:
         """Attempt a single click on a Turnstile widget or benign continue button."""
@@ -750,28 +561,20 @@ class BrowserFetcher:
             pass
         return False
 
-    async def _ensure_page_readiness(
+    async def _wait_initial_readiness(
         self,
         page: Any,
-        network: dict[str, Any],
-        max_scrolls: int,
-        scroll_sleep_early: float,
-        scroll_sleep_late: float,
-        warnings: list[str],
-    ) -> bool:
-        # ── first stability wait (shorter cap) ──
-        first_stability_timeout = min(2.5, self.timeout / 4)
+        tracker: PageNetworkTracker,
+    ) -> tuple[bool, bool]:
+        """Wait for initial DOM stability and passive challenge resolution."""
         await wait_for_stability(
             page,
-            timeout=first_stability_timeout,
-            network_activity=lambda: (network["active"], network["last_activity"]),
+            timeout=min(2.5, self.timeout / 4),
+            network_activity=tracker.activity,
         )
 
-        # ── early-exit probe ──
         probe = await in_page_metrics(page)
         if probe["challenge"]:
-            # Challenge page detected (e.g. Cloudflare Turnstile / PoW / reCAPTCHA).
-            # Avoid scrolling which can interrupt solving, and poll until resolved.
             challenge_timeout = min(15.0, self.timeout / 2)
             challenge_started = time.monotonic()
             challenge_deadline = challenge_started + challenge_timeout
@@ -785,13 +588,8 @@ class BrowserFetcher:
                 if not probe["challenge"]:
                     if probe["text"] > 0 or probe["main_text"] > 0:
                         break
-                    # When a challenge script calls window.location.reload(),
-                    # in_page_metrics may catch a mid-navigation exception or
-                    # observe an empty document before the reloaded DOM arrives.
-                    # Require consecutive settled non-challenge polls before exiting
-                    # with 0 text.
                     empty_non_challenge_polls += 1
-                    if empty_non_challenge_polls >= 3 and network.get("active", 0) == 0:
+                    if empty_non_challenge_polls >= 3 and tracker.active == 0:
                         break
                 else:
                     empty_non_challenge_polls = 0
@@ -799,38 +597,37 @@ class BrowserFetcher:
                 page,
                 timeout=min(3.0, self.timeout / 4),
                 stable_rounds=2,
-                network_activity=lambda: (network["active"], network["last_activity"]),
+                network_activity=tracker.activity,
             )
             probe = await in_page_metrics(page)
             if probe["challenge"]:
-                network["unresolved_challenge"] = True
-                return True
+                return True, True
 
-        skip_scroll = (
-            probe["text"] >= 800
-            or probe["main_text"] >= 300
-        )
+        weak_main = probe["text"] < 800 and probe["main_text"] < 300
+        return False, weak_main
 
-        if skip_scroll:
-            # Page already has good content — skip scrolling.
-            await page.evaluate("() => window.scrollTo(0, 0)")
+    async def _navigate_and_await_readiness(
+        self,
+        page: Any,
+        tracker: PageNetworkTracker,
+        url: str,
+        *,
+        has_auth_proxy: bool,
+        page_deadline: float,
+    ) -> tuple[Any, bool, bool]:
+        rem_ms = max(5000.0, (page_deadline - time.monotonic()) * 1000)
+        goto_timeout_ms = int(min(self.timeout * 1000, rem_ms))
+        if has_auth_proxy:
+            async with self._proxy_nav_lock:
+                response = await page.goto(
+                    url, wait_until="domcontentloaded", timeout=goto_timeout_ms
+                )
         else:
-            limit_reached = await controlled_scroll(
-                page,
-                max_scrolls=max_scrolls,
-                sleep_early=scroll_sleep_early,
-                sleep_late=scroll_sleep_late,
+            response = await page.goto(
+                url, wait_until="domcontentloaded", timeout=goto_timeout_ms
             )
-            await wait_for_stability(
-                page,
-                timeout=min(3.0, self.timeout / 4),
-                stable_rounds=2,
-                network_activity=lambda: (network["active"], network["last_activity"]),
-            )
-            if limit_reached:
-                warnings.append("Maximum controlled-scroll limit was reached.")
-
-        return skip_scroll
+        unresolved_challenge, weak_main = await self._wait_initial_readiness(page, tracker)
+        return response, unresolved_challenge, weak_main
 
     async def _capture_screenshot(
         self,
@@ -843,10 +640,8 @@ class BrowserFetcher:
         if screenshot == "none":
             return None, None
         try:
-            full_page = screenshot == "full"
-            # Playwright's type argument is "png" / "jpeg".
             screenshot_bytes = await page.screenshot(
-                full_page=full_page,
+                full_page=(screenshot == "full"),
                 type=screenshot_format,
             )
             if len(screenshot_bytes) > screenshot_max_bytes:
@@ -854,11 +649,123 @@ class BrowserFetcher:
                 return None, None
             return screenshot_bytes, screenshot_format
         except Exception as exc:
-            logger.warning(
-                "screenshot capture failed: %s", exc, exc_info=True
-            )
+            logger.warning("screenshot capture failed: %s", exc, exc_info=True)
             warnings.append("Screenshot capture failed; continuing without it.")
             return None, None
+
+    async def _run_page_interactions(
+        self,
+        page: Any,
+        tracker: PageNetworkTracker,
+        url: str,
+        *,
+        actions: Sequence[PageAction] | None,
+        expand: bool,
+        screenshot: str,
+        screenshot_format: str,
+        screenshot_max_bytes: int,
+        page_deadline: float,
+        unresolved_challenge: bool,
+        weak_main: bool,
+        warnings: list[str],
+    ) -> tuple[
+        str,
+        BeautifulSoup | None,
+        bytes | None,
+        str | None,
+        list[ActionResult] | None,
+    ]:
+        actions_executed = None
+        response_soup: BeautifulSoup | None = None
+
+        if unresolved_challenge:
+            html = await page.content()
+            screenshot_bytes, screenshot_ext = await self._capture_screenshot(
+                page, screenshot, screenshot_format, screenshot_max_bytes, warnings
+            )
+            return html, None, screenshot_bytes, screenshot_ext, None
+
+        await neutralize_overlays_and_unlock_scroll(page)
+        if actions:
+            from .actions import execute_page_actions, normalize_actions
+
+            actions_executed = await execute_page_actions(
+                page,
+                normalize_actions(actions),
+                humanize=self.humanize,
+                default_timeout=min(15.0, self.timeout),
+                warnings=warnings,
+                network_activity=tracker.activity,
+            )
+            await neutralize_overlays_and_unlock_scroll(page)
+
+        scroll_budget_end = page_deadline - (3.5 if expand else 1.5)
+        limit_reached = await controlled_scroll(
+            page,
+            max_scrolls=self.max_scroll_steps,
+            max_height=self.max_scroll_height,
+            sleep_early=0.12,
+            sleep_late=0.18,
+            deadline=max(time.monotonic() + 1.0, scroll_budget_end),
+            network_activity=tracker.activity,
+        )
+        await wait_for_stability(
+            page,
+            timeout=min(2.5, self.timeout / 4),
+            stable_rounds=2,
+            network_activity=tracker.activity,
+        )
+        if limit_reached:
+            warnings.append(
+                "Full-page scroll reached configured step or height limit; returning all content loaded so far."
+            )
+
+        if expand:
+            expand_deadline = max(time.monotonic() + 0.5, page_deadline - 1.0)
+            await expand_disclosures_only(
+                page, deadline=expand_deadline, network_activity=tracker.activity
+            )
+            screenshot_bytes, screenshot_ext = await self._capture_screenshot(
+                page, screenshot, screenshot_format, screenshot_max_bytes, warnings
+            )
+            baseline_html, raw_sections = await iterate_dynamic_tabs(
+                page, deadline=expand_deadline, network_activity=tracker.activity
+            )
+            html, response_soup = prepare_expanded_dom(baseline_html, raw_sections)
+        else:
+            html = await page.content()
+            screenshot_bytes, screenshot_ext = await self._capture_screenshot(
+                page, screenshot, screenshot_format, screenshot_max_bytes, warnings
+            )
+
+        if len(html) > self.max_content_size * self.browser_pre_check_byte_margin:
+            raise TransportFailure(
+                FetchErrorInfo("content_too_large", "rendered content exceeds maximum size", True)
+            )
+        if weak_main and not expand:
+            html = await self._include_same_site_frames(page, html, page.url or url, warnings)
+
+        return html, response_soup, screenshot_bytes, screenshot_ext, actions_executed
+
+    @staticmethod
+    def _classify_browser_error(exc: Exception) -> TransportFailure:
+        message = str(exc).lower()
+        proxy_tokens = (
+            "err_tunnel_connection_failed",
+            "ns_error_proxy_forbidden",
+            "err_proxy_connection_failed",
+            "proxy connection refused",
+            "proxy error",
+            "proxy 403",
+        )
+        if "timeout" in message:
+            code, public_message, retryable = "browser_timeout", "browser navigation timed out", True
+        elif any(token in message for token in proxy_tokens):
+            code = "proxy_forbidden" if ("forbidden" in message or "403" in message) else "proxy_error"
+            public_message, retryable = f"browser proxy connection failed: {exc}", False
+        else:
+            code, public_message, retryable = "browser_navigation_error", "browser navigation failed", True
+        return TransportFailure(FetchErrorInfo(code, public_message, retryable, type(exc).__name__))
 
     async def _fetch_page_once(
         self,
@@ -868,297 +775,84 @@ class BrowserFetcher:
         actions: Sequence[PageAction] | None = None,
         capture_xhr: bool | str | Sequence[str] = False,
         headers: dict[str, str] | None = None,
-        cookies: dict[str, str] | None = None,
-        max_scrolls: int = 6,
-        scroll_sleep_early: float = 0.10,
-        scroll_sleep_late: float = 0.15,
+        cookie_profile: CookieProfile | None = None,
+        expand: bool = False,
         page_timeout: float,
         screenshot: str = "none",
         screenshot_format: str = "png",
         screenshot_max_bytes: int = 50 * 1024 * 1024,
     ) -> BrowserResponse:
-        """Navigate, wait for stability, optionally scroll, execute actions, and return raw HTML.
-
-        Uses an adaptive early-exit probe: if the page is already complete
-        after the first stability wait, scrolling and the second wait are
-        skipped entirely.
-
-        Each call creates a new browser *context* (isolated cookie jar,
-        localStorage, cache) and tears it down at the end so consecutive
-        fetches are not linkable through shared storage.
-        """
-        page: Any = None
-        context: Any = None
-        network: dict[str, Any] = {}
+        """Open an isolated context, navigate, interact/expand, and capture rendered HTML."""
         warnings: list[str] = []
-        fetch_succeeded = False
         effective_proxy = proxy if proxy is not None else self.proxy
-        proxy_key = effective_proxy.url if effective_proxy and effective_proxy.url else ""
-        site_key = registrable_host(url) or (urlsplit(url).hostname or "").lower()
-        pool_key = f"{proxy_key}|{site_key}"
+        page_deadline = time.monotonic() + page_timeout
         try:
             async with asyncio.timeout(page_timeout):
-                has_proxy = bool(effective_proxy and effective_proxy.url)
-                context_headers: dict[str, str] = {}
-                if not has_proxy and self.accept_language != "en-US,en;q=0.5":
-                    context_headers["Accept-Language"] = self.accept_language
-                if headers:
-                    context_headers.update(headers)
-
-                # Acquire reusable per-site context from pool to preserve disk/memory HTTP cache
-                # and same-site clearance cookies across requests to the same registrable domain.
-                async with self._context_lock:
-                    pool = self._context_pools.setdefault(pool_key, [])
-                    while pool:
-                        candidate = pool.pop()
-                        is_closed = getattr(candidate, "is_closed", None)
-                        if callable(is_closed) and is_closed():
-                            continue
-                        try:
-                            _ = candidate.pages
-                            context = candidate
-                            break
-                        except Exception:
-                            pass
-
-                reused_context = context is not None
-                if context is None:
-                    context_kwargs: dict[str, Any] = {
-                        "bypass_csp": False,
-                        "ignore_https_errors": True,
-                        "java_script_enabled": True,
-                        "accept_downloads": False,
-                    }
-                    browser_proxy = effective_proxy.browser_config() if effective_proxy else None
-                    if browser_proxy:
-                        context_kwargs["proxy"] = browser_proxy
-                    context = await self._browser.new_context(**context_kwargs)
-
-                if cookies:
-                    cookie_list = [
-                        {"name": k, "value": v, "url": url}
-                        for k, v in cookies.items()
-                    ]
-                    try:
-                        await context.add_cookies(cookie_list)
-                    except Exception:
-                        target_host = urlsplit(url).hostname or "localhost"
-                        try:
-                            await context.add_cookies([
-                                {"name": k, "value": v, "domain": target_host, "path": "/"}
-                                for k, v in cookies.items()
-                            ])
-                        except Exception as exc:
-                            logger.debug("Failed to set cookies on browser context: %s", exc)
-
-                page = await context.new_page()
-                if context_headers:
-                    try:
-                        await page.set_extra_http_headers(context_headers)
-                    except Exception:
-                        pass
-
-                network = await self._setup_interception(
-                    page,
+                async with self._open_isolated_page(
                     url,
-                    proxy=effective_proxy,
+                    effective_proxy=effective_proxy,
+                    headers=headers,
+                    cookie_profile=cookie_profile,
                     capture_xhr=capture_xhr,
-                    screenshot=screenshot != "none",
-                )
-                goto_timeout_ms = int(max(1.0, min(page_timeout, self.timeout)) * 1000)
-                if has_proxy and not reused_context:
-                    async with self._proxy_nav_lock:
-                        response = await page.goto(
-                            url,
-                            wait_until="domcontentloaded",
-                            timeout=goto_timeout_ms,
-                        )
-                else:
-                    response = await page.goto(
-                        url,
-                        wait_until="domcontentloaded",
-                        timeout=goto_timeout_ms,
-                    )
-
-                skip_scroll = await self._ensure_page_readiness(
-                    page,
-                    network,
-                    max_scrolls=max_scrolls,
-                    scroll_sleep_early=scroll_sleep_early,
-                    scroll_sleep_late=scroll_sleep_late,
-                    warnings=warnings,
-                )
-
-                actions_executed = None
-                if actions:
-                    from .actions import execute_page_actions, normalize_actions
-
-                    normalized_actions = normalize_actions(actions)
-                    actions_executed = await execute_page_actions(
+                    screenshot=(screenshot != "none"),
+                ) as (page, tracker, has_auth_proxy):
+                    response, unresolved_challenge, weak_main = await self._navigate_and_await_readiness(
                         page,
-                        normalized_actions,
-                        humanize=self.humanize,
-                        default_timeout=min(15.0, self.timeout),
+                        tracker,
+                        url,
+                        has_auth_proxy=has_auth_proxy,
+                        page_deadline=page_deadline,
+                    )
+                    (
+                        html,
+                        response_soup,
+                        screenshot_bytes,
+                        screenshot_ext,
+                        actions_executed,
+                    ) = await self._run_page_interactions(
+                        page,
+                        tracker,
+                        url,
+                        actions=actions,
+                        expand=expand,
+                        screenshot=screenshot,
+                        screenshot_format=screenshot_format,
+                        screenshot_max_bytes=screenshot_max_bytes,
+                        page_deadline=page_deadline,
+                        unresolved_challenge=unresolved_challenge,
+                        weak_main=weak_main,
                         warnings=warnings,
-                        network_activity=lambda: (network.get("active", 0), network.get("last_activity", 0.0)),
                     )
-
-                # Fast size pre-check — character length is enough as a soft
-                # guard; avoids the cost of a TextEncoder byte-length encode.
-                pre_size = await page.evaluate(
-                    "() => (document.documentElement?.outerHTML.length || 0)"
-                )
-                margin = self.browser_pre_check_byte_margin
-                if pre_size > self.max_content_size * margin:
-                    raise TransportFailure(
-                        FetchErrorInfo(
-                            "content_too_large",
-                            "rendered content exceeds maximum size",
-                            True,
+                    if len(html.encode("utf-8")) > self.max_content_size:
+                        raise TransportFailure(
+                            FetchErrorInfo("content_too_large", "rendered content exceeds maximum size", True)
                         )
+                    xhr_responses = await tracker.finalize_xhr()
+                    final_status = (
+                        tracker.last_document_status
+                        if tracker.last_document_status is not None
+                        else (response.status if response else None)
                     )
-
-                html = await page.content()
-
-                # ── gated iframe merge ──
-                if not skip_scroll:
-                    # Only merge iframes when the main document is weak.
-                    html = await self._include_same_site_frames(page, html, page.url or url, warnings)
-
-                if len(html.encode("utf-8")) > self.max_content_size:
-                    raise TransportFailure(
-                        FetchErrorInfo(
-                            "content_too_large",
-                            "rendered content exceeds maximum size",
-                            True,
-                        )
+                    return BrowserResponse(
+                        url=page.url,
+                        status_code=final_status,
+                        html=html,
+                        warnings=warnings,
+                        confidence=ConfidenceReport(1.0, ()),
+                        soup=response_soup,
+                        screenshot=screenshot_bytes,
+                        screenshot_format=screenshot_ext,
+                        actions_executed=actions_executed,
+                        xhr_responses=xhr_responses,
                     )
-
-                screenshot_bytes, screenshot_ext = await self._capture_screenshot(
-                    page,
-                    screenshot=screenshot,
-                    screenshot_format=screenshot_format,
-                    screenshot_max_bytes=screenshot_max_bytes,
-                    warnings=warnings,
-                )
-
-                pending_xhr = network.get("pending_xhr_tasks")
-                if pending_xhr:
-                    await asyncio.gather(*list(pending_xhr), return_exceptions=True)
-
-                doc_status = network.get("last_document_status")
-                final_status = doc_status if doc_status is not None else (response.status if response else None)
-
-                fetch_succeeded = final_status is None or final_status < 400
-                return BrowserResponse(
-                    url=page.url,
-                    status_code=final_status,
-                    html=html,
-                    warnings=warnings,
-                    confidence=ConfidenceReport(1.0, ()),
-                    screenshot=screenshot_bytes,
-                    screenshot_format=screenshot_ext,
-                    actions_executed=actions_executed,
-                    xhr_responses=network.get("captured_xhr") or None,
-                )
-
         except TransportFailure:
             raise
         except TimeoutError as exc:
             raise TransportFailure(
-                FetchErrorInfo(
-                    "browser_timeout",
-                    "browser navigation timed out",
-                    True,
-                    type(exc).__name__,
-                )
+                FetchErrorInfo("browser_timeout", "browser navigation timed out", True, type(exc).__name__)
             ) from exc
         except Exception as exc:
-            message = str(exc).lower()
-            timeout = "timeout" in message
-            proxy_tokens = (
-                "err_tunnel_connection_failed",
-                "ns_error_proxy_forbidden",
-                "err_proxy_connection_failed",
-                "proxy connection refused",
-                "proxy error",
-                "proxy 403",
-            )
-            is_proxy_rejection = any(token in message for token in proxy_tokens)
-            if timeout:
-                code = "browser_timeout"
-                public_message = "browser navigation timed out"
-                retryable = True
-            elif is_proxy_rejection:
-                code = "proxy_forbidden" if any(tok in message for tok in ("forbidden", "403")) else "proxy_error"
-                public_message = f"browser proxy connection failed: {exc}"
-                retryable = False
-            else:
-                code = "browser_navigation_error"
-                public_message = "browser navigation failed"
-                retryable = True
-            raise TransportFailure(
-                FetchErrorInfo(code, public_message, retryable, type(exc).__name__)
-            ) from exc
-        finally:
-            if isinstance(network, dict) and network.get("pending_xhr_tasks"):
-                for t in list(network["pending_xhr_tasks"]):
-                    if not t.done():
-                        t.cancel()
-            if page is not None:
-                try:
-                    # Stop route interception before closing so Playwright can
-                    # cleanly tear down its internal async handler tasks.  This
-                    # prevents "TargetClosedError — Future exception was never
-                    # retrieved" warnings when the page closes while routes are
-                    # still being serviced.
-                    await page.unroute("**/*")
-                except Exception:
-                    pass
-                # Give the event loop a chance to flush any in-flight route
-                # handler callbacks before we close the page.
-                await asyncio.sleep(0)
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if context is not None:
-                max_pool_size = max(2, getattr(self, "browser_concurrency", 4))
-                evicted_contexts: list[Any] = []
-                unresolved_challenge = bool(isinstance(network, dict) and network.get("unresolved_challenge"))
-                try:
-                    if cookies or not fetch_succeeded or unresolved_challenge:
-                        await context.clear_cookies()
-                    async with self._context_lock:
-                        pool = self._context_pools.setdefault(pool_key, [])
-                        if (
-                            fetch_succeeded
-                            and not self._needs_reset
-                            and self._browser is not None
-                            and getattr(self._browser, "is_connected", lambda: True)()
-                            and len(pool) < max_pool_size
-                        ):
-                            pool.append(context)
-                            context = None
-                            while len(self._context_pools) > 16:
-                                oldest_key = next(iter(self._context_pools))
-                                if oldest_key == pool_key and len(self._context_pools) > 1:
-                                    keys_iter = iter(self._context_pools)
-                                    next(keys_iter)
-                                    oldest_key = next(keys_iter)
-                                evicted_contexts.extend(self._context_pools.pop(oldest_key, []))
-                except Exception:
-                    pass
-                for evicted in evicted_contexts:
-                    try:
-                        await evicted.close()
-                    except Exception:
-                        pass
-                if context is not None:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
+            raise self._classify_browser_error(exc) from exc
 
     async def _include_same_site_frames(
         self, page: Any, html: str, main_url: str, warnings: list[str]
@@ -1169,7 +863,6 @@ class BrowserFetcher:
         main_site = registrable_host(main_url)
         matched_iframes: set[int] = set()
         frame_count = 0
-        max_frames = 3
         for frame in page.frames[1:]:
             frame_url = frame.url
             depth = 0
@@ -1210,7 +903,7 @@ class BrowserFetcher:
                 else:
                     (soup.body or soup).append(section)
                 frame_count += 1
-                if frame_count >= max_frames:
+                if frame_count >= 3:
                     warnings.append("Same-domain iframe limit was reached.")
                     break
             except Exception:
@@ -1219,14 +912,6 @@ class BrowserFetcher:
 
     async def close(self) -> None:
         self._cancel_idle_task()
-        async with self._context_lock:
-            for pool in self._context_pools.values():
-                for ctx in pool:
-                    try:
-                        await ctx.close()
-                    except Exception:
-                        pass
-            self._context_pools.clear()
         async with self._start_lock:
             if self._manager is not None:
                 try:
@@ -1243,4 +928,7 @@ class BrowserFetcher:
             xvfb = self._xvfb
             self._xvfb = None
             if xvfb is not None:
-                await asyncio.to_thread(xvfb.stop)
+                try:
+                    await asyncio.to_thread(xvfb.stop)
+                except Exception:
+                    pass

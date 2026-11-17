@@ -53,50 +53,13 @@ class SQLiteCache:
             raise
 
     async def _migrate_if_needed(self) -> None:
-        """Reconcile older ``fetch_cache`` schemas with the current layout.
-
-        Older releases added a ``created_at REAL NOT NULL`` column that newer
-        INSERTs no longer write. ``CREATE TABLE IF NOT EXISTS`` would happily
-        keep the stale column, which made every cache write fail with
-        ``IntegrityError: NOT NULL constraint failed: fetch_cache.created_at``.
-
-        We use SQLite's ``PRAGMA user_version`` as a one-shot marker and
-        drop the legacy column in-place (requires SQLite ≥ 3.35). No-op for
-        fresh databases and databases that have already been migrated.
-        """
+        """Reset transient cache table when on-disk schema predates SCHEMA_VERSION."""
         if self._db is None:
             raise RuntimeError("cache has not been started")
-        db = self._db
-        ver_cursor = await db.execute("PRAGMA user_version")
-        ver_row = await ver_cursor.fetchone()
-        await ver_cursor.close()
-        if ver_row and ver_row[0] >= SCHEMA_VERSION:
-            return  # already on the current schema
-
-        # Detect an existing fetch_cache table that still carries the legacy
-        # ``created_at`` column. ``PRAGMA table_info`` returns one row per
-        # column with (cid, name, type, notnull, dflt_value, pk).
-        exists_cursor = await db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fetch_cache'"
-        )
-        table_exists = await exists_cursor.fetchone() is not None
-        await exists_cursor.close()
-        if not table_exists:
-            # Fresh install; CREATE TABLE in start() will lay out the schema.
-            return
-
-        info_cursor = await db.execute("PRAGMA table_info(fetch_cache)")
-        columns = await info_cursor.fetchall()
-        await info_cursor.close()
-        has_legacy = any(col[1] == "created_at" for col in columns)
-        if not has_legacy:
-            # Table layout already matches the current schema; nothing to do.
-            return
-
-        # SQLite ≥ 3.35 supports ALTER TABLE … DROP COLUMN. The bundled
-        # sqlite3 in our minimum supported Python (3.11+) ships 3.37+, so
-        # this is always available.
-        await db.execute("ALTER TABLE fetch_cache DROP COLUMN created_at")
+        async with self._db.execute("PRAGMA user_version") as cursor:
+            ver_row = await cursor.fetchone()
+        if not ver_row or ver_row[0] < SCHEMA_VERSION:
+            await self._db.execute("DROP TABLE IF EXISTS fetch_cache")
 
     async def get(self, key: str, *, requested_screenshot: bool = False) -> FetchResult | None:
         """Return the cached result for *key*, or ``None`` when the key is missing

@@ -13,7 +13,6 @@ from .providers import (
     make_domain_session,
     make_random_session,
     parse_proxy_url,
-    redact_proxy_url,
     resolve_proxy,
 )
 
@@ -30,6 +29,5 @@ __all__ = [
     "make_domain_session",
     "make_random_session",
     "parse_proxy_url",
-    "redact_proxy_url",
     "resolve_proxy",
 ]

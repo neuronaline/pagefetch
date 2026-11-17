@@ -31,10 +31,12 @@ from .config import (
     PageFetchConfig,
 )
 from .constants import VALID_HTTP_METHODS
+from .cookies import CookiePool, CookieProfile, CookieRecord, load_cookies, parse_cookie_pool
 from .exceptions import PageFetchError
 from .models import (
     ActionResult,
     CapturedXHR,
+    ExpandedSection,
     FetchErrorInfo,
     FetchResult,
     ImageInfo,
@@ -56,10 +58,10 @@ from .proxy.providers import ProxyConfigurationError
 # never see "No handler found" warnings.
 logging.getLogger("pagefetch").addHandler(logging.NullHandler())
 
-# Browser dependencies (camoufox + browser binary) are auto-installed on
-# first browser use.  Call ensure_runtime_requirements() for an up-front
-# check without installation; call auto_bootstrap_browser() to force
-# installation at any point.
+# Browser dependencies (camoufox + browser binary) require 'pagefetch[browser]'
+# and 'python -m camoufox fetch' by default, or opt-in automatic installation
+# via PAGEFETCH_AUTO_INSTALL=1. Call ensure_runtime_requirements() for an
+# up-front check without installation.
 
 # Single source of truth is ``pyproject.toml``. ``importlib.metadata`` is the
 # canonical lookup and works for installed wheels / sdists; the fallback keeps
@@ -71,11 +73,15 @@ except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
     # Mirrors the version declared in ``pyproject.toml`` so that
     # ``pagefetch.__version__`` is usable before the distribution metadata
     # is installed (editable checkouts, sdists).
-    __version__ = "0.9.15"
+    __version__ = "0.9.16"
 
 __all__ = [
     "ActionResult",
     "CapturedXHR",
+    "CookiePool",
+    "CookieProfile",
+    "CookieRecord",
+    "ExpandedSection",
     "FetchErrorInfo",
     "FetchResult",
     "ImageInfo",
@@ -105,6 +111,8 @@ __all__ = [
     "ensure_runtime_requirements",
     "extract_document",
     "extract_structure",
+    "load_cookies",
     "normalize_actions",
     "parse_action",
+    "parse_cookie_pool",
 ]

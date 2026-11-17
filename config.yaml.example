@@ -44,10 +44,18 @@ retries_browser: 2
 # Number of requests served by a browser process before recycling (default: 50)
 # max_browser_requests: 50
 
+# Full-page main-window scroll bounds (every browser navigation scrolls to bottom)
+max_scroll_steps: 25
+max_scroll_height: 150000
+
+# Automatically expand in-page 'Read more' buttons, accordions, and dynamic tabs
+# (when true, forces mode=browser even if mode=auto)
+expand: false
+
 # ── Stealth & Anti-Detection ────────────────────────────────
 # Anti-detection preset: off | balanced | max
 #   off      — humanize=false, block_level=aggressive, request_pacing=0.0, session_rotation=sticky
-#   balanced — humanize=true,  block_level=balanced,   request_pacing=0.5, session_rotation=rotate (recommended)
+#   balanced — humanize=true,  block_level=balanced,   request_pacing=0.5, session_rotation=sticky (recommended)
 #   max      — humanize=true,  block_level=minimal,    request_pacing=2.0, session_rotation=rotate
 # Explicitly set options below override the preset values.
 stealth_level: balanced
@@ -109,10 +117,14 @@ cache_ttl: 24h               # s, m, h, d  suffixes accepted
 # cache_path: ./pagefetch-cache.sqlite3  # default uses the native user cache directory
 
 # ── Custom Headers & Cookies ────────────────────────────────
-# Default headers and cookies applied to all requests.
+# Default headers and cookies/cookie-pool applied across requests.
+# ``cookie_file`` accepts a Netscape cookies.txt file or a line-delimited
+# raw Cookie header file.
 # headers:
 #   Authorization: "Bearer ${API_TOKEN}"
 #   X-Custom-Client: "pagefetch-app"
+# cookie_file: ./cookies.txt
+# cookie_cooldown: 120.0
 # cookies:
 #   session_token: "example_token_value"
 

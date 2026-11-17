@@ -12,57 +12,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ..models import ActionResult, FetchErrorInfo, PageAction, VALID_ACTION_TYPES
+from ..processing.structure import build_js_interactive_tagger
 from .http import TransportFailure
 from .readiness import wait_for_stability
 
 logger = logging.getLogger("pagefetch.fetching.actions")
 
-_JS_TAG_INTERACTIVE_ELEMENTS = """() => {
-    const isInteractive = (el) => {
-        if (el.hasAttribute('disabled') || el.hasAttribute('hidden')) return false;
-        if (el.getAttribute('aria-hidden') === 'true') return false;
-        const tag = el.tagName.toLowerCase();
-        if (['button', 'select', 'textarea', 'summary', 'option'].includes(tag)) return true;
-        if (tag === 'a' && el.hasAttribute('href') && el.getAttribute('href').trim() !== '') return true;
-        if (tag === 'input') {
-            const t = (el.getAttribute('type') || 'text').toLowerCase();
-            return t !== 'hidden';
-        }
-        const role = (el.getAttribute('role') || '').toLowerCase();
-        if (['button', 'link', 'textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'switch', 'menuitem', 'tab', 'option'].includes(role)) {
-            return true;
-        }
-        const ce = el.getAttribute('contenteditable');
-        if (ce === '' || ce === 'true') return true;
-        const ti = el.getAttribute('tabindex');
-        if (ti !== null && !isNaN(parseInt(ti, 10)) && parseInt(ti, 10) >= 0) return true;
-        return false;
-    };
-    let count = 0;
-    let nodeCount = 0;
-    const maxDepth = 12;
-    const maxNodes = 800;
-
-    function walk(node, depth) {
-        if (!node || node.nodeType !== 1) return;
-        nodeCount++;
-        if (isInteractive(node)) {
-            count++;
-            node.setAttribute('data-pf-action-id', String(count));
-        }
-        if (depth + 1 < maxDepth && nodeCount < maxNodes) {
-            for (let child = node.firstElementChild; child; child = child.nextElementSibling) {
-                walk(child, depth + 1);
-                if (nodeCount >= maxNodes) break;
-            }
-        }
-    }
-    const root = document.documentElement || document.body;
-    if (root) {
-        walk(root, 0);
-    }
-    return count;
-}"""
+_JS_TAG_INTERACTIVE_ELEMENTS = build_js_interactive_tagger()
 
 
 def parse_action(spec: str) -> PageAction:
@@ -122,9 +78,6 @@ def parse_action(spec: str) -> PageAction:
         return PageAction(type=action_type, value=rest, optional=optional)
 
     return PageAction(type=action_type, selector=rest, optional=optional)
-
-
-_parse_action_string = parse_action
 
 
 def normalize_actions(

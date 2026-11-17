@@ -215,18 +215,32 @@ Automatic package and binary installation on first use is disabled by default fo
 ### `PageFetch` Client
 
 The main entry point. Use as an async context manager for automatic cleanup.
+`PageFetch(...)` exposes the 10 everyday options directly; pass a
+`PageFetchConfig` instance for advanced tuning:
 
 ```python
-from pagefetch import PageFetch
+from pagefetch import PageFetch, PageFetchConfig
 
 client = PageFetch(
     mode="auto",              # "auto" | "http" | "browser"
     proxy="none",             # "none" | "custom" | "decodo" | "byteful"
     cleaning_level="standard", # "minimal" | "standard" | "maximum"
-    http_concurrency=10,      # Max parallel HTTP requests
-    browser_concurrency=4,    # Max parallel browser instances
+    stealth_level="off",      # "off" | "balanced" | "max" preset
+    expand=False,             # Auto-expand in-DOM disclosures & client-side tabs
     cache_enabled=True,       # Enable SQLite disk cache
     cache_ttl="24h",          # TTL: "30m", "2h", "7d", or seconds as int
+    raise_on_error=False,     # Raise PageFetchError instead of returning error result
+    headers={},               # Default extra headers sent on every request
+    cookies={},               # Default cookies / CookiePool source
+)
+
+# Advanced concurrency, timeout, retry, proxy session, and browser tuning
+# goes through PageFetchConfig:
+config = PageFetchConfig(
+    mode="auto",
+    proxy="byteful",
+    http_concurrency=10,      # Max parallel HTTP requests
+    browser_concurrency=4,    # Max parallel browser instances
     cache_path=None,          # Custom SQLite cache path (None = platform default)
     http_timeout=20.0,        # Per-request HTTP timeout (seconds)
     browser_timeout=45.0,     # Per-page browser timeout (seconds)
@@ -238,21 +252,12 @@ client = PageFetch(
     block_images=True,        # Block image loading in browser mode to save bandwidth
     block_level="aggressive", # "minimal" | "balanced" | "aggressive"
     accept_language="en-US,en;q=0.5",  # Accept-Language header
-    humanize=False,          # Add small randomized delays to mimic a human
+    humanize=False,           # Add small randomized delays to mimic a human
     session_rotation="sticky",# "sticky" | "rotate" proxy session strategy
     session_duration=None,    # Optional sticky-session TTL for residential providers
-                              # ("30m", "2h", "1d" or integer seconds). Appends
-                              # -sessionduration-<minutes> (Decodo) or
-                              # _ttl_<n><unit> (Byteful) — see DECODO_DOCS §4,
-                              # BYTEFUL_DOCS §4. Ignored under session_rotation="rotate".
     request_pacing=0.0,       # Seconds of delay between requests
-    stealth_level="off",      # "off" | "balanced" | "max" preset
-    raise_on_error=False,     # Raise PageFetchError instead of returning error result
     screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…)
 )
-
-# Alternatively, initialize from an existing PageFetchConfig instance:
-config = PageFetchConfig.from_yaml("config.yaml")
 client = PageFetch(config=config)  # or PageFetch.from_config(config)
 
 # Or load directly from a YAML file in one shot:
@@ -269,21 +274,22 @@ client = PageFetch.from_yaml("config.yaml")
 
 ### Methods
 
-**`fetch(url, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
+**`fetch(url, *, mode=None, proxy=None, method="GET", headers=None, cookies=None, content=None, data=None, json=None, actions=None, capture_xhr=False, expand=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
-Fetch a single URL. All keyword arguments override client-level defaults for this request. Bare domains (e.g. `example.com`) are automatically normalized to `https://`.
+Fetch a single URL. Keyword arguments override client-level defaults for that request. Bare domains (e.g. `example.com`) are automatically normalized to `https://`. Supplying `actions`, `capture_xhr`, or `expand=True` automatically runs in browser mode (and raises `ValueError` if `mode="http"` is forced).
 
-**`fetch_many(urls, *, mode=None, proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
+**`fetch_many(urls, *, mode=None, proxy=None, ..., use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
 
 Fetch multiple URLs concurrently. Deduplicates identical inputs, preserves original ordering, and isolates failures across URLs.
 
-**`extract(url, *, structure=True, compact_structure=False, screenshot="none", screenshot_format="png", proxy=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
+**`extract(url, *, structure=True, compact_structure=False, screenshot="none", screenshot_format="png", proxy=None, headers=None, cookies=None, actions=None, capture_xhr=False, expand=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
 Fetch a page in browser mode and return the rendered DOM, an optional structural summary, and/or a screenshot:
 
 - `result.html` — Fully rendered HTML.
 - `result.structure` — `PageStructure` summary ($O(N)$ extraction with verified `unique_selector`).
 - `result.screenshot` / `result.screenshot_format` — Captured screenshot bytes (`screenshot="viewport"` or `screenshot="full"`).
+- `result.sections` — Structured `ExpandedSection` items collected from static/expanded tabs and disclosures.
 
 Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not cached in SQLite.
 
@@ -292,12 +298,14 @@ Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not c
 | Symbol | Purpose |
 |---|---|
 | `PageFetch`, `PageFetchConfig` | Client + validated configuration |
-| `FetchResult`, `LinkInfo`, `ImageInfo`, `FetchErrorInfo` | Result dataclasses |
+| `FetchResult`, `ExpandedSection`, `LinkInfo`, `ImageInfo`, `FetchErrorInfo` | Result dataclasses |
+| `CookiePool`, `CookieProfile`, `CookieRecord`, `load_cookies`, `parse_cookie_pool` | Stateless cookie-pool management & RFC 6265 matching |
 | `PageStructure`, `StructureNode`, `StylesheetInfo`, `InlineStylesheet`, `ScriptInfo`, `InlineScript` | Page-structure summary types |
-| `StructureLimits`, `extract_structure` | Lower-level structure extraction engine |
+| `StructureLimits`, `extract_structure`, `extract_document` | Lower-level DOM structure & non-HTML extraction engines |
+| `PageAction`, `ActionResult`, `CapturedXHR`, `parse_action`, `normalize_actions` | In-page browser interaction & XHR capture models |
 | `PageFetchError`, `ProxyConfigurationError`, `RuntimeBootstrapError` | Exception hierarchy |
 | `ensure_runtime_requirements`, `auto_bootstrap_browser` | Runtime dependency validation & installation |
-| `VALID_MODES`, `VALID_PROXIES`, `VALID_STEALTH_LEVELS`, `VALID_BLOCK_LEVELS`, `VALID_CLEANING_LEVELS`, `VALID_SESSION_ROTATION` | Configuration & validation constants |
+| `VALID_MODES`, `VALID_PROXIES`, `VALID_STEALTH_LEVELS`, `VALID_BLOCK_LEVELS`, `VALID_CLEANING_LEVELS`, `VALID_SESSION_ROTATION`, `VALID_ACTION_TYPES`, `VALID_HTTP_METHODS` | Configuration & validation constants |
 
 PageFetch is fully typed (PEP 561 compliant, shipping with `py.typed`). Type checkers like `mypy` and `pyright` will automatically discover in-line type annotations.
 
@@ -337,6 +345,9 @@ class FetchResult:
     fetched_at: datetime | None # ISO 8601 timestamp
     warnings: list[str]         # Non-fatal issues (cache skip, etc.)
     error: FetchErrorInfo | None  # Error details when success=False
+    actions_executed: list[ActionResult] | None  # Browser action outcomes
+    xhr_responses: list[CapturedXHR] | None      # Captured background XHR/fetch payloads
+    sections: list[ExpandedSection] | None       # Static or dynamically expanded tab sections
 ```
 
 ### Serialization
@@ -417,6 +428,8 @@ pagefetch https://example.com --debug
 | `--request-pacing SECONDS` | `request_pacing` |
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
 | `--cleaning-level {minimal,standard,maximum}` | `cleaning_level` |
+| `--expand` / `--no-expand` | `expand` |
+| `--cookie COOKIE` / `--cookie-file PATH` | `cookies` / `cookie_file` |
 | `--include-html` | `FetchResult.json(include_html=…)` |
 | `--screenshot {none,viewport,full}` | `PageFetch.extract(screenshot=…)` |
 | `--screenshot-format {png,jpeg}` | `PageFetch.extract(screenshot_format=…)` |
@@ -426,10 +439,6 @@ pagefetch https://example.com --debug
 | `--debug` | Enable verbose DEBUG logging |
 
 Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error, `3` partial failure.
-
-### Interactive Menu
-
-Running `python -m pagefetch` with **no arguments** launches a guided interactive terminal menu (mode, proxy, stealth, format, URL entry). Supplying any argument (e.g. `python -m pagefetch example.com`) directly runs the CLI.
 
 ---
 
@@ -449,7 +458,8 @@ result = await client.fetch("https://example.com", use_cache=False)
 result = await client.fetch("https://example.com", cache_ttl="1h")
 
 # Custom SQLite database location
-client = PageFetch(cache_path="/path/to/custom_cache.sqlite3")
+from pagefetch import PageFetchConfig
+client = PageFetch(config=PageFetchConfig(cache_path="/path/to/custom_cache.sqlite3"))
 ```
 
 ---
@@ -477,11 +487,11 @@ async with PageFetch(proxy="decodo") as client:
     result = await client.fetch("https://example.de")
 
 # Byteful sticky session with a 2-hour TTL token
-async with PageFetch(proxy="byteful", session_duration="2h") as client:
+async with PageFetch(config=PageFetchConfig(proxy="byteful", session_duration="2h")) as client:
     result = await client.fetch("https://example.com")
 
 # Rotate proxy sessions across requests
-async with PageFetch(proxy="byteful", session_rotation="rotate") as client:
+async with PageFetch(config=PageFetchConfig(proxy="byteful", session_rotation="rotate")) as client:
     results = await client.fetch_many([...])
 ```
 
@@ -495,9 +505,11 @@ Credentials are never exposed in result objects, logs, or cache keys.
 | Content Type | Detection | Extraction |
 |---|---|---|
 | **PDF** | Magic bytes + `Content-Type` | Clean text extraction via optional `pagefetch[pdf]` extra |
-| **XML** | `+xml` or `application/xml` | Strictly parsed with `lxml`; text in `.text` and XML tree in fenced `.markdown` |
-| **JSON** | `application/json` or `+json` | Raw payload preserved as `.text` and `.markdown` without browser overhead |
-| **Plain text** | `text/plain` or fallback | Preserved as `.text` and `.markdown` |
+| **DOCX** | Archive signature / MIME / `.docx` | Headings, lists, hyperlinks, and GFM tables via `lxml` + `zipfile` |
+| **CSV / TSV** | MIME / `.csv` / `.tsv` | Delimiter detection + GFM Markdown table in `.markdown` and full data in `.text` |
+| **XML** | `+xml` or `application/xml` | Feeds (RSS/Atom) formatted as Markdown articles; generic XML in fenced code |
+| **JSON** | `application/json` or `+json` | Pretty-printed `.text` and fenced `.markdown` with metadata |
+| **Plain text** | `text/plain` or `.txt` / `.md` | Preserved as `.text` and `.markdown` |
 
 Non-HTML content is handled immediately at the HTTP layer, bypassing all browser dependencies.
 
@@ -528,7 +540,7 @@ Non-HTML content is handled immediately at the HTTP layer, bypassing all browser
 | `humanize` | `bool` | `False` | Add randomized delays mimicking human interactions |
 | `session_rotation` | `str` | `"sticky"` | `"sticky"` or `"rotate"` proxy session rotation |
 | `session_duration` | `str \| int \| None` | `None` | Optional sticky-session TTL forwarded to residential providers. Decodo → `-sessionduration-<minutes>` (1–1440 min); Byteful → `_ttl_<n><unit>` (1 min – 7 days). See DECODO_DOCS §4, BYTEFUL_DOCS §4. |
-| `request_pacing` | `float` | `0.0` | Seconds of delay between browser requests |
+| `request_pacing` | `float` | `0.0` | Per-host randomized delay ceiling (seconds) between requests |
 | `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
 | `screenshot_max_bytes` | `int` | `50 MiB` | Maximum allowed screenshot byte size |
