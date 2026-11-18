@@ -1,4 +1,4 @@
-"""Optional-dependency checks and opt-in browser runtime bootstrap.
+"""Runtime dependency checks and opt-in Camoufox browser bootstrap.
 
 Automatic browser installation is disabled by default. Set
 ``PAGEFETCH_AUTO_INSTALL=1`` to allow automatic installation on first use.
@@ -23,14 +23,14 @@ _FETCH_TIMEOUT = 300
 
 # Single source of truth for the Camoufox pip spec used by the opt-in
 # auto-install path (``PAGEFETCH_AUTO_INSTALL=1``). This MUST stay in lockstep
-# with the ``browser`` extra defined in ``pyproject.toml``. ``pip install``
-# runs arbitrary PyPI-provided code in the host Python environment with full
-# user privileges; automatic installation is disabled by default.
+# with ``dependencies`` in ``pyproject.toml``. ``pip install`` runs arbitrary
+# PyPI-provided code in the host Python environment with full user privileges;
+# automatic installation is disabled by default.
 _CAMOUFOX_SPEC = "camoufox[geoip]>=0.5.6,<1"
 
 
 class RuntimeBootstrapError(RuntimeError):
-    """Raised when an explicitly requested optional feature is unavailable."""
+    """Raised when a required runtime dependency or browser binary is unavailable."""
 
 
 def ensure_runtime_requirements(
@@ -38,14 +38,14 @@ def ensure_runtime_requirements(
     needs_browser: bool = True,
     needs_pdf: bool = False,
 ) -> None:
-    """Validate optional feature dependencies without changing the environment."""
+    """Validate runtime dependencies without changing the environment."""
     missing: list[str] = []
     if needs_browser and importlib.util.find_spec("camoufox") is None:
-        missing.append("browser support: pip install 'pagefetch[browser]'")
+        missing.append("browser support: pip install 'camoufox[geoip]'")
     if needs_pdf and importlib.util.find_spec("pypdf") is None:
-        missing.append("PDF support: pip install 'pagefetch[pdf]'")
+        missing.append("PDF support: pip install pypdf")
     if missing:
-        raise RuntimeBootstrapError("Missing optional dependencies: " + "; ".join(missing))
+        raise RuntimeBootstrapError("Missing runtime dependencies: " + "; ".join(missing))
 
 
 def _get_pip_command() -> list[str]:
@@ -155,7 +155,7 @@ async def bootstrap_browser() -> None:
         if not _has_camoufox_binary():
             raise RuntimeBootstrapError(
                 "Automatic browser installation is disabled (set PAGEFETCH_AUTO_INSTALL=1 "
-                "to enable, or install 'pagefetch[browser]' and run 'python -m camoufox fetch')."
+                "to enable, or run 'python -m camoufox fetch')."
             )
         return
     await asyncio.to_thread(_install_browser_sync)

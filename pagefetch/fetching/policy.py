@@ -1,22 +1,14 @@
-"""Per-host pacing and adaptive browser-escalation memory."""
+"""Per-host request pacing."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 import time
 from urllib.parse import urlsplit
 
 from ..utils.cache_dict import BoundedTTLCache
 from ..utils.urls import registrable_host
-
-logger = logging.getLogger("pagefetch")
-
-# Process-wide adaptive host memory so short-lived PageFetch instances
-# remember hosts that required browser escalation within the last 10 minutes.
-_HOST_ESCALATIONS: BoundedTTLCache[str, list[float]] = BoundedTTLCache(max_size=1000, ttl=300.0)
-_HOST_MEMORY: BoundedTTLCache[str, bool] = BoundedTTLCache(max_size=1000, ttl=600.0)
 
 
 class AsyncPacer:
@@ -43,7 +35,7 @@ class AsyncPacer:
 
 
 class HostPolicy:
-    """Coordinates per-host request pacing and cross-instance escalation memory."""
+    """Coordinates per-host request pacing."""
 
     __slots__ = ("_request_pacing", "_host_pacers")
 
@@ -60,15 +52,3 @@ class HostPolicy:
             return
         pacer = self._host_pacers.get_or_create(host, lambda: AsyncPacer(self._request_pacing))
         await pacer.acquire()
-
-    def record_escalation(self, url: str) -> None:
-        """Record an escalation to browser mode for adaptive host memory."""
-        host = (urlsplit(url).hostname or url).lower()
-        if _HOST_ESCALATIONS.append_timestamp(host, window=300.0) >= 2:
-            _HOST_MEMORY.set(host, True)
-            logger.info("Host %s remembered for browser mode (10m TTL)", host)
-
-    def is_remembered(self, url: str) -> bool:
-        """Return True if host is cached as requiring browser mode."""
-        host = (urlsplit(url).hostname or url).lower()
-        return bool(_HOST_MEMORY.get(host, False))

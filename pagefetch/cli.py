@@ -5,10 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import random
 import sys
 from collections.abc import Sequence
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +14,6 @@ from .client import PageFetch
 from .config import (
     VALID_BLOCK_LEVELS,
     VALID_CLEANING_LEVELS,
-    VALID_MODES,
     VALID_OUTPUT_FORMATS,
     VALID_PROXIES,
     VALID_SCREENSHOT_FORMATS,
@@ -49,7 +46,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("input", metavar="URL_OR_FILE")
     parser.add_argument("--format", choices=sorted(VALID_OUTPUT_FORMATS), default="markdown")
     parser.add_argument("-c", "--config", type=Path, metavar="PATH", help="Path to config.yaml")
-    parser.add_argument("--mode", choices=sorted(VALID_MODES), default=argparse.SUPPRESS)
     parser.add_argument(
         "--proxy",
         choices=sorted(VALID_PROXIES),
@@ -62,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--screenshot",
         choices=sorted(VALID_SCREENSHOT_MODES),
         default=argparse.SUPPRESS,
-        help="Capture a screenshot (forces mode=browser). 'viewport' = visible area, 'full' = entire scrollable page.",
+        help="Capture a screenshot. 'viewport' = visible area, 'full' = entire scrollable page.",
     )
     parser.add_argument(
         "--screenshot-format",
@@ -77,10 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cache time-to-live, e.g. 30s, 15m, 24h, 7d (default: 24h)",
     )
     parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--http-concurrency", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--browser-concurrency", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--concurrency", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--browser-timeout", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--retries", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--block-images", action="store_true", default=argparse.SUPPRESS, dest="block_images")
     parser.add_argument("--no-block-images", action="store_false", default=argparse.SUPPRESS, dest="block_images")
     parser.add_argument("--debug", action="store_true")
@@ -89,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--block-level",
         choices=sorted(VALID_BLOCK_LEVELS),
         default=argparse.SUPPRESS,
-        help="Resource blocking aggressiveness (default: aggressive)",
+        help="Resource blocking aggressiveness (default: balanced)",
     )
     parser.add_argument(
         "--accept-language",
@@ -122,13 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         metavar="SECONDS",
         default=argparse.SUPPRESS,
-        help="Delay between requests (default: 0.0)",
+        help="Per-host randomized delay ceiling in seconds (default: 0.5)",
     )
     parser.add_argument(
         "--stealth-level",
         choices=sorted(VALID_STEALTH_LEVELS),
         default=argparse.SUPPRESS,
-        help="Anti-detection profile preset (default: off)",
+        help="Anti-detection profile preset (default: balanced)",
     )
     parser.add_argument(
         "--cleaning-level",
@@ -136,13 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="How aggressively to strip non-content DOM (default: standard)",
     )
-    # HTTP and interaction extensions
-    parser.add_argument(
-        "-X",
-        "--method",
-        default=None,
-        help="HTTP request method: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS (default: GET, or POST if payload is given)",
-    )
+    # Interaction and cookie extensions
     parser.add_argument(
         "-H",
         "--header",
@@ -171,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=argparse.SUPPRESS,
         dest="expand",
-        help="Automatically expand 'Read more' disclosures, accordions, and dynamic tabs (forces mode=browser)",
+        help="Automatically expand 'Read more' disclosures, accordions, and dynamic tabs (default: enabled)",
     )
     parser.add_argument(
         "--no-expand",
@@ -179,17 +168,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         dest="expand",
         help="Disable automatic disclosure and tab expansion",
-    )
-    parser.add_argument(
-        "-d",
-        "--data",
-        metavar="DATA",
-        help="Request body payload for POST/PUT requests",
-    )
-    parser.add_argument(
-        "--json",
-        metavar="JSON",
-        help="JSON payload string for POST/PUT requests",
     )
     parser.add_argument(
         "--action",
@@ -250,8 +228,6 @@ def _build_config(args: argparse.Namespace) -> PageFetchConfig:
         k: v for k, v in vars(args).items()
         if k in known_fields and v is not None
     }
-    if getattr(args, "timeout", None) is not None:
-        cli_overrides["http_timeout"] = args.timeout
     if getattr(args, "no_cache", False):
         cli_overrides["cache_enabled"] = False
 
@@ -285,12 +261,8 @@ async def run_batch(
     screenshot: str = "none",
     screenshot_format: str = "png",
     output: Path | None = None,
-    method: str = "GET",
     headers: dict[str, str] | None = None,
     cookies: Any = None,
-    content: bytes | str | None = None,
-    data: dict[str, Any] | None = None,
-    json_data: Any = None,
     actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
     capture_xhr: bool | str | Sequence[str] = False,
 ) -> int:
@@ -304,47 +276,26 @@ async def run_batch(
     extract_structure = output_format in {"structure", "raw"}
     include_screenshot = screenshot != "none" and output_format in {"raw", "json"}
     use_extract = extract_structure or screenshot != "none"
-    use_browser = use_extract or bool(actions) or bool(capture_xhr) or config.expand
-    effective_mode = "browser" if use_browser else config.mode
-    if use_browser and config.mode != "browser":
-        print(
-            f"pagefetch: forced mode=browser (was {config.mode})",
-            file=sys.stderr,
-        )
-    if effective_mode != config.mode:
-        client_config = replace(config, mode=effective_mode)
-    else:
-        client_config = config
-    async with PageFetch(config=client_config) as client:
+    async with PageFetch(config=config) as client:
         if use_extract:
-            results = []
-            pacing = config.request_pacing or 0.0
-            for idx, item in enumerate(urls):
-                # Stagger browser navigations to avoid a synchronized burst —
-                # a stronger bot signal than the parallel fetch_many path.
-                if pacing > 0 and idx > 0:
-                    await asyncio.sleep(random.uniform(0, pacing))
-                results.append(
-                    await client.extract(
-                        item,
-                        structure=extract_structure,
-                        screenshot=screenshot,
-                        screenshot_format=screenshot_format,
-                        headers=headers,
-                        cookies=cookies,
-                        actions=actions,
-                        capture_xhr=capture_xhr,
-                    )
+            results = [
+                await client.extract(
+                    item,
+                    structure=extract_structure,
+                    screenshot=screenshot,
+                    screenshot_format=screenshot_format,
+                    headers=headers,
+                    cookies=cookies,
+                    actions=actions,
+                    capture_xhr=capture_xhr,
                 )
+                for item in urls
+            ]
         else:
             results = await client.fetch_many(
                 urls,
-                method=method,
                 headers=headers,
                 cookies=cookies,
-                content=content,
-                data=data,
-                json=json_data,
                 actions=actions,
                 capture_xhr=capture_xhr,
             )
@@ -392,18 +343,6 @@ async def _run(args: argparse.Namespace) -> int:
     else:
         capture_xhr = raw_xhr
 
-    json_payload = None
-    if getattr(args, "json", None):
-        import json as _json
-        json_payload = _json.loads(args.json)
-
-    data_payload = getattr(args, "data", None)
-    method_arg = getattr(args, "method", None)
-    if method_arg is None:
-        method = "POST" if (data_payload is not None or json_payload is not None) else "GET"
-    else:
-        method = method_arg.upper()
-
     return await run_batch(
         config,
         urls,
@@ -412,9 +351,6 @@ async def _run(args: argparse.Namespace) -> int:
         screenshot=screenshot,
         screenshot_format=screenshot_format,
         output=args.output,
-        method=method,
-        content=data_payload,
-        json_data=json_payload,
         actions=actions,
         capture_xhr=capture_xhr,
     )

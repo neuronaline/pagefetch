@@ -12,3 +12,12 @@ class PageFetchError(Exception):
         self.error = error
         self.url = url
         super().__init__(error.message)
+
+
+class TransportFailure(Exception):
+    """Internal transport exception carrying structured :class:`FetchErrorInfo`."""
+
+    def __init__(self, error: FetchErrorInfo, *, status_code: int | None = None) -> None:
+        self.error = error
+        self.status_code = status_code
+        super().__init__(error.message)

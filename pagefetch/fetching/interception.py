@@ -11,8 +11,33 @@ from urllib.parse import urlsplit
 
 from ..models import CapturedXHR
 from ..processing.challenges import CHALLENGE_DOMAINS, CHALLENGE_PATH_PREFIXES
-from ..utils.urls import async_is_safe_host, registrable_host
+from ..processing.pipeline import is_unsupported_binary_response, parse_content_type
+from ..utils.urls import _precheck_host_safety, async_is_safe_host, registrable_host
 from .actions import matches_xhr_pattern
+
+_NETWORK_SCHEMES: frozenset[str] = frozenset({"http", "https", "ws", "wss"})
+_SAFE_NON_NETWORK_SCHEMES: frozenset[str] = frozenset({"about", "data", "blob"})
+_CREDENTIAL_HEADERS: frozenset[str] = frozenset(
+    {"authorization", "cookie", "proxy-authorization"}
+)
+
+
+def _origin_tuple(url: str) -> tuple[str, str, int] | None:
+    """Return normalized ``(http_scheme, host, port)`` for same-origin header scoping."""
+    parsed = urlsplit(url)
+    raw_scheme = parsed.scheme.lower()
+    if raw_scheme not in _NETWORK_SCHEMES:
+        return None
+    norm_scheme = "https" if raw_scheme in {"https", "wss"} else "http"
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return None
+    default_port = 443 if norm_scheme == "https" else 80
+    try:
+        port = parsed.port or default_port
+    except ValueError:
+        return None
+    return (norm_scheme, host, port)
 
 # Resource-type blocking sets per stealth level.
 # Note: stylesheets and websockets remain intact for layout & WAF verification.
@@ -59,8 +84,13 @@ class PageNetworkTracker:
         has_proxy: bool,
         capture_xhr: bool | str | Sequence[str] = False,
         screenshot: bool = False,
+        strip_cross_origin_credentials: bool = False,
+        max_content_size: int | None = None,
     ) -> None:
         self._main_site = registrable_host(target_url)
+        self._target_origin = _origin_tuple(target_url)
+        self._strip_cross_origin_credentials = strip_cross_origin_credentials
+        self._max_content_size = max_content_size
         self._has_proxy = has_proxy
         self._capture_xhr = capture_xhr
         self._block_level = block_level
@@ -72,8 +102,16 @@ class PageNetworkTracker:
         self.active: int = 0
         self.last_activity: float = time.monotonic()
         self.last_document_status: int | None = None
+        self.last_document_url: str | None = None
+        self.last_document_headers: dict[str, str] | None = None
+        self.last_document_response: Any = None
+        self.ssrf_blocked_url: str | None = None
+        self.unsupported_content_type: str | None = None
+        self.oversized_response: bool = False
+        self.abort_event: asyncio.Event = asyncio.Event()
         self.captured_xhr: list[CapturedXHR] = []
         self.pending_xhr_tasks: set[asyncio.Task[Any]] = set()
+        self._pending_ssrf_tasks: set[asyncio.Task[Any]] = set()
         self._total_xhr_bytes = 0
         self._page: Any = None
 
@@ -93,6 +131,7 @@ class PageNetworkTracker:
     async def detach(self, page: Any) -> None:
         """Cancel pending XHR tasks and flush Playwright routes before page close."""
         self.cancel_pending()
+        self.last_document_response = None
         if page is None:
             return
         try:
@@ -103,10 +142,23 @@ class PageNetworkTracker:
         await asyncio.sleep(0)
 
     def cancel_pending(self) -> None:
-        """Cancel any unfinished XHR body capture tasks."""
-        for task in list(self.pending_xhr_tasks):
+        """Cancel any unfinished XHR or SSRF verification tasks."""
+        for task in (*self.pending_xhr_tasks, *self._pending_ssrf_tasks):
             if not task.done():
                 task.cancel()
+
+    async def check_ssrf(self, final_url: str | None = None) -> str | None:
+        """Await pending redirect host checks and return any SSRF-blocked URL."""
+        if self._pending_ssrf_tasks:
+            await asyncio.gather(*list(self._pending_ssrf_tasks), return_exceptions=True)
+        if self.ssrf_blocked_url:
+            return self.ssrf_blocked_url
+        if final_url and final_url.startswith(("http://", "https://")):
+            host = (urlsplit(final_url).hostname or "").lower()
+            if host and not await async_is_safe_host(host, resolve_dns=not self._has_proxy):
+                self.ssrf_blocked_url = final_url
+                return final_url
+        return None
 
     async def finalize_xhr(self) -> list[CapturedXHR] | None:
         """Await pending XHR body captures and return collected payloads if non-empty."""
@@ -114,9 +166,48 @@ class PageNetworkTracker:
             await asyncio.gather(*list(self.pending_xhr_tasks), return_exceptions=True)
         return self.captured_xhr or None
 
-    def _on_request_started(self, _request: Any) -> None:
+    async def _verify_redirect_dns(self, host: str, req_url: str) -> None:
+        if not await async_is_safe_host(host, resolve_dns=not self._has_proxy):
+            if self.ssrf_blocked_url is None:
+                self.ssrf_blocked_url = req_url
+                self.abort_event.set()
+
+    def _inspect_redirect_request(self, request: Any) -> None:
+        req_url = getattr(request, "url", "") or ""
+        scheme = req_url.split(":", 1)[0].lower() if ":" in req_url else ""
+        main_frame = getattr(self._page, "main_frame", None)
+        is_main_doc = (
+            getattr(request, "resource_type", None) == "document"
+            and main_frame is not None
+            and getattr(request, "frame", None) == main_frame
+        )
+        if scheme not in _NETWORK_SCHEMES:
+            if scheme not in _SAFE_NON_NETWORK_SCHEMES and is_main_doc and self.ssrf_blocked_url is None:
+                self.ssrf_blocked_url = req_url
+                self.abort_event.set()
+            return
+        req_host = (urlsplit(req_url).hostname or "").lower()
+        if not req_host:
+            return
+        verdict = _precheck_host_safety(req_host, resolve_dns=not self._has_proxy)
+        if verdict is False:
+            if is_main_doc and self.ssrf_blocked_url is None:
+                self.ssrf_blocked_url = req_url
+                self.abort_event.set()
+        elif isinstance(verdict, str) and is_main_doc:
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(self._verify_redirect_dns(verdict, req_url))
+                self._pending_ssrf_tasks.add(task)
+                task.add_done_callback(self._pending_ssrf_tasks.discard)
+            except RuntimeError:
+                pass
+
+    def _on_request_started(self, request: Any) -> None:
         self.active += 1
         self.last_activity = time.monotonic()
+        if getattr(request, "redirected_from", None) is not None:
+            self._inspect_redirect_request(request)
 
     def _on_request_finished(self, _request: Any) -> None:
         self.active = max(0, self.active - 1)
@@ -126,8 +217,39 @@ class PageNetworkTracker:
         try:
             req = getattr(resp, "request", None)
             if req and req.resource_type == "document":
-                if getattr(resp, "frame", None) == self._page.main_frame:
+                if (
+                    getattr(resp, "frame", None) == self._page.main_frame
+                    and not (300 <= resp.status < 400)
+                ):
                     self.last_document_status = resp.status
+                    self.last_document_url = resp.url
+                    self.last_document_response = resp
+                    raw_headers = getattr(resp, "headers", None)
+                    if isinstance(raw_headers, dict):
+                        hdr_copy = dict(raw_headers)
+                        self.last_document_headers = hdr_copy
+                        if resp.status < 400:
+                            ct_val = ""
+                            cd_val = ""
+                            cl_val = ""
+                            for k, v in hdr_copy.items():
+                                lk = str(k).lower()
+                                if lk == "content-type":
+                                    ct_val = str(v)
+                                elif lk == "content-disposition":
+                                    cd_val = str(v)
+                                elif lk == "content-length":
+                                    cl_val = str(v).strip()
+                            if is_unsupported_binary_response(ct_val, resp.url, cd_val):
+                                self.unsupported_content_type = parse_content_type(ct_val)
+                                self.abort_event.set()
+                            elif (
+                                self._max_content_size is not None
+                                and cl_val.isdigit()
+                                and int(cl_val) > self._max_content_size
+                            ):
+                                self.oversized_response = True
+                                self.abort_event.set()
             if self._capture_xhr and req and req.resource_type in {"xhr", "fetch"}:
                 if matches_xhr_pattern(resp.url, self._capture_xhr):
                     pending_count = len(self.pending_xhr_tasks)
@@ -179,12 +301,28 @@ class PageNetworkTracker:
         request = route.request
         request_url = request.url
         res_type = request.resource_type
-        req_host = ""
-        req_path = ""
-        if request_url.startswith(("http://", "https://", "ws://", "wss://")):
-            req_parsed = urlsplit(request_url)
-            req_host = (req_parsed.hostname or "").lower()
-            req_path = (req_parsed.path or "").lower()
+        main_frame = getattr(self._page, "main_frame", None)
+        is_main_doc = (
+            res_type == "document"
+            and main_frame is not None
+            and getattr(request, "frame", None) == main_frame
+        )
+        scheme = request_url.split(":", 1)[0].lower() if ":" in request_url else ""
+        if scheme not in _NETWORK_SCHEMES:
+            try:
+                if scheme in _SAFE_NON_NETWORK_SCHEMES:
+                    await route.continue_()
+                else:
+                    if is_main_doc and self.ssrf_blocked_url is None:
+                        self.ssrf_blocked_url = request_url
+                    await route.abort()
+            except Exception:
+                pass
+            return
+
+        req_parsed = urlsplit(request_url)
+        req_host = (req_parsed.hostname or "").lower()
+        req_path = (req_parsed.path or "").lower()
 
         is_challenge_host = any(
             req_host == d or req_host.endswith("." + d)
@@ -200,13 +338,12 @@ class PageNetworkTracker:
 
         external_frame = False
         external_script = False
-        main_frame = getattr(self._page, "main_frame", None)
         if (
             self._block_level != "minimal"
             and not is_challenge_host
             and main_frame is not None
             and getattr(request, "frame", None) != main_frame
-            and request_url.startswith(("http://", "https://"))
+            and scheme in {"http", "https"}
         ):
             if res_type == "document":
                 external_frame = registrable_host(request_url) != self._main_site
@@ -218,8 +355,23 @@ class PageNetworkTracker:
                 await route.abort()
                 return
             if req_host and not await async_is_safe_host(req_host, resolve_dns=not self._has_proxy):
+                if is_main_doc and self.ssrf_blocked_url is None:
+                    self.ssrf_blocked_url = request_url
                 await route.abort()
                 return
-            await route.continue_()
+            if (
+                self._strip_cross_origin_credentials
+                and _origin_tuple(request_url) != self._target_origin
+            ):
+                stripped_hdrs = {
+                    k: v
+                    for k, v in (await request.all_headers()).items()
+                    if not k.startswith(":")
+                    and k.lower() != "host"
+                    and k.lower() not in _CREDENTIAL_HEADERS
+                }
+                await route.continue_(headers=stripped_hdrs)
+            else:
+                await route.continue_()
         except Exception:
             pass

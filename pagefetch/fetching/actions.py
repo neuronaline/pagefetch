@@ -11,9 +11,9 @@ from collections.abc import Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..exceptions import TransportFailure
 from ..models import ActionResult, FetchErrorInfo, PageAction, VALID_ACTION_TYPES
 from ..processing.structure import build_js_interactive_tagger
-from .http import TransportFailure
 from .readiness import wait_for_stability
 
 logger = logging.getLogger("pagefetch.fetching.actions")

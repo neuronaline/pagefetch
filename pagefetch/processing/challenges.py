@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 
 # Multilingual interstitial phrases indicating an active challenge gate.
@@ -153,12 +154,15 @@ _WAF_BYTE_STRINGS: tuple[str, ...] = (
     "cf-chl-bypass",
     "cf_chl_opt",
     "__cf_chl_jschl_tk__",
+    "cf-turnstile",
+    "cf-error-details",
     "challenge-running",
     "checking your browser",
     "verify you are human",
     "just a moment",
     "attention required",
-    "access denied",
+    "sorry, you have been blocked",
+    "error code: 1020",
     "akamai bot manager",
     "perimeterx",
     "datadome",
@@ -170,6 +174,26 @@ _WAF_BYTE_STRINGS: tuple[str, ...] = (
     "grecaptcha.enterprise.execute",
 )
 WAF_CHALLENGE_MARKERS: tuple[bytes, ...] = tuple(s.encode("ascii") for s in _WAF_BYTE_STRINGS)
+
+# Response headers that unambiguously indicate an active WAF/anti-bot challenge or mitigation.
+WAF_CHALLENGE_HEADERS: frozenset[str] = frozenset(
+    {
+        "cf-mitigated",
+        "x-datadome",
+        "x-dd-b",
+        "x-dd-type",
+        "x-amzn-waf-action",
+        "x-kpsdk-ct",
+        "x-kpsdk-cd",
+        "x-vercel-mitigated",
+    }
+)
+
+_NON_VISIBLE_HTML_RE = re.compile(
+    r"<!--.*?-->|<(?:script|style|title|noscript)\b[^>]*>.*?</(?:script|style|title|noscript)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_HTML_TAG_STRIP_RE = re.compile(r"<[^>]+>")
 
 # Third-party challenge domains allowed through browser resource/request filters.
 CHALLENGE_DOMAINS: frozenset[str] = frozenset(
@@ -203,8 +227,44 @@ CHALLENGE_PATH_PREFIXES: tuple[str, ...] = (
 )
 
 
-def looks_like_waf_challenge(content: bytes) -> bool:
-    """Return True when *content* carries WAF challenge markers in the first 8 KiB."""
+def _is_empty_or_bare_shell(sample: str) -> bool:
+    """Return True when *sample* is empty or an HTML shell with no visible text."""
+    stripped = sample.strip()
+    if not stripped:
+        return True
+    if not stripped.startswith("<"):
+        return False
+    without_invisible = _NON_VISIBLE_HTML_RE.sub("", stripped)
+    return not _HTML_TAG_STRIP_RE.sub("", without_invisible).strip()
+
+
+def has_waf_challenge_header(
+    headers: Mapping[str, str] | None,
+    *,
+    status_code: int | None = None,
+) -> bool:
+    """Return True when *headers* or *status_code* explicitly signal an anti-bot challenge."""
+    if status_code == 203:
+        return True
+    if not headers:
+        return False
+    lowered = {str(k).lower(): str(v).lower() for k, v in headers.items()}
+    if any(h in lowered for h in WAF_CHALLENGE_HEADERS):
+        return True
+    if "caf" in lowered or "x-ncbi-captcha" in lowered.get("vary", ""):
+        return True
+    return False
+
+
+def looks_like_waf_challenge(
+    content: bytes,
+    headers: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when *content* or *headers* carry WAF challenge markers."""
+    if headers:
+        lowered_keys = {str(k).lower() for k in headers}
+        if any(h in lowered_keys for h in WAF_CHALLENGE_HEADERS):
+            return True
     if not content:
         return False
     head = content[:8192].lower()
@@ -214,16 +274,38 @@ def looks_like_waf_challenge(content: bytes) -> bool:
 def detect_challenge_provider(
     html: str,
     headers: Mapping[str, str] | None = None,
+    *,
+    status_code: int | None = None,
 ) -> str | None:
-    """Identify the specific challenge or WAF provider from response headers and HTML."""
+    """Identify the specific challenge or WAF provider from response headers, status, and HTML."""
     hdrs = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
     sample = (html or "")[:65536].lower()
+    server = hdrs.get("server", "")
+    is_block_status = status_code in {403, 429}
+    bare_body = _is_empty_or_bare_shell(sample)
 
-    if "x-datadome" in hdrs or "datadome.co" in sample or "dd_cid" in sample:
+    if (
+        "x-datadome" in hdrs
+        or "x-dd-b" in hdrs
+        or "x-dd-type" in hdrs
+        or "datadome.co" in sample
+        or "dd_cid" in sample
+        or "datadome=" in hdrs.get("set-cookie", "")
+        or "datadome" in server
+    ):
         return "datadome"
     if "x-amzn-waf-action" in hdrs or "awswaf.com" in sample or "aws-waf-token" in sample:
         return "aws_waf"
-    if "perimeterx.net" in sample or "px-captcha" in sample or "_pxcaptcha" in sample:
+    if any(k in hdrs for k in ("x-kpsdk-ct", "x-kpsdk-cd", "x-kpsdk-r", "x-kpsdk-v")):
+        return "kasada"
+    if "x-vercel-mitigated" in hdrs:
+        return "vercel"
+    if (
+        "perimeterx.net" in sample
+        or "px-captcha" in sample
+        or "_pxcaptcha" in sample
+        or any(k.startswith("x-px-") for k in hdrs)
+    ):
         return "perimeterx"
     if "arkoselabs.com" in sample or "funcaptcha.com" in sample:
         return "arkose"
@@ -236,23 +318,63 @@ def detect_challenge_provider(
         or "recaptcha.net" in sample
         or "recaptcha.google.com" in sample
         or "recaptchachallengepageui" in sample
+        or "grecaptcha.enterprise.execute" in sample
     ):
         return "recaptcha"
     if (
-        "cf-turnstile" in sample
+        "cf-mitigated" in hdrs
+        or "cf-turnstile" in sample
         or "cf-chl-" in sample
         or "_cf_chl_opt" in sample
         or "challenges.cloudflare.com" in sample
         or (
-            "cf-ray" in hdrs
-            and ("just a moment" in sample or "attention required" in sample or "cf-mitigated" in hdrs)
+            ("cf-ray" in hdrs or "cloudflare" in server)
+            and (
+                "just a moment" in sample
+                or "attention required" in sample
+                or "sorry, you have been blocked" in sample
+                or "cf-error-details" in sample
+                or "error code: 1020" in sample
+                or (is_block_status and bare_body)
+            )
         )
     ):
         return "cloudflare"
-    if "incapsula" in sample or "_incap_" in sample or "visid_incap" in sample or "x-iinfo" in hdrs:
+    if (
+        "incapsula" in sample
+        or "_incap_" in sample
+        or "visid_incap" in sample
+        or "x-iinfo" in hdrs
+        or "imperva" in hdrs.get("x-cdn", "")
+        or "incapsula" in hdrs.get("x-cdn", "")
+    ):
         return "incapsula"
-    if "/_bm/" in sample or "ak_bmsc" in sample or "bm_sz" in sample:
+    if (
+        "/_bm/" in sample
+        or "ak_bmsc" in sample
+        or "bm_sz" in sample
+        or (
+            "akamaighost" in server
+            and (
+                "access denied" in sample
+                or "reference #" in sample
+                or (is_block_status and bare_body)
+            )
+        )
+    ):
         return "akamai"
+    if (
+        "x-sucuri-id" in hdrs
+        or "sucuri/cloudproxy" in server
+        or "sucuri website firewall" in sample
+    ):
+        return "sucuri"
+    if ("cloudfront" in server or "x-amz-cf-id" in hdrs) and (
+        "generated by cloudfront" in sample
+        or "the request could not be satisfied" in sample
+        or (is_block_status and bare_body)
+    ):
+        return "cloudfront"
     return None
 
 

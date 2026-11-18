@@ -94,22 +94,6 @@ class BoundedTTLCache(Generic[K, V]):
             self._data.move_to_end(key)
             return updated
 
-    def append_timestamp(self, key: K, *, window: float, now: float | None = None) -> int:
-        """Record a monotonic timestamp under *key*, prune outside *window*, return count."""
-        ts = time.monotonic() if now is None else now
-        with self._lock:
-            entry = self._data.get(key)
-            history: list[float] = []
-            if entry is not None:
-                _, prev = entry
-                history = [t for t in prev if ts - t <= window]  # type: ignore[attr-defined]
-            else:
-                self._sweep_and_evict(ts)
-            history.append(ts)
-            self._data[key] = (ts + window, history)  # type: ignore[assignment]
-            self._data.move_to_end(key)
-            return len(history)
-
     def clear(self) -> None:
         with self._lock:
             self._data.clear()

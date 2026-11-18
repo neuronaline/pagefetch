@@ -1,4 +1,4 @@
-"""PageFetch — asynchronous HTTP-first web fetching with browser fallback.
+"""PageFetch — asynchronous Camoufox-powered web scraping and content extraction.
 
 Quick start::
 
@@ -24,13 +24,11 @@ from .client import PageFetch
 from .config import (
     VALID_BLOCK_LEVELS,
     VALID_CLEANING_LEVELS,
-    VALID_MODES,
     VALID_PROXIES,
     VALID_SESSION_ROTATION,
     VALID_STEALTH_LEVELS,
     PageFetchConfig,
 )
-from .constants import VALID_HTTP_METHODS
 from .cookies import CookiePool, CookieProfile, CookieRecord, load_cookies, parse_cookie_pool
 from .exceptions import PageFetchError
 from .models import (
@@ -58,10 +56,9 @@ from .proxy.providers import ProxyConfigurationError
 # never see "No handler found" warnings.
 logging.getLogger("pagefetch").addHandler(logging.NullHandler())
 
-# Browser dependencies (camoufox + browser binary) require 'pagefetch[browser]'
-# and 'python -m camoufox fetch' by default, or opt-in automatic installation
-# via PAGEFETCH_AUTO_INSTALL=1. Call ensure_runtime_requirements() for an
-# up-front check without installation.
+# The Camoufox browser binary is downloaded via 'python -m camoufox fetch' by
+# default, or opt-in automatic installation via PAGEFETCH_AUTO_INSTALL=1. Call
+# ensure_runtime_requirements() for an up-front check without installation.
 
 # Single source of truth is ``pyproject.toml``. ``importlib.metadata`` is the
 # canonical lookup and works for installed wheels / sdists; the fallback keeps
@@ -102,8 +99,6 @@ __all__ = [
     "VALID_ACTION_TYPES",
     "VALID_BLOCK_LEVELS",
     "VALID_CLEANING_LEVELS",
-    "VALID_HTTP_METHODS",
-    "VALID_MODES",
     "VALID_PROXIES",
     "VALID_SESSION_ROTATION",
     "VALID_STEALTH_LEVELS",

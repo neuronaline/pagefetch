@@ -515,7 +515,7 @@ class CookiePool:
 
 
 class CookieSession:
-    """Per-operation cookie profile selector coordinating HTTP, Browser, and retries."""
+    """Per-operation cookie profile selector coordinating browser fetches and retries."""
 
     __slots__ = (
         "pool",
@@ -722,7 +722,7 @@ def _parse_single_source(source: Any, *, salt_offset: int = 0) -> list[CookiePro
     if isinstance(source, Path):
         return _profiles_from_path(source, salt_offset=salt_offset)
     if isinstance(source, Mapping):
-        if type(source).__module__.startswith(("http.cookies", "httpx")):
+        if type(source).__module__.startswith("http.cookies"):
             raise ValueError(
                 f"Unsupported cookies input of type {type(source).__name__}; expected dict, CookiePool, "
                 "CookieProfile, Cookie header str, Path, or Sequence of profiles"

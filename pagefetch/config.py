@@ -14,7 +14,6 @@ from platformdirs import user_cache_path
 
 from .utils.durations import parse_duration
 
-VALID_MODES = frozenset({"auto", "http", "browser"})
 VALID_PROXIES = frozenset({"none", "custom", "decodo", "byteful"})
 VALID_CLEANING_LEVELS = frozenset({"minimal", "standard", "maximum"})
 VALID_BLOCK_LEVELS = frozenset({"minimal", "balanced", "aggressive"})
@@ -141,19 +140,14 @@ def merge_headers(*mappings: Mapping[str, str] | None) -> dict[str, str]:
 
 @dataclass(slots=True, frozen=True)
 class PageFetchConfig:
-    mode: Literal["auto", "http", "browser"] = "auto"
     proxy: Literal["none", "custom", "decodo", "byteful"] = "none"
     cleaning_level: Literal["minimal", "standard", "maximum"] = "standard"
-    http_concurrency: int = 10
-    browser_concurrency: int = 4
+    concurrency: int = 4
     cache_enabled: bool = True
     cache_ttl: int | str = 86400
     cache_path: Path | str | None = None
-    http_timeout: float = 20.0
-    browser_timeout: float = 45.0
-    retries_http: int = 3
-    retries_browser: int = 2
-    max_redirects: int = 10
+    timeout: float = 45.0
+    retries: int = 2
     max_content_size: int = 25 * 1024 * 1024
     confidence_threshold: float = 0.80
     block_images: bool | None = None
@@ -164,15 +158,15 @@ class PageFetchConfig:
     # Sticky-session TTL forwarded to residential providers (DECODO_DOCS §4, BYTEFUL_DOCS §4).
     session_duration: int | str | None = None
     request_pacing: float | None = None
-    stealth_level: Literal["off", "balanced", "max"] = "off"
+    stealth_level: Literal["off", "balanced", "max"] = "balanced"
     raise_on_error: bool = False
     screenshot_max_bytes: int = 50 * 1024 * 1024
-    max_browser_requests: int = 50
-    browser_idle_ttl: float | int | str | None = 180.0
-    browser_pre_check_byte_margin: float = 1.5
+    max_requests: int = 50
+    idle_ttl: float | int | str | None = 180.0
+    pre_check_byte_margin: float = 1.5
     max_scroll_steps: int = 25
     max_scroll_height: int = 150_000
-    expand: bool = False
+    expand: bool = True
     cookie_file: Path | str | None = None
     cookie_cooldown: float | int | str = 120.0
     headers: dict[str, str] | Sequence[str] | None = field(default_factory=dict)
@@ -183,8 +177,6 @@ class PageFetchConfig:
         """Validate and normalize all configuration fields in a single pass."""
         from .cookies import parse_cookie_pool
 
-        if not isinstance(self.mode, str) or self.mode not in VALID_MODES:
-            raise ValueError(f"mode must be one of {sorted(VALID_MODES)}")
         if not isinstance(self.proxy, str) or self.proxy not in VALID_PROXIES:
             raise ValueError(f"proxy must be one of {sorted(VALID_PROXIES)}")
         if not isinstance(self.cleaning_level, str) or self.cleaning_level not in VALID_CLEANING_LEVELS:
@@ -231,7 +223,7 @@ class PageFetchConfig:
         if self.cookies is None:
             object.__setattr__(self, "cookies", {})
         elif isinstance(self.cookies, dict) and not type(self.cookies).__module__.startswith(
-            ("http.cookies", "httpx")
+            "http.cookies"
         ):
             object.__setattr__(
                 self,
@@ -259,10 +251,10 @@ class PageFetchConfig:
         )
         object.__setattr__(
             self,
-            "browser_idle_ttl",
+            "idle_ttl",
             _coerce_duration_seconds(
-                self.browser_idle_ttl,
-                name="browser_idle_ttl",
+                self.idle_ttl,
+                name="idle_ttl",
                 allow_none=True,
                 allow_float=True,
                 zero_as_none=True,
@@ -280,12 +272,10 @@ class PageFetchConfig:
 
         # Validate positive integer bounds.
         for name in (
-            "http_concurrency",
-            "browser_concurrency",
-            "max_redirects",
+            "concurrency",
             "max_content_size",
             "screenshot_max_bytes",
-            "max_browser_requests",
+            "max_requests",
             "max_scroll_steps",
             "max_scroll_height",
         ):
@@ -294,22 +284,18 @@ class PageFetchConfig:
                 raise ValueError(f"{name} must be a positive integer")
 
         # Validate non-negative integer bounds.
-        for name in ("retries_http", "retries_browser"):
-            value = getattr(self, name)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
+        if not isinstance(self.retries, int) or isinstance(self.retries, bool) or self.retries < 0:
+            raise ValueError("retries must be a non-negative integer")
 
-        # Validate positive finite floats.
-        for name in ("http_timeout", "browser_timeout"):
-            value = getattr(self, name)
-            if (
-                not isinstance(value, int | float)
-                or isinstance(value, bool)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(f"{name} must be a positive finite number")
-            object.__setattr__(self, name, float(value))
+        # Validate positive finite float timeout.
+        if (
+            not isinstance(self.timeout, int | float)
+            or isinstance(self.timeout, bool)
+            or not math.isfinite(self.timeout)
+            or self.timeout <= 0
+        ):
+            raise ValueError("timeout must be a positive finite number")
+        object.__setattr__(self, "timeout", float(self.timeout))
 
         if (
             not isinstance(self.confidence_threshold, int | float)
@@ -357,16 +343,16 @@ class PageFetchConfig:
         object.__setattr__(self, "request_pacing", float(self.request_pacing))
 
         if (
-            not isinstance(self.browser_pre_check_byte_margin, int | float)
-            or isinstance(self.browser_pre_check_byte_margin, bool)
-            or not math.isfinite(self.browser_pre_check_byte_margin)
-            or self.browser_pre_check_byte_margin < 1.0
+            not isinstance(self.pre_check_byte_margin, int | float)
+            or isinstance(self.pre_check_byte_margin, bool)
+            or not math.isfinite(self.pre_check_byte_margin)
+            or self.pre_check_byte_margin < 1.0
         ):
-            raise ValueError("browser_pre_check_byte_margin must be a finite number >= 1.0")
+            raise ValueError("pre_check_byte_margin must be a finite number >= 1.0")
         object.__setattr__(
             self,
-            "browser_pre_check_byte_margin",
-            float(self.browser_pre_check_byte_margin),
+            "pre_check_byte_margin",
+            float(self.pre_check_byte_margin),
         )
 
     def build_cookie_pool(self) -> Any:

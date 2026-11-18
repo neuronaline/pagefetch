@@ -41,9 +41,8 @@ class ProxyConfigurationError(ValueError):
 VALID_PROXY_PROVIDERS = frozenset({"none", "custom", "decodo", "byteful"})
 RESIDENTIAL_PROVIDERS = frozenset({"decodo", "byteful"})
 
-# Schemes accepted by ``custom`` and residential providers. ``socks5h``
-# is supported by httpx[http2,socks] via python-socks and resolves hostnames
-# remotely (useful when local DNS cannot reach the target).
+# Schemes accepted by ``custom`` and residential providers.
+# ``socks5h`` is normalized to ``socks5`` for Playwright/Camoufox proxy configs.
 CUSTOM_PROXY_SCHEMES = frozenset({"http", "https", "socks5", "socks5h"})
 
 # Documented bounds for the optional session-TTL token. Both providers
@@ -122,21 +121,6 @@ def infer_target_country(url: str) -> str | None:
     return None
 
 
-def accept_language_for_country(
-    country: str | None,
-    default: str = "en-US,en;q=0.5",
-) -> str:
-    """Return an ``Accept-Language`` header aligned with *country* unless *default* was customized."""
-    if default != "en-US,en;q=0.5" or not country:
-        return default
-    cc = country.lower()
-    if cc == "us":
-        return default
-    if cc in {"gb", "ca", "au", "nz", "ie"}:
-        return f"en-{cc.upper()},en;q=0.9"
-    return f"{cc}-{cc.upper()},{cc};q=0.9,en-US;q=0.8,en;q=0.7"
-
-
 def bump_domain_session(domain: str) -> int:
     """Increment the failure epoch for *domain* so subsequent requests rotate to a new proxy session."""
     return _DOMAIN_FAILURE_EPOCHS.increment(domain.lower().strip("."))
@@ -165,8 +149,9 @@ class ProxySettings:
         hostname = parsed.hostname or ""
         if ":" in hostname and not hostname.startswith("["):
             hostname = f"[{hostname}]"
+        scheme = "socks5" if parsed.scheme == "socks5h" else parsed.scheme
         config: dict[str, str] = {
-            "server": f"{parsed.scheme}://{hostname}{port_part}"
+            "server": f"{scheme}://{hostname}{port_part}"
         }
         if parsed.username:
             config["username"] = unquote(parsed.username)

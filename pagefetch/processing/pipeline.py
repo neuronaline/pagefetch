@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
 from bs4 import BeautifulSoup
 
 from ..constants import SAFE_RESPONSE_HEADERS
-from ..fetching.http import HTTPResponse, TransportFailure
+from ..exceptions import TransportFailure
 from ..models import FetchErrorInfo, FetchResult
 from .detector import ConfidenceReport
 from .html import process_html
@@ -32,28 +33,60 @@ _META_CHARSET_RE = re.compile(
     rb"""<meta\s+[^>]*?(?:charset\s*=\s*['"]?([a-zA-Z0-9_\-]+)|content\s*=\s*['"][^'"]*?charset=\s*['"]?([a-zA-Z0-9_\-]+))""",
     re.IGNORECASE,
 )
+_XML_ENCODING_RE = re.compile(
+    rb"""^\s*<\?xml\b[^>]*?\bencoding\s*=\s*['"]([a-zA-Z0-9_\-]+)['"]""",
+    re.IGNORECASE,
+)
 
 
-def decode_response_body(response: HTTPResponse) -> str:
-    """Decode raw HTTP response bytes into string using meta charset, response encoding or utf-8."""
-    # Sniff HTML meta charset from the first 4096 bytes
-    meta_encoding: str | None = None
+@dataclass(slots=True, frozen=True)
+class DocumentPayload:
+    """In-memory document payload and headers ready for extraction."""
+
+    url: str
+    status_code: int
+    headers: Mapping[str, str]
+    content: bytes
+    encoding: str | None = None
+
+
+def _header_get(headers: Mapping[str, str] | None, name: str, default: str = "") -> str:
+    if not headers:
+        return default
+    target = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == target:
+            return str(value)
+    return default
+
+
+def decode_response_body(response: DocumentPayload) -> str:
+    """Decode raw response bytes into string using declared charset, response encoding, or utf-8."""
+    # Sniff HTML <meta charset> or XML <?xml encoding="..."?> from the first 4096 bytes
+    sniffed_encoding: str | None = None
     if response.content:
-        match = _META_CHARSET_RE.search(response.content[:4096])
-        if match:
-            raw_enc = (match.group(1) or match.group(2)).decode("ascii", errors="ignore").strip().lower()
+        head = response.content[:4096]
+        match = _META_CHARSET_RE.search(head)
+        raw_bytes = (match.group(1) or match.group(2)) if match else None
+        if raw_bytes is None:
+            xml_match = _XML_ENCODING_RE.search(head)
+            if xml_match:
+                raw_bytes = xml_match.group(1)
+        if raw_bytes:
+            raw_enc = raw_bytes.decode("ascii", errors="ignore").strip().lower()
             try:
                 import codecs
+
                 codecs.lookup(raw_enc)
-                meta_encoding = raw_enc
+                sniffed_encoding = raw_enc
             except (LookupError, ValueError):
-                meta_encoding = None
+                sniffed_encoding = None
 
     candidates: list[str] = []
-    if meta_encoding:
-        candidates.append(meta_encoding)
+    if sniffed_encoding:
+        candidates.append(sniffed_encoding)
     resp_enc = response.encoding.lower() if response.encoding else None
-    # Explicit Content-Type charset has high priority unless it is httpx's default fallback ('iso-8859-1')
+    # Explicit Content-Type charset has high priority unless it is a generic ISO-8859-1 fallback.
     if resp_enc and resp_enc != "iso-8859-1" and resp_enc not in candidates:
         candidates.append(resp_enc)
     if "utf-8" not in candidates:
@@ -107,6 +140,38 @@ def parse_content_type(header: str | None) -> str:
     return (header or "application/octet-stream").split(";", 1)[0].strip().lower()
 
 
+def _effective_mime(headers: Mapping[str, str] | None, fallback: str) -> str:
+    """Return normalized Content-Type header unless missing or generic octet-stream."""
+    ct = parse_content_type(_header_get(headers, "Content-Type"))
+    return fallback if ct == "application/octet-stream" else ct
+
+
+def is_explicit_non_html_mime(content_type: str | None) -> bool:
+    """Return True when *content_type* explicitly declares a supported non-HTML MIME."""
+    if not content_type:
+        return False
+    ct = parse_content_type(content_type)
+    return (
+        ct
+        in (
+            "application/pdf",
+            "application/x-pdf",
+            _DOCX_MIME,
+            "text/csv",
+            "application/csv",
+            "text/tab-separated-values",
+            "text/tsv",
+            "application/json",
+            "text/json",
+            "application/xml",
+            "text/xml",
+        )
+        or ct.startswith("text/plain")
+        or ct.endswith("+json")
+        or ("+xml" in ct and ct != "application/xhtml+xml")
+    )
+
+
 def _clean_url_path(url: str | None) -> str:
     if not url:
         return ""
@@ -141,8 +206,11 @@ def looks_like_html(content: bytes) -> bool:
     stripped = content.lstrip()
     if not stripped:
         return False
+    head = stripped[:512].lower()
+    if head.startswith(b"<?xml"):
+        return False
     return stripped.startswith(b"<") and any(
-        marker in stripped[:512].lower()
+        marker in head
         for marker in (
             b"<!doctype html",
             b"<html",
@@ -157,32 +225,56 @@ def looks_like_html(content: bytes) -> bool:
     )
 
 
-def is_pdf_content(content_type: str, content: bytes, url: str | None = None) -> bool:
-    """Check if content represents a PDF file by content-type, magic bytes, or URL."""
-    ct = parse_content_type(content_type)
-    if _is_html_mime(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
-        return False
-    if ct in ("application/pdf", "application/x-pdf") or (content and content.startswith(b"%PDF-")):
+def is_pdf_content(
+    content_type: str,
+    content: bytes,
+    url: str | None = None,
+    *,
+    filename: str | None = None,
+) -> bool:
+    """Check if content represents a PDF file by magic bytes, content-type, or filename/URL."""
+    if content and content.startswith(b"%PDF-"):
         return True
-    if _clean_url_path(url).endswith(".pdf") and (not content or content.startswith(b"%PDF-")):
+    ct = parse_content_type(content_type)
+    if _is_html_mime(ct) or looks_like_html(content):
+        return False
+    if ct in ("application/pdf", "application/x-pdf"):
+        return True
+    clean_name = (filename or "").strip().lower()
+    has_pdf_ext = _clean_url_path(url).endswith(".pdf") or clean_name.endswith(".pdf")
+    if has_pdf_ext and not content:
         return True
     return False
 
 
-def detect_document_kind(content_type: str, content: bytes, url: str | None = None) -> str:
-    """Detect high-level document kind from declared MIME, magic bytes, and URL extension."""
+def detect_document_kind(
+    content_type: str,
+    content: bytes,
+    url: str | None = None,
+    *,
+    filename: str | None = None,
+) -> str:
+    """Detect high-level document kind from magic bytes, declared MIME, filename, and URL."""
     ct = parse_content_type(content_type)
-    # Declared text/html or HTML byte sniff always beats misleading URL extensions (.md, .pdf).
-    if _is_html_mime(ct) or (looks_like_html(content) and not content.startswith(b"%PDF-")):
+    clean_path = _clean_url_path(url)
+    clean_name = (filename or "").strip().lower()
+
+    # Unambiguous binary signatures always win even over misconfigured text/html headers.
+    if content and content.startswith(b"%PDF-"):
+        return "pdf"
+    is_zip = bool(content and content.startswith(b"PK\x03\x04"))
+    if is_zip and (b"word/document.xml" in content[:65536] or b"word/" in content[:65536]):
+        return "docx"
+
+    explicit_non_html = is_explicit_non_html_mime(ct)
+    # Declared text/html or HTML byte sniff beats misleading URL extensions (.md, .pdf).
+    if _is_html_mime(ct) or (not explicit_non_html and looks_like_html(content)):
         return "html"
-    if is_pdf_content(ct, content, url=url):
+    if is_pdf_content(ct, content, url=url, filename=filename):
         return "pdf"
 
-    clean_path = _clean_url_path(url)
-    is_zip = bool(content and content.startswith(b"PK\x03\x04"))
-    if ct == _DOCX_MIME or (clean_path.endswith(".docx") and (not content or is_zip)):
-        return "docx"
-    if is_zip and (b"word/document.xml" in content[:65536] or b"word/" in content[:65536]):
+    has_docx_ext = clean_path.endswith(".docx") or clean_name.endswith(".docx")
+    if ct == _DOCX_MIME or (has_docx_ext and (not content or is_zip)):
         return "docx"
 
     if ct in ("text/csv", "application/csv"):
@@ -196,15 +288,20 @@ def detect_document_kind(content_type: str, content: bytes, url: str | None = No
     if ct.startswith("text/plain"):
         return "text"
 
+    if content and content.lstrip()[:64].lower().startswith((b"<?xml", b"<rss", b"<feed")):
+        return "xml"
+
     for ext, kind in _EXTENSION_KIND_MAP.items():
-        if clean_path.endswith(ext):
+        if clean_name.endswith(ext) or clean_path.endswith(ext):
             return kind
+    if clean_name.endswith((".html", ".htm")):
+        return "html"
     return "unknown"
 
 
 def build_document_result(
     url: str,
-    response: HTTPResponse,
+    response: DocumentPayload,
     proxy: str,
     doc: Any,
     method: str,
@@ -214,9 +311,9 @@ def build_document_result(
 ) -> FetchResult:
     """Wrap a processed non-HTML document into a FetchResult."""
     doc.metadata["headers"] = {
-        key.lower(): value
+        str(key).lower(): str(value)
         for key, value in response.headers.items()
-        if key.lower() in SAFE_RESPONSE_HEADERS
+        if str(key).lower() in SAFE_RESPONSE_HEADERS
     }
     return FetchResult(
         url=url,
@@ -249,7 +346,7 @@ def build_html_result(
     proxy: str,
     method: str,
     cleaning_level: str = "standard",
-    response_headers: httpx.Headers | None = None,
+    response_headers: Mapping[str, str] | None = None,
     soup: BeautifulSoup | None = None,
     confidence: ConfidenceReport | None = None,
     include_structure: bool = False,
@@ -321,7 +418,7 @@ def build_html_result(
     )
 
 
-def build_pdf_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+def build_pdf_result(url: str, response: DocumentPayload, proxy: str) -> FetchResult:
     """Process a PDF response and construct a FetchResult."""
     try:
         doc = process_pdf(response.content)
@@ -341,7 +438,7 @@ def build_pdf_result(url: str, response: HTTPResponse, proxy: str) -> FetchResul
     return build_document_result(url, response, proxy, doc, "pdf", "application/pdf")
 
 
-def build_docx_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+def build_docx_result(url: str, response: DocumentPayload, proxy: str) -> FetchResult:
     """Process a DOCX response and construct a FetchResult."""
     try:
         doc = process_docx(response.content)
@@ -366,7 +463,7 @@ def build_docx_result(url: str, response: HTTPResponse, proxy: str) -> FetchResu
 
 def build_csv_result(
     url: str,
-    response: HTTPResponse,
+    response: DocumentPayload,
     proxy: str,
     delimiter: str | None = None,
 ) -> FetchResult:
@@ -382,17 +479,18 @@ def build_csv_result(
                 type(exc).__name__,
             )
         ) from exc
+    fallback_ct = "text/tab-separated-values" if delimiter == "\t" else "text/csv"
     return build_document_result(
         url,
         response,
         proxy,
         doc,
         "csv",
-        parse_content_type(response.headers.get("Content-Type")),
+        _effective_mime(response.headers, fallback_ct),
     )
 
 
-def build_json_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+def build_json_result(url: str, response: DocumentPayload, proxy: str) -> FetchResult:
     """Process a JSON response and construct a FetchResult."""
     doc = process_json(response.content, encoding=response.encoding)
     return build_document_result(
@@ -401,11 +499,11 @@ def build_json_result(url: str, response: HTTPResponse, proxy: str) -> FetchResu
         proxy,
         doc,
         "json",
-        parse_content_type(response.headers.get("Content-Type")),
+        _effective_mime(response.headers, "application/json"),
     )
 
 
-def build_xml_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+def build_xml_result(url: str, response: DocumentPayload, proxy: str) -> FetchResult:
     """Process an XML response and construct a FetchResult."""
     try:
         doc = process_xml(response.content, response.encoding)
@@ -424,12 +522,12 @@ def build_xml_result(url: str, response: HTTPResponse, proxy: str) -> FetchResul
         proxy,
         doc,
         "xml",
-        parse_content_type(response.headers.get("Content-Type")),
+        _effective_mime(response.headers, "application/xml"),
         raw_source=decode_response_body(response),
     )
 
 
-def build_text_result(url: str, response: HTTPResponse, proxy: str) -> FetchResult:
+def build_text_result(url: str, response: DocumentPayload, proxy: str) -> FetchResult:
     """Process a plain-text or Markdown response and construct a FetchResult."""
     doc = process_text(response.content, response.encoding)
     return build_document_result(
@@ -438,14 +536,14 @@ def build_text_result(url: str, response: HTTPResponse, proxy: str) -> FetchResu
         proxy,
         doc,
         "text",
-        parse_content_type(response.headers.get("Content-Type")),
+        _effective_mime(response.headers, "text/plain"),
     )
 
 
 def build_non_html_result(
     kind: str,
     url: str,
-    response: HTTPResponse,
+    response: DocumentPayload,
     proxy: str,
 ) -> FetchResult | None:
     """Dispatch a classified non-HTML document response to its FetchResult builder."""

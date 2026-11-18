@@ -114,7 +114,7 @@ def process_pdf(content: bytes) -> ProcessedDocument:
         from pypdf import PdfReader
     except ImportError as exc:
         raise MissingOptionalDependency(
-            "PDF support requires the optional dependency: pip install 'pagefetch[pdf]'"
+            "PDF support requires pypdf: pip install pypdf"
         ) from exc
 
     reader = PdfReader(io.BytesIO(content))

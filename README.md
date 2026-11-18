@@ -1,7 +1,7 @@
 # PageFetch
 
-**Async-first web scraping and content extraction library for Python 3.11+ — with
-intelligent browser fallback, built-in caching, SSRF protection, and structured Markdown output.**
+**Async-first Camoufox-powered web scraping and content extraction library for Python 3.11+ — with
+built-in stealth, automatic DOM expansion, SQLite caching, SSRF protection, and structured Markdown output.**
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
@@ -9,21 +9,19 @@ intelligent browser fallback, built-in caching, SSRF protection, and structured 
   <img src="https://img.shields.io/badge/code%20style-ruff-261230" alt="Ruff">
 </p>
 
-PageFetch is a modern, asynchronous Python library for **fetching web pages** and
-extracting clean, structured content. It attempts a pooled **HTTP request** first,
-scores the returned HTML using multiple **completeness signals**, and lazily falls
-back to a **Camoufox stealth browser** when the page looks blocked, empty, or
-dependent on client-side JavaScript rendering. The result is always a consistent
-`FetchResult` object carrying **Markdown**, raw HTML, extracted links, images,
-metadata, and more — regardless of which method succeeded.
+PageFetch is a modern, asynchronous Python library for **fetching web pages and documents**
+through a **Camoufox stealth browser** and extracting clean, structured content. Every request
+renders in an isolated browser context, scrolls and expands in-DOM disclosures/tabs by default,
+and captures inline or downloaded documents (`PDF`, `DOCX`, `CSV`, `XML`, `JSON`, `TXT`) through
+the same unified browser stack. The result is always a consistent `FetchResult` object carrying
+**Markdown**, raw HTML, extracted links, images, metadata, and more.
 
 Perfect for **web scraping**, **content aggregation**, **LLM data pipelines**,
 **SEO analysis**, **archiving**, and any workflow that needs reliable page
 content without fighting bot detection or leaking internal infrastructure.
 
 Supported environments: Windows 10/11 x64 and Ubuntu 22.04/24.04 x64 on
-Python 3.11–3.13. Browser mode relies on the corresponding upstream Camoufox
-artifact.
+Python 3.11–3.13, backed by the corresponding upstream Camoufox browser artifact.
 
 ---
 
@@ -56,7 +54,7 @@ from pagefetch import PageFetch
 
 
 async def main() -> None:
-    async with PageFetch(mode="auto", cache_ttl="24h") as client:
+    async with PageFetch(cache_ttl="24h") as client:
         result = await client.fetch("https://example.com")
         if result.success:
             print(f"Title: {result.title}")
@@ -73,7 +71,7 @@ asyncio.run(main())
 ### Fetch Multiple URLs in Parallel
 
 ```python
-async with PageFetch(mode="auto") as client:
+async with PageFetch() as client:
     results = await client.fetch_many([
         "https://example.com",
         "https://example.org",
@@ -90,55 +88,50 @@ async with PageFetch(mode="auto") as client:
 
 | Challenge | PageFetch Solution |
 |---|---|
-| **Bot detection & blocking** | Camoufox stealth browser with automatic fallback when HTTP returns empty, blocked (403/429), or JavaScript-dependent pages |
-| **Over-fetching with heavy browsers** | HTTP-first strategy — only ~5–15% of pages need the browser in auto mode |
-| **Internal network vulnerabilities** | Built-in SSRF protection blocking private IPs, loopback, link-local, and cloud metadata endpoints across both HTTP and browser layers |
+| **Bot detection & dynamic rendering** | Native Camoufox stealth browser for every request (`stealth_level="balanced"` and `expand=True` by default) |
+| **Internal network vulnerabilities** | Built-in SSRF protection blocking private IPs, loopback, link-local, and cloud metadata endpoints across navigation and subresource routes |
 | **Inconsistent output formats** | Single `FetchResult` model: always get `.markdown`, `.html`, `.text`, `.links`, `.images`, `.metadata` |
-| **Managing concurrency** | Built-in semaphores for HTTP (default 10) and browser (default 4) with bounded browser session rotation |
+| **Managing concurrency** | Built-in browser semaphore (default 4) with bounded browser process rotation |
 | **Repeated requests waste bandwidth** | SQLite disk cache with configurable TTL, shared across runs |
 | **Proxy rotation complexity** | Native Decodo and Byteful integration — configure via env vars or code |
-| **Content that isn't HTML** | PDFs auto-detected and extracted; XML documents parsed; plain text preserved |
+| **Content that isn't HTML** | PDFs, DOCX, CSV/TSV, XML, JSON, and plain text captured via inline browser payloads or native downloads |
 | **Fast DOM inspection** | $O(N)$ single-pass structural summary generating verified unique CSS selectors |
-| **Dependency management friction** | Core HTTP support stays lightweight; browser and PDF features use explicit extras |
+| **Zero-setup dependencies** | `camoufox[geoip]` and `pypdf` included as core dependencies |
 | **Hard-to-match fingerprints** | `stealth_level` presets + `humanize`, `block_level`, `request_pacing`, and `session_rotation` |
 
 ---
 
 ## Security & SSRF Protection
 
-PageFetch incorporates strict Server-Side Request Forgery (SSRF) defense at both the HTTP and browser layers:
+PageFetch incorporates strict Server-Side Request Forgery (SSRF) defense across navigation and browser route interception:
 
 - **Restricted Targets**: Any attempt to fetch private networks (e.g. `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), loopback addresses (`127.0.0.0/8`, `localhost`), link-local IPs, multicast ranges, or cloud provider metadata endpoints (`169.254.169.254`) is rejected immediately with an `invalid_url` error.
-- **Redirect Validation**: HTTP redirect chains validate each hop against SSRF rules, preventing open redirect bypasses.
 - **Browser Route Interception**: Camoufox browser instances intercept page-level and subresource network routes to block access to restricted hosts and internal IP ranges.
-- **Opt-in Runtime Installs**: Dynamic package installation at runtime is disabled by default (`PAGEFETCH_AUTO_INSTALL=0`) to prevent unexpected execution of external install scripts.
+- **Opt-in Runtime Installs**: Dynamic browser binary download at runtime is disabled by default (`PAGEFETCH_AUTO_INSTALL=0`) unless explicitly enabled.
 
 ---
 
 ## Stealth & Anti-Detection
 
-When `mode` is `"auto"` or `"browser"`, PageFetch exposes a layered stealth
-posture so the browser fingerprint can stay aligned with the proxy exit
-country:
+PageFetch defaults to `stealth_level="balanced"` so the browser fingerprint stays aligned with the proxy exit country out of the box:
 
 | Knob | Purpose |
 |---|---|
-| `stealth_level` | One-shot preset: `"off"` (default), `"balanced"`, or `"max"`. Sets `humanize`, `block_level`, `request_pacing`, and `session_rotation` together; explicit values still win. |
+| `stealth_level` | One-shot preset: `"balanced"` (default), `"off"`, or `"max"`. Sets `humanize`, `block_level`, `request_pacing`, and `session_rotation` together; explicit values still win. |
 | `humanize` | Add small randomized delays to mimic human interaction. |
-| `block_level` | `"minimal"`, `"balanced"`, or `"aggressive"` resource blocking (third-party trackers, fonts, media). |
+| `block_level` | `"minimal"`, `"balanced"` (default), or `"aggressive"` resource blocking (third-party trackers, fonts, media). |
 | `session_rotation` | `"sticky"` reuses one proxy session per domain; `"rotate"` manages fresh sessions within a bounded browser pool. |
-| `request_pacing` | Fixed seconds of delay between browser requests (`0.0` = none). |
-| `accept_language` | Value sent as the `Accept-Language` header. |
+| `request_pacing` | Per-host randomized delay ceiling in seconds (`0.5` in `"balanced"`, `0.0` = none). |
+| `accept_language` | Value sent as the `Accept-Language` header (explicit non-default values override proxy GeoIP locale). |
 | `cleaning_level` | How aggressively non-content DOM is stripped before extraction: `"minimal"` (display:none / hidden / 1×1 pixels only), `"standard"` (default — also drops cookie banners, ad slots, tracking pixels), `"maximum"` (removes layout chrome, nav, and sidebars while preserving article headers, `h1`/`h2`, tables, code blocks, and primary content). |
 
 ```python
-# Quiet, fast default for open sites
-async with PageFetch(mode="auto") as client:
+# Balanced stealth + tab/disclosure expansion (default)
+async with PageFetch() as client:
     ...
 
-# Maximum stealth for heavily protected targets
+# Maximum stealth with residential proxy
 async with PageFetch(
-    mode="browser",
     proxy="decodo",
     stealth_level="max",
 ) as client:
@@ -171,11 +164,10 @@ missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
 
 1. **Normalize & Validate** — URL syntax, encoding, scheme, and host safety (SSRF checks) are validated before any network call.
 2. **Check cache** — If a valid SQLite entry exists, return instantly.
-3. **HTTP fetch** — Performed via `httpx` with HTTP/2, connection pooling, and bounded retries. Non-HTML responses (PDF, XML, JSON, plain text) are processed directly without browser overhead.
-4. **Content analysis** — The `confidence` score evaluates HTML completeness using text density, structural markup, heading presence, link counts, and common blocking signals (multilingual captcha walls, empty bodies, access-denied patterns).
-5. **Browser fallback** (auto mode) — Camoufox takes over when HTTP content confidence is below the threshold (default 0.80), when the server returns a blocked status (`403` or `429`), or on Cloudflare Under Attack (`503` with WAF challenge markers). Blocked responses bypass unnecessary HTTP retries and switch directly to browser rendering. Genuine timeouts, connection failures, 404s, and non-challenge 5xx responses fail fast at the HTTP layer.
-6. **Processing pipeline** — Cleaned HTML → extracted links, images, metadata → converted to Markdown via an engine preserving tables (with proper escaping of table pipes), code blocks, and nested lists.
-7. **Cache & return** — The structured `FetchResult` is persisted to SQLite and returned.
+3. **Camoufox Browser Fetch** — Opens an isolated context (with per-context proxy and cookie profile), navigates, waits for readiness / solves passive challenges, scrolls, and expands disclosures & dynamic tabs (`expand=True` by default).
+4. **Non-HTML & Download Handling** — Inline non-HTML payloads (`PDF`, `JSON`, `XML`, `TXT`) and browser-triggered attachment downloads (`PDF`, `CSV`/`TSV`, `DOCX`) are extracted directly from the browser session and converted into structured `FetchResult` payloads.
+5. **Processing pipeline** — Cleaned HTML → extracted links, images, metadata → converted to Markdown via an engine preserving tables (with proper escaping of table pipes), code blocks, and nested lists.
+6. **Cache & return** — The structured `FetchResult` is persisted to SQLite and returned.
 
 ---
 
@@ -184,29 +176,16 @@ missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
 ### Prerequisites
 
 - **Python** ≥ 3.11
-- **Xvfb** (Linux only, for stealth browser mode: `sudo apt install xvfb`)
+- **Xvfb** (Linux only: `sudo apt install xvfb`)
 
 ### Install
 
 ```bash
-# Core HTTP/HTML support (lightweight)
 pip install .
-
-# Add browser fallback
-pip install ".[browser]"
-python -m camoufox fetch
-
-# Add PDF extraction
-pip install ".[pdf]"
-
-# Or install every optional feature
-pip install ".[all]"
 python -m camoufox fetch
 ```
 
-HTTP mode works without Camoufox. For browser fallback or `browser` mode, install
-`pagefetch[browser]` and fetch the browser artifact via `python -m camoufox fetch`.
-Automatic package and binary installation on first use is disabled by default for safety, but can be explicitly enabled with `PAGEFETCH_AUTO_INSTALL=1`.
+Automatic binary download on first use is disabled by default for safety, but can be explicitly enabled with `PAGEFETCH_AUTO_INSTALL=1`.
 
 ---
 
@@ -215,47 +194,41 @@ Automatic package and binary installation on first use is disabled by default fo
 ### `PageFetch` Client
 
 The main entry point. Use as an async context manager for automatic cleanup.
-`PageFetch(...)` exposes the 10 everyday options directly; pass a
+`PageFetch(...)` exposes the 9 everyday options directly; pass a
 `PageFetchConfig` instance for advanced tuning:
 
 ```python
 from pagefetch import PageFetch, PageFetchConfig
 
 client = PageFetch(
-    mode="auto",              # "auto" | "http" | "browser"
-    proxy="none",             # "none" | "custom" | "decodo" | "byteful"
+    proxy="none",              # "none" | "custom" | "decodo" | "byteful"
     cleaning_level="standard", # "minimal" | "standard" | "maximum"
-    stealth_level="off",      # "off" | "balanced" | "max" preset
-    expand=False,             # Auto-expand in-DOM disclosures & client-side tabs
-    cache_enabled=True,       # Enable SQLite disk cache
-    cache_ttl="24h",          # TTL: "30m", "2h", "7d", or seconds as int
-    raise_on_error=False,     # Raise PageFetchError instead of returning error result
-    headers={},               # Default extra headers sent on every request
-    cookies={},               # Default cookies / CookiePool source
+    stealth_level="balanced",  # "off" | "balanced" | "max" preset
+    expand=True,               # Auto-expand in-DOM disclosures & client-side tabs
+    cache_enabled=True,        # Enable SQLite disk cache
+    cache_ttl="24h",           # TTL: "30m", "2h", "7d", or seconds as int
+    raise_on_error=False,      # Raise PageFetchError instead of returning error result
+    headers={},                # Default extra headers sent on every request
+    cookies={},                # Default cookies / CookiePool source
 )
 
 # Advanced concurrency, timeout, retry, proxy session, and browser tuning
 # goes through PageFetchConfig:
 config = PageFetchConfig(
-    mode="auto",
     proxy="byteful",
-    http_concurrency=10,      # Max parallel HTTP requests
-    browser_concurrency=4,    # Max parallel browser instances
-    cache_path=None,          # Custom SQLite cache path (None = platform default)
-    http_timeout=20.0,        # Per-request HTTP timeout (seconds)
-    browser_timeout=45.0,     # Per-page browser timeout (seconds)
-    retries_http=3,           # Retry on 5xx (and HTTP-only 429) errors
-    retries_browser=2,        # Retry on browser failure
-    max_redirects=10,         # Maximum redirect chain
+    concurrency=4,             # Max parallel browser contexts
+    cache_path=None,           # Custom SQLite cache path (None = platform default)
+    timeout=45.0,              # Per-page timeout (seconds)
+    retries=2,                 # Retry on browser/challenge failure
     max_content_size=25 * 1024 * 1024,  # Max response body bytes (25 MiB)
-    confidence_threshold=0.80,    # Min confidence before browser fallback
-    block_images=True,        # Block image loading in browser mode to save bandwidth
-    block_level="aggressive", # "minimal" | "balanced" | "aggressive"
+    confidence_threshold=0.80, # Min confidence for challenge/completeness checks
+    block_images=False,        # Block image loading (False in balanced/max stealth)
+    block_level="balanced",    # "minimal" | "balanced" | "aggressive"
     accept_language="en-US,en;q=0.5",  # Accept-Language header
-    humanize=False,           # Add small randomized delays to mimic a human
-    session_rotation="sticky",# "sticky" | "rotate" proxy session strategy
-    session_duration=None,    # Optional sticky-session TTL for residential providers
-    request_pacing=0.0,       # Seconds of delay between requests
+    humanize=True,             # Add randomized delays to mimic human interaction
+    session_rotation="sticky", # "sticky" | "rotate" proxy session strategy
+    session_duration=None,     # Optional sticky-session TTL for residential providers
+    request_pacing=0.5,        # Per-host randomized delay ceiling (seconds)
     screenshot_max_bytes=50 * 1024 * 1024,  # Max bytes for extract(screenshot=…)
 )
 client = PageFetch(config=config)  # or PageFetch.from_config(config)
@@ -264,27 +237,19 @@ client = PageFetch(config=config)  # or PageFetch.from_config(config)
 client = PageFetch.from_yaml("config.yaml")
 ```
 
-### Modes
-
-| Mode | Behavior |
-|---|---|
-| `"auto"` | HTTP first; falls back to Camoufox if confidence < threshold or 403/429 received (default) |
-| `"http"` | Pure HTTP/2 fetching — no browser, no confidence scoring |
-| `"browser"` | Camoufox stealth browser for every request |
-
 ### Methods
 
-**`fetch(url, *, mode=None, proxy=None, method="GET", headers=None, cookies=None, content=None, data=None, json=None, actions=None, capture_xhr=False, expand=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
+**`fetch(url, *, proxy=None, headers=None, cookies=None, actions=None, capture_xhr=False, expand=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
-Fetch a single URL. Keyword arguments override client-level defaults for that request. Bare domains (e.g. `example.com`) are automatically normalized to `https://`. Supplying `actions`, `capture_xhr`, or `expand=True` automatically runs in browser mode (and raises `ValueError` if `mode="http"` is forced).
+Fetch a single URL through Camoufox. Keyword arguments override client-level defaults for that request. Requires an absolute `http://` or `https://` URL (the CLI also accepts bare domains like `example.com`).
 
-**`fetch_many(urls, *, mode=None, proxy=None, ..., use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
+**`fetch_many(urls, *, proxy=None, ..., use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
 
 Fetch multiple URLs concurrently. Deduplicates identical inputs, preserves original ordering, and isolates failures across URLs.
 
 **`extract(url, *, structure=True, compact_structure=False, screenshot="none", screenshot_format="png", proxy=None, headers=None, cookies=None, actions=None, capture_xhr=False, expand=None, use_cache=True, cache_ttl=None, raise_on_error=None) → FetchResult`**
 
-Fetch a page in browser mode and return the rendered DOM, an optional structural summary, and/or a screenshot:
+Fetch a page and return the rendered DOM, an optional structural summary, and/or a screenshot:
 
 - `result.html` — Fully rendered HTML.
 - `result.structure` — `PageStructure` summary ($O(N)$ extraction with verified `unique_selector`).
@@ -305,7 +270,7 @@ Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not c
 | `PageAction`, `ActionResult`, `CapturedXHR`, `parse_action`, `normalize_actions` | In-page browser interaction & XHR capture models |
 | `PageFetchError`, `ProxyConfigurationError`, `RuntimeBootstrapError` | Exception hierarchy |
 | `ensure_runtime_requirements`, `auto_bootstrap_browser` | Runtime dependency validation & installation |
-| `VALID_MODES`, `VALID_PROXIES`, `VALID_STEALTH_LEVELS`, `VALID_BLOCK_LEVELS`, `VALID_CLEANING_LEVELS`, `VALID_SESSION_ROTATION`, `VALID_ACTION_TYPES`, `VALID_HTTP_METHODS` | Configuration & validation constants |
+| `VALID_PROXIES`, `VALID_STEALTH_LEVELS`, `VALID_BLOCK_LEVELS`, `VALID_CLEANING_LEVELS`, `VALID_SESSION_ROTATION`, `VALID_ACTION_TYPES` | Configuration & validation constants |
 
 PageFetch is fully typed (PEP 561 compliant, shipping with `py.typed`). Type checkers like `mypy` and `pyright` will automatically discover in-line type annotations.
 
@@ -337,9 +302,9 @@ class FetchResult:
     structure: PageStructure | None  # DOM/stylesheet/script summary (when requested)
     screenshot: bytes | None         # PNG/JPEG screenshot bytes (when requested)
     screenshot_format: str | None    # "png" or "jpeg"
-    fetch_method: str | None    # "http", "browser", "text", "xml", or "pdf"
+    fetch_method: str | None    # "browser", "pdf", "docx", "csv", "json", "xml", or "text"
     proxy_provider: str         # "none", "custom", "decodo", or "byteful"
-    content_confidence: float | None  # 0–1 completeness score (None for browser mode)
+    content_confidence: float | None  # 0.0–1.0 completeness score (1.0 for non-HTML documents)
     from_cache: bool            # Was this served from cache?
     duration_ms: float | None   # Total fetch duration
     fetched_at: datetime | None # ISO 8601 timestamp
@@ -394,16 +359,16 @@ pagefetch https://example.com --format structure
 pagefetch https://example.com --format raw --screenshot full --screenshot-format png
 
 # Save output to a file
-pagefetch https://example.com --mode browser -o output.md
+pagefetch https://example.com -o output.md
 
 # Process multiple URLs from a file
-pagefetch urls.txt --format json --mode auto
+pagefetch urls.txt --format json
 
 # Use residential proxy with sticky session and explicit 2-hour TTL
 pagefetch https://example.com --proxy byteful --session-duration 2h
 
-# Apply stealth preset with session rotation
-pagefetch https://example.com --mode browser --stealth-level balanced --session-rotation rotate
+# Apply maximum stealth preset with session rotation
+pagefetch https://example.com --stealth-level max --session-rotation rotate
 
 # Debug mode for troubleshooting
 pagefetch https://example.com --debug
@@ -413,11 +378,11 @@ pagefetch https://example.com --debug
 
 | Flag | Maps to |
 |---|---|
-| `inputs` (positional) | One or more URLs or text files containing URLs |
-| `--mode {auto,http,browser}` | `mode` |
+| `input` (positional) | A single URL or path to a text file containing URLs |
 | `--proxy {none,custom,decodo,byteful}` | `proxy` |
-| `--http-concurrency N` / `--browser-concurrency N` | `http_concurrency` / `browser_concurrency` |
-| `--timeout SECONDS` / `--browser-timeout SECONDS` | `http_timeout` / `browser_timeout` |
+| `--concurrency N` | `concurrency` |
+| `--timeout SECONDS` | `timeout` |
+| `--retries N` | `retries` |
 | `--cache-ttl DURATION` / `--no-cache` | `cache_ttl` / `cache_enabled=False` |
 | `--block-images` / `--no-block-images` | `block_images` |
 | `--block-level {minimal,balanced,aggressive}` | `block_level` |
@@ -429,7 +394,10 @@ pagefetch https://example.com --debug
 | `--stealth-level {off,balanced,max}` | `stealth_level` |
 | `--cleaning-level {minimal,standard,maximum}` | `cleaning_level` |
 | `--expand` / `--no-expand` | `expand` |
+| `-H HEADER` / `--header HEADER` | `headers` (repeatable `'Name: Value'`) |
 | `--cookie COOKIE` / `--cookie-file PATH` | `cookies` / `cookie_file` |
+| `--action ACTION` | `actions` (repeatable interaction spec) |
+| `--capture-xhr [PATTERN]` | `capture_xhr` |
 | `--include-html` | `FetchResult.json(include_html=…)` |
 | `--screenshot {none,viewport,full}` | `PageFetch.extract(screenshot=…)` |
 | `--screenshot-format {png,jpeg}` | `PageFetch.extract(screenshot_format=…)` |
@@ -444,7 +412,7 @@ Exit codes: `0` all succeeded, `1` all failed, `2` usage/IO error, `3` partial f
 
 ## Caching
 
-PageFetch uses a **SQLite-backed disk cache** stored in the platform's user cache directory (`platformdirs`). Cache keys incorporate the normalized URL, fetch mode, proxy configuration, and relevant stealth settings.
+PageFetch uses a **SQLite-backed disk cache** stored in the platform's user cache directory (`platformdirs`). Cache keys incorporate the normalized URL, proxy configuration, cookie/header tokens, and relevant extraction and stealth settings.
 
 - **Default TTL**: 24 hours (configurable: `"30m"`, `"2h"`, `"7d"`, or integer seconds).
 - **Network bypass**: Cache hits return instantly without network or browser overhead.
@@ -504,14 +472,14 @@ Credentials are never exposed in result objects, logs, or cache keys.
 
 | Content Type | Detection | Extraction |
 |---|---|---|
-| **PDF** | Magic bytes + `Content-Type` | Clean text extraction via optional `pagefetch[pdf]` extra |
+| **PDF** | Magic bytes + `Content-Type` + `.pdf` | Clean page-structured text & metadata extraction via `pypdf` |
 | **DOCX** | Archive signature / MIME / `.docx` | Headings, lists, hyperlinks, and GFM tables via `lxml` + `zipfile` |
 | **CSV / TSV** | MIME / `.csv` / `.tsv` | Delimiter detection + GFM Markdown table in `.markdown` and full data in `.text` |
-| **XML** | `+xml` or `application/xml` | Feeds (RSS/Atom) formatted as Markdown articles; generic XML in fenced code |
+| **XML** | `+xml`, `application/xml`, or `<?xml` | Feeds (RSS/Atom) formatted as Markdown articles; generic XML in fenced code |
 | **JSON** | `application/json` or `+json` | Pretty-printed `.text` and fenced `.markdown` with metadata |
 | **Plain text** | `text/plain` or `.txt` / `.md` | Preserved as `.text` and `.markdown` |
 
-Non-HTML content is handled immediately at the HTTP layer, bypassing all browser dependencies.
+Non-HTML content is captured directly from inline browser responses or native attachment downloads through the same Camoufox context, skipping HTML scroll/expansion passes.
 
 ---
 
@@ -519,32 +487,36 @@ Non-HTML content is handled immediately at the HTTP layer, bypassing all browser
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `mode` | `str` | `"auto"` | Fetch strategy: `"auto"`, `"http"`, or `"browser"` |
 | `proxy` | `str` | `"none"` | Proxy provider: `"none"`, `"custom"` (any HTTP/HTTPS/SOCKS5/SOCKS5H), `"decodo"`, or `"byteful"` |
 | `cleaning_level` | `str` | `"standard"` | DOM cleaning level: `"minimal"`, `"standard"`, or `"maximum"` |
-| `http_concurrency` | `int` | `10` | Maximum concurrent HTTP connections |
-| `browser_concurrency` | `int` | `4` | Maximum concurrent browser instances |
+| `concurrency` | `int` | `4` | Maximum concurrent browser contexts |
 | `cache_enabled` | `bool` | `True` | Enable SQLite disk cache |
 | `cache_ttl` | `str \| int` | `"24h"` | Cache time-to-live |
 | `cache_path` | `str \| Path` | *platform default* | Custom SQLite cache file path |
-| `http_timeout` | `float` | `20.0` | HTTP request timeout in seconds |
-| `browser_timeout` | `float` | `45.0` | Browser page load timeout in seconds |
-| `retries_http` | `int` | `3` | Automatic retries on retryable HTTP errors (5xx, HTTP-only 429) |
-| `retries_browser` | `int` | `2` | Automatic retries on browser failures |
-| `max_redirects` | `int` | `10` | Maximum redirect chain |
+| `timeout` | `float` | `45.0` | Browser page load timeout in seconds |
+| `retries` | `int` | `2` | Automatic retries on browser/challenge failures |
 | `max_content_size` | `int` | `25 MiB` | Maximum response body in bytes |
-| `confidence_threshold` | `float` | `0.80` | Minimum confidence score before browser fallback in auto mode |
-| `block_images` | `bool` | `True`* | Block image loading in browser mode (*defaults to `False` in `balanced`/`max` stealth for fingerprint coherence) |
-| `block_level` | `str` | `"aggressive"` | Resource blocking: `"minimal"`, `"balanced"`, or `"aggressive"` |
-| `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in `Accept-Language` header |
-| `humanize` | `bool` | `False` | Add randomized delays mimicking human interactions |
+| `confidence_threshold` | `float` | `0.80` | Minimum confidence score for challenge/completeness scoring |
+| `block_images` | `bool` | `False`* | Block image loading in browser mode (*defaults to `False` in `balanced`/`max` stealth, `True` in `off`) |
+| `block_level` | `str` | `"balanced"` | Resource blocking: `"minimal"`, `"balanced"`, or `"aggressive"` |
+| `accept_language` | `str` | `"en-US,en;q=0.5"` | Value sent in `Accept-Language` header (explicit non-default values override proxy GeoIP locale) |
+| `humanize` | `bool` | `True` | Add randomized delays mimicking human interactions |
 | `session_rotation` | `str` | `"sticky"` | `"sticky"` or `"rotate"` proxy session rotation |
 | `session_duration` | `str \| int \| None` | `None` | Optional sticky-session TTL forwarded to residential providers. Decodo → `-sessionduration-<minutes>` (1–1440 min); Byteful → `_ttl_<n><unit>` (1 min – 7 days). See DECODO_DOCS §4, BYTEFUL_DOCS §4. |
-| `request_pacing` | `float` | `0.0` | Per-host randomized delay ceiling (seconds) between requests |
-| `stealth_level` | `str` | `"off"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
+| `request_pacing` | `float` | `0.5` | Per-host randomized delay ceiling (seconds) between requests |
+| `stealth_level` | `str` | `"balanced"` | Anti-detection preset: `"off"`, `"balanced"`, or `"max"` |
+| `expand` | `bool` | `True` | Automatically expand in-DOM disclosures & dynamic tabs |
+| `max_scroll_steps` | `int` | `25` | Maximum main-window scroll steps per navigation |
+| `max_scroll_height` | `int` | `150000` | Maximum main-window scroll height (pixels) |
+| `cookie_file` | `str \| Path \| None` | `None` | Optional Netscape `cookies.txt` or Cookie header list file |
+| `cookie_cooldown` | `float \| int \| str` | `120.0` | Base cooldown seconds for blocked cookie profiles |
+| `headers` | `dict[str, str]` | `{}` | Default request headers (credential headers stay origin-scoped) |
+| `cookies` | `Any` | `{}` | Default cookies or `CookiePool` source |
 | `raise_on_error` | `bool` | `False` | Raise `PageFetchError` on failure instead of returning error result |
 | `screenshot_max_bytes` | `int` | `50 MiB` | Maximum allowed screenshot byte size |
-| `browser_pre_check_byte_margin` | `float` | `1.5` | Multiplicative margin for browser pre-render size checks |
+| `max_requests` | `int` | `50` | Max requests served before recycling the browser process |
+| `idle_ttl` | `float \| str \| None` | `180.0` | Idle seconds before closing an unused browser process |
+| `pre_check_byte_margin` | `float` | `1.5` | Multiplicative margin for browser pre-render size checks |
 
 ---
 

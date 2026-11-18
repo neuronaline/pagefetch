@@ -6,12 +6,8 @@
 # Environment variables are resolved from  .env  or the shell.
 # ─────────────────────────────────────────────────────────────
 
-# Fetching mode:  auto  (try HTTP first, fall back to browser),
-#                 http  (HTTP only),  browser  (browser only)
-mode: auto
-
-# Confidence threshold (0.0 – 1.0) for deciding whether HTTP
-# content is usable or a browser fallback is needed.
+# ── Extraction & Content ────────────────────────────────────
+# Confidence threshold (0.0 – 1.0) used during challenge/completeness scoring.
 confidence_threshold: 0.80
 
 # How aggressively to strip non-content DOM before extraction.
@@ -21,59 +17,55 @@ confidence_threshold: 0.80
 #              explicit comments / share / related blocks
 cleaning_level: standard
 
-# ── HTTP ────────────────────────────────────────────────────
-http_concurrency: 10
-http_timeout: 20.0          # seconds
-retries_http: 3
-max_redirects: 10
-max_content_size: 26214400  # 25 MiB in bytes
-
 # ── Browser (Camoufox) ──────────────────────────────────────
-browser_concurrency: 4
-browser_timeout: 45.0       # seconds
-retries_browser: 2
+concurrency: 4
+timeout: 45.0               # seconds
+retries: 2
+max_content_size: 26214400  # 25 MiB in bytes
 
 # Maximum bytes for ``extract(screenshot=…)`` captures. Oversized
 # screenshots are discarded with a warning so the SQLite cache stays
 # small. Comment in to override the 50 MiB default.
 # screenshot_max_bytes: 52428800
 
-# Multiplicative byte margin over max_content_size for browser-mode pre-render checks
-# browser_pre_check_byte_margin: 1.5
+# Multiplicative byte margin over max_content_size for browser pre-render checks
+# pre_check_byte_margin: 1.5
 
 # Number of requests served by a browser process before recycling (default: 50)
-# max_browser_requests: 50
+# max_requests: 50
+
+# Idle timeout (seconds or duration string) before closing an unused browser process
+# idle_ttl: 180s
 
 # Full-page main-window scroll bounds (every browser navigation scrolls to bottom)
 max_scroll_steps: 25
 max_scroll_height: 150000
 
 # Automatically expand in-page 'Read more' buttons, accordions, and dynamic tabs
-# (when true, forces mode=browser even if mode=auto)
-expand: false
+expand: true
 
 # ── Stealth & Anti-Detection ────────────────────────────────
 # Anti-detection preset: off | balanced | max
-#   off      — humanize=false, block_level=aggressive, request_pacing=0.0, session_rotation=sticky
-#   balanced — humanize=true,  block_level=balanced,   request_pacing=0.5, session_rotation=sticky (recommended)
-#   max      — humanize=true,  block_level=minimal,    request_pacing=2.0, session_rotation=rotate
+#   off      — humanize=false, block_level=aggressive, block_images=true,  request_pacing=0.0, session_rotation=sticky
+#   balanced — humanize=true,  block_level=balanced,   block_images=false, request_pacing=0.5, session_rotation=sticky (default)
+#   max      — humanize=true,  block_level=minimal,    block_images=false, request_pacing=2.0, session_rotation=rotate
 # Explicitly set options below override the preset values.
 stealth_level: balanced
 
 # Add small randomized delays to mimic human interaction
-humanize: false
+# humanize: true
 
 # Resource blocking aggressiveness: minimal | balanced | aggressive
-block_level: aggressive
+# block_level: balanced
 
 # Block images in browser mode (saves bandwidth; auto-disabled in balanced/max stealth)
-block_images: true
+# block_images: false
 
-# Value sent as the Accept-Language header
+# Value sent as the Accept-Language header (explicit non-default values override proxy GeoIP locale)
 accept_language: "en-US,en;q=0.5"
 
-# Seconds of delay between browser requests (0.0 = none)
-request_pacing: 0.0
+# Seconds of delay between requests per host (0.0 = none)
+# request_pacing: 0.5
 
 # ── Proxy ───────────────────────────────────────────────────
 # Provider:  none  |  custom  |  decodo  |  byteful
