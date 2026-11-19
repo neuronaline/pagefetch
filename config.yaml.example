@@ -24,8 +24,8 @@ retries: 2
 max_content_size: 26214400  # 25 MiB in bytes
 
 # Maximum bytes for ``extract(screenshot=…)`` captures. Oversized
-# screenshots are discarded with a warning so the SQLite cache stays
-# small. Comment in to override the 50 MiB default.
+# screenshots are discarded with a warning. Comment in to override the
+# 50 MiB default.
 # screenshot_max_bytes: 52428800
 
 # Multiplicative byte margin over max_content_size for browser pre-render checks

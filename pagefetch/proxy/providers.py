@@ -31,9 +31,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
-
-class ProxyConfigurationError(ValueError):
-    """Raised when a selected provider is missing required settings."""
+from ..exceptions import ProxyConfigurationError
 
 
 # Public so the config layer and tests can keep their ``frozenset`` in sync

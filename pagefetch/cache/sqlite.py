@@ -25,6 +25,11 @@ class SQLiteCache:
         self._db: aiosqlite.Connection | None = None
         self._cleanup_counter: int = 0
 
+    @property
+    def is_open(self) -> bool:
+        """Return ``True`` when the underlying SQLite connection is open."""
+        return self._db is not None
+
     async def start(self) -> None:
         if self._db is not None:
             return
@@ -145,6 +150,22 @@ class SQLiteCache:
             )
         self._cleanup_counter += 1
         await self._db.commit()
+
+    async def clear(self, *, expired_only: bool = False) -> int:
+        """Delete cached entries and return the number of rows removed."""
+        if self._db is None:
+            raise RuntimeError("cache has not been started")
+        if expired_only:
+            async with self._db.execute(
+                "DELETE FROM fetch_cache WHERE expires_at <= ?",
+                (time.time(),),
+            ) as cursor:
+                removed = max(cursor.rowcount or 0, 0)
+        else:
+            async with self._db.execute("DELETE FROM fetch_cache") as cursor:
+                removed = max(cursor.rowcount or 0, 0)
+        await self._db.commit()
+        return removed
 
     async def close(self) -> None:
         if self._db is not None:

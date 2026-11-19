@@ -43,7 +43,7 @@ def _configure_unicode_streams() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pagefetch", description="Fetch complete web page content")
-    parser.add_argument("input", metavar="URL_OR_FILE")
+    parser.add_argument("input", nargs="?", default=None, metavar="URL_OR_FILE")
     parser.add_argument("--format", choices=sorted(VALID_OUTPUT_FORMATS), default="markdown")
     parser.add_argument("-c", "--config", type=Path, metavar="PATH", help="Path to config.yaml")
     parser.add_argument(
@@ -73,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cache time-to-live, e.g. 30s, 15m, 24h, 7d (default: 24h)",
     )
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Clear the SQLite cache (can be used alone or before fetching)",
+    )
     parser.add_argument("--concurrency", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--retries", type=int, default=argparse.SUPPRESS)
@@ -278,19 +283,16 @@ async def run_batch(
     use_extract = extract_structure or screenshot != "none"
     async with PageFetch(config=config) as client:
         if use_extract:
-            results = [
-                await client.extract(
-                    item,
-                    structure=extract_structure,
-                    screenshot=screenshot,
-                    screenshot_format=screenshot_format,
-                    headers=headers,
-                    cookies=cookies,
-                    actions=actions,
-                    capture_xhr=capture_xhr,
-                )
-                for item in urls
-            ]
+            results = await client.extract_many(
+                urls,
+                structure=extract_structure,
+                screenshot=screenshot,
+                screenshot_format=screenshot_format,
+                headers=headers,
+                cookies=cookies,
+                actions=actions,
+                capture_xhr=capture_xhr,
+            )
         else:
             results = await client.fetch_many(
                 urls,
@@ -327,13 +329,30 @@ async def run_batch(
 
 
 async def _run(args: argparse.Namespace) -> int:
-    urls = _inputs(args.input)
+    urls = _inputs(args.input) if args.input is not None else None
+    if urls is not None and not urls:
+        raise ValueError("the input file does not contain any URLs")
     screenshot = getattr(args, "screenshot", "none") or "none"
     screenshot_format = getattr(args, "screenshot_format", "png") or "png"
     config = _build_config(args)
 
     raw_actions = getattr(args, "actions", None)
     actions = normalize_actions(raw_actions) if raw_actions else None
+
+    if getattr(args, "clear_cache", False):
+        if not config.cache_enabled:
+            print("pagefetch: cache is disabled; skipped clearing", file=sys.stderr)
+        else:
+            removed = await PageFetch(config=config).clear_cache()
+            print(
+                f"pagefetch: cleared {removed} cached entry(ies) ({config.cache_path})",
+                file=sys.stderr,
+            )
+        if urls is None:
+            return 0
+
+    if urls is None:
+        raise ValueError("URL_OR_FILE is required")
 
     raw_xhr = getattr(args, "capture_xhr", None)
     if raw_xhr is None:
@@ -358,7 +377,10 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     _configure_unicode_streams()
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.input is None and not getattr(args, "clear_cache", False):
+        parser.error("the following arguments are required: URL_OR_FILE (unless --clear-cache is passed)")
     if args.debug:
         handler = logging.StreamHandler()
         logging.getLogger("pagefetch").addHandler(handler)

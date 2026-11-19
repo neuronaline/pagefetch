@@ -70,7 +70,7 @@ except PackageNotFoundError:  # pragma: no cover - source-checkout fallback
     # Mirrors the version declared in ``pyproject.toml`` so that
     # ``pagefetch.__version__`` is usable before the distribution metadata
     # is installed (editable checkouts, sdists).
-    __version__ = "0.9.16"
+    __version__ = "1.0.0"
 
 __all__ = [
     "ActionResult",

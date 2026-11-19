@@ -67,7 +67,7 @@ def _render_structure(result: FetchResult) -> str:
     """Return a Markdown view of the page structure when available."""
     structure = result.structure
     if structure is None:
-        return "(structure not requested; pass --include-structure to capture it)"
+        return "(structure not requested; pass --format structure to capture it)"
     lines: list[str] = [
         f"# {result.title or result.url}",
         "",

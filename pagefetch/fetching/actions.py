@@ -7,7 +7,7 @@ import fnmatch
 import logging
 import random
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 

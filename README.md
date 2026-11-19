@@ -4,6 +4,7 @@
 built-in stealth, automatic DOM expansion, SQLite caching, SSRF protection, and structured Markdown output.**
 
 <p align="center">
+  <a href="https://pypi.org/project/pagefetch/"><img src="https://img.shields.io/pypi/v/pagefetch" alt="PyPI"></a>
   <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License">
   <img src="https://img.shields.io/badge/code%20style-ruff-261230" alt="Ruff">
@@ -151,7 +152,7 @@ realistic on every host:
   renders a real window into the virtual display, avoiding the
   fingerprinting tells that come with Firefox's `--headless` flag. Display
   lifecycles are strictly managed to avoid orphan processes.
-- **Windows / macOS** — Firefox's native `headless=True`. No display server
+- **Windows** — Firefox's native `headless=True`. No display server
   is required.
 
 On Linux, `Xvfb` must be installed (e.g. `apt install xvfb` on Debian/Ubuntu,
@@ -181,7 +182,7 @@ missing, browser fetches surface a `FetchErrorInfo` with code `xvfb_missing`.
 ### Install
 
 ```bash
-pip install .
+pip install pagefetch
 python -m camoufox fetch
 ```
 
@@ -258,6 +259,14 @@ Fetch a page and return the rendered DOM, an optional structural summary, and/or
 
 Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not cached in SQLite.
 
+**`extract_many(urls, *, structure=True, compact_structure=False, screenshot="none", screenshot_format="png", ..., use_cache=True, cache_ttl=None, raise_on_error=None) → list[FetchResult]`**
+
+Extract multiple URLs concurrently. Deduplicates identical inputs, preserves original ordering, and isolates failures across URLs.
+
+**`clear_cache(*, expired_only=False) → int`**
+
+Delete all cached entries (or only expired entries when `expired_only=True`) from the configured SQLite cache and return the number of removed rows. Safe to call both inside `async with PageFetch()` and standalone.
+
 ### Public API Exports
 
 | Symbol | Purpose |
@@ -268,7 +277,7 @@ Screenshots are bounded by `screenshot_max_bytes` (default 50 MiB) and are not c
 | `PageStructure`, `StructureNode`, `StylesheetInfo`, `InlineStylesheet`, `ScriptInfo`, `InlineScript` | Page-structure summary types |
 | `StructureLimits`, `extract_structure`, `extract_document` | Lower-level DOM structure & non-HTML extraction engines |
 | `PageAction`, `ActionResult`, `CapturedXHR`, `parse_action`, `normalize_actions` | In-page browser interaction & XHR capture models |
-| `PageFetchError`, `ProxyConfigurationError`, `RuntimeBootstrapError` | Exception hierarchy |
+| `PageFetchError`, `ProxyConfigurationError`, `RuntimeBootstrapError` | Unified exception hierarchy rooted at `PageFetchError` (`ProxyConfigurationError` also subclasses `ValueError`; `RuntimeBootstrapError` also subclasses `RuntimeError`) |
 | `ensure_runtime_requirements`, `auto_bootstrap_browser` | Runtime dependency validation & installation |
 | `VALID_PROXIES`, `VALID_STEALTH_LEVELS`, `VALID_BLOCK_LEVELS`, `VALID_CLEANING_LEVELS`, `VALID_SESSION_ROTATION`, `VALID_ACTION_TYPES` | Configuration & validation constants |
 
@@ -370,6 +379,10 @@ pagefetch https://example.com --proxy byteful --session-duration 2h
 # Apply maximum stealth preset with session rotation
 pagefetch https://example.com --stealth-level max --session-rotation rotate
 
+# Clear cached entries (standalone or before fetching)
+pagefetch --clear-cache
+pagefetch https://example.com --clear-cache
+
 # Debug mode for troubleshooting
 pagefetch https://example.com --debug
 ```
@@ -378,12 +391,13 @@ pagefetch https://example.com --debug
 
 | Flag | Maps to |
 |---|---|
-| `input` (positional) | A single URL or path to a text file containing URLs |
+| `input` (positional) | A single URL or path to a text file containing URLs (optional when `--clear-cache` is used) |
 | `--proxy {none,custom,decodo,byteful}` | `proxy` |
 | `--concurrency N` | `concurrency` |
 | `--timeout SECONDS` | `timeout` |
 | `--retries N` | `retries` |
 | `--cache-ttl DURATION` / `--no-cache` | `cache_ttl` / `cache_enabled=False` |
+| `--clear-cache` | `PageFetch.clear_cache()` (standalone or before fetching) |
 | `--block-images` / `--no-block-images` | `block_images` |
 | `--block-level {minimal,balanced,aggressive}` | `block_level` |
 | `--accept-language HEADER` | `accept_language` |
@@ -424,6 +438,10 @@ result = await client.fetch("https://example.com", use_cache=False)
 
 # Custom TTL per request
 result = await client.fetch("https://example.com", cache_ttl="1h")
+
+# Clear cached entries (returns deleted row count)
+removed = await client.clear_cache()
+expired_removed = await client.clear_cache(expired_only=True)
 
 # Custom SQLite database location
 from pagefetch import PageFetchConfig
@@ -526,11 +544,8 @@ Non-HTML content is captured directly from inline browser responses or native at
 # Clone and set up
 git clone https://github.com/neuronaline/pagefetch.git && cd pagefetch
 
-# Install with test dependencies
-pip install -e ".[test]"
-
-# Run test suite
-pytest
+# Install editable package
+pip install -e .
 
 # Code formatting & linting
 ruff check .

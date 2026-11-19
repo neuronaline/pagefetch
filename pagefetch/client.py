@@ -18,7 +18,7 @@ from .cache import SQLiteCache, build_cache_key
 from .config import _UNSET, VALID_PROXIES, PageFetchConfig, _normalize_headers_input, merge_headers
 from .constants import BLOCKED_STATUS_CODES, RETRYABLE_STATUS_CODES, looks_like_waf_challenge
 from .cookies import CookiePool, CookieSession, parse_cookie_pool
-from .exceptions import PageFetchError, TransportFailure
+from .exceptions import PageFetchError, ProxyConfigurationError, TransportFailure
 from .fetching.actions import normalize_actions
 from .fetching.manager import TransportManager
 from .fetching.policy import HostPolicy
@@ -26,7 +26,7 @@ from .models import FetchErrorInfo, FetchResult, PageAction
 from .processing.challenges import has_waf_challenge_header
 from .processing.detector import ConfidenceReport, analyze_html, detect_challenge_provider
 from .processing.pipeline import build_html_result
-from .proxy import ProxyConfigurationError, ProxySettings
+from .proxy import ProxySettings
 from .proxy.providers import bump_domain_session
 from .utils.durations import parse_duration
 from .utils.urls import async_is_safe_host, normalize_url, registrable_host, validate_url
@@ -182,6 +182,36 @@ class PageFetch:
         """Release all browser processes and the cache database."""
         await self._transports.close(cache=self._cache)
 
+    async def clear_cache(self, *, expired_only: bool = False) -> int:
+        """Clear cached responses and return the number of deleted entries.
+
+        Safe to call both inside an active ``async with PageFetch()`` block
+        and standalone on a freshly constructed client (without creating an
+        empty database file when none exists yet). Returns ``0`` when caching
+        is disabled.
+        """
+        if self._transports.is_closed:
+            raise RuntimeError("PageFetch has already been closed")
+        if self._cache is None:
+            return 0
+        if self._cache.is_open:
+            return await self._cache.clear(expired_only=expired_only)
+        async with self._transports.lifecycle_lock:
+            if self._transports.is_closed:
+                raise RuntimeError("PageFetch has already been closed")
+            if self._cache is None:
+                return 0
+            if self._cache.is_open:
+                return await self._cache.clear(expired_only=expired_only)
+            if not self._cache.path.exists():
+                return 0
+            cache = SQLiteCache(self._cache.path)
+            await cache.start()
+            try:
+                return await cache.clear(expired_only=expired_only)
+            finally:
+                await cache.close()
+
     async def _begin_operation(self) -> bool:
         try:
             await self.start()
@@ -292,47 +322,30 @@ class PageFetch:
             per_call_cookies=per_call_pool,
         )
 
-    async def fetch_many(
+    async def _run_many(
         self,
         urls: Iterable[str],
         *,
-        proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
-        headers: dict[str, str] | None = None,
-        cookies: Any = None,
-        actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
-        capture_xhr: bool | str | Sequence[str] = False,
-        expand: bool | None = None,
-        use_cache: bool = True,
-        cache_ttl: str | int | None = None,
-        raise_on_error: bool | None = None,
+        proxy: Literal["none", "custom", "decodo", "byteful"] | None,
+        cookies: Any,
+        worker: Callable[[str, CookiePool | None], Awaitable[FetchResult]],
     ) -> list[FetchResult]:
-        """Fetch unique URLs concurrently while preserving input order."""
+        """Deduplicate *urls*, run *worker* concurrently, and restore input order."""
         ordered = list(urls)
         unique = list(dict.fromkeys(ordered))
         shared_call_pool = _coerce_cookie_pool(cookies)
-
         fanout_sem = asyncio.Semaphore(self.config.concurrency * 2)
+        fallback_proxy = self.config.proxy if proxy is None else str(proxy)
 
         async def run_one(item: str) -> FetchResult:
             async with fanout_sem:
                 try:
-                    return await self.fetch(
-                        item,
-                        proxy=proxy,
-                        headers=headers,
-                        cookies=shared_call_pool,
-                        actions=actions,
-                        capture_xhr=capture_xhr,
-                        expand=expand,
-                        use_cache=use_cache,
-                        cache_ttl=cache_ttl,
-                        raise_on_error=raise_on_error,
-                    )
+                    return await worker(item, shared_call_pool)
                 except PageFetchError as exc:
                     return FetchResult(
                         url=str(item),
                         success=False,
-                        proxy_provider=self.config.proxy if proxy is None else str(proxy),
+                        proxy_provider=fallback_proxy,
                         error=exc.error,
                         fetched_at=datetime.now(UTC),
                     )
@@ -348,6 +361,80 @@ class PageFetch:
             emitted.add(id(result))
             results.append(result)
         return results
+
+    async def fetch_many(
+        self,
+        urls: Iterable[str],
+        *,
+        proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: Any = None,
+        actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
+        expand: bool | None = None,
+        use_cache: bool = True,
+        cache_ttl: str | int | None = None,
+        raise_on_error: bool | None = None,
+    ) -> list[FetchResult]:
+        """Fetch unique URLs concurrently while preserving input order."""
+        return await self._run_many(
+            urls,
+            proxy=proxy,
+            cookies=cookies,
+            worker=lambda item, pool: self.fetch(
+                item,
+                proxy=proxy,
+                headers=headers,
+                cookies=pool,
+                actions=actions,
+                capture_xhr=capture_xhr,
+                expand=expand,
+                use_cache=use_cache,
+                cache_ttl=cache_ttl,
+                raise_on_error=raise_on_error,
+            ),
+        )
+
+    async def extract_many(
+        self,
+        urls: Iterable[str],
+        *,
+        structure: bool = True,
+        compact_structure: bool = False,
+        screenshot: Literal["none", "viewport", "full"] = "none",
+        screenshot_format: Literal["png", "jpeg"] = "png",
+        proxy: Literal["none", "custom", "decodo", "byteful"] | None = None,
+        headers: dict[str, str] | None = None,
+        cookies: Any = None,
+        actions: Sequence[PageAction | dict[str, Any] | str] | None = None,
+        capture_xhr: bool | str | Sequence[str] = False,
+        expand: bool | None = None,
+        use_cache: bool = True,
+        cache_ttl: str | int | None = None,
+        raise_on_error: bool | None = None,
+    ) -> list[FetchResult]:
+        """Extract unique URLs concurrently while preserving input order."""
+        return await self._run_many(
+            urls,
+            proxy=proxy,
+            cookies=cookies,
+            worker=lambda item, pool: self.extract(
+                item,
+                structure=structure,
+                compact_structure=compact_structure,
+                screenshot=screenshot,
+                screenshot_format=screenshot_format,
+                proxy=proxy,
+                headers=headers,
+                cookies=pool,
+                actions=actions,
+                capture_xhr=capture_xhr,
+                expand=expand,
+                use_cache=use_cache,
+                cache_ttl=cache_ttl,
+                raise_on_error=raise_on_error,
+            ),
+        )
 
     async def extract(
         self,
@@ -517,17 +604,22 @@ class PageFetch:
                     logger.warning("cache read failed: %s", type(exc).__name__)
             try:
                 result = await transport(normalized_url)
-            except (TransportFailure, ProxyConfigurationError) as exc:
-                error = (
-                    exc.error
-                    if isinstance(exc, TransportFailure)
-                    else FetchErrorInfo("connection_error", str(exc), False, type(exc).__name__)
-                )
+            except ProxyConfigurationError as exc:
+                if should_raise:
+                    raise ProxyConfigurationError(exc.error, url=normalized_url) from exc
                 result = self._finish_error(
                     url=normalized_url,
                     proxy=proxy,
-                    error=error,
-                    status_code=getattr(exc, "status_code", None),
+                    error=exc.error,
+                    started_at=started_at,
+                    should_raise=False,
+                )
+            except TransportFailure as exc:
+                result = self._finish_error(
+                    url=normalized_url,
+                    proxy=proxy,
+                    error=exc.error,
+                    status_code=exc.status_code,
                     started_at=started_at,
                     should_raise=should_raise,
                 )

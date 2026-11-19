@@ -15,6 +15,8 @@ import sys
 import threading
 from pathlib import Path
 
+from .exceptions import RuntimeBootstrapError
+
 logger = logging.getLogger("pagefetch.bootstrap")
 
 _BOOTSTRAP_LOCK = threading.Lock()
@@ -27,10 +29,6 @@ _FETCH_TIMEOUT = 300
 # PyPI-provided code in the host Python environment with full user privileges;
 # automatic installation is disabled by default.
 _CAMOUFOX_SPEC = "camoufox[geoip]>=0.5.6,<1"
-
-
-class RuntimeBootstrapError(RuntimeError):
-    """Raised when a required runtime dependency or browser binary is unavailable."""
 
 
 def ensure_runtime_requirements(
